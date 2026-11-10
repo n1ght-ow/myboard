@@ -35,6 +35,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
@@ -172,22 +173,26 @@ private fun keyHeight(widthDp: Int, smallestDp: Int, orientation: Int, scale: Fl
 @Composable
 private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardController) {
     val composing = state.engine.raw.isNotEmpty() || state.engine.candidates.isNotEmpty()
-    Row(
-        Modifier.fillMaxWidth().height(46.dp).padding(horizontal = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        if (!composing) {
-            ToolButton(palette, onClick = controller::toggleMenu) { GridIcon(palette.icon, Modifier.size(22.dp)) }
-            Box(Modifier.weight(1f))
-        } else {
+    if (!composing) {
+        FunctionRow(state, palette, controller)
+        return
+    }
+    val preedit = state.engine.preedit.ifBlank { state.engine.raw }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 2.dp)) {
+        if (preedit.isNotEmpty()) {
+            Text(
+                preedit,
+                color = palette.accent,
+                fontSize = 12.sp,
+                maxLines = 1,
+                modifier = Modifier.padding(start = 4.dp, bottom = 1.dp),
+            )
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
             Row(
                 Modifier.weight(1f).horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                val preedit = state.engine.preedit.ifBlank { state.engine.raw }
-                if (preedit.isNotEmpty()) {
-                    Text(preedit, color = palette.accent, fontSize = 15.sp, modifier = Modifier.padding(end = 8.dp))
-                }
                 state.engine.candidates.forEachIndexed { index, candidate ->
                     val shown = if (state.engine.language == Language.English && !state.engine.associating) {
                         applyCase(candidate.text, state.engine.raw)
@@ -197,23 +202,39 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                     Text(
                         shown,
                         color = palette.label,
-                        fontSize = 16.sp,
+                        fontSize = 18.sp,
                         modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (index == 0) palette.pressed else Color.Transparent)
                             .clickable { controller.pick(index) }
-                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
                     )
                 }
             }
-            Text(
-                if (state.expanded) "收起" else "展开",
-                color = palette.subtle,
-                fontSize = 13.sp,
-                modifier = Modifier.clickable(onClick = controller::toggleExpanded).padding(horizontal = 6.dp),
-            )
+            Box(
+                Modifier
+                    .clickable(onClick = controller::toggleExpanded)
+                    .padding(horizontal = 6.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                DismissIcon(
+                    palette.subtle,
+                    Modifier.size(18.dp).rotate(if (state.expanded) 180f else 0f),
+                )
+            }
         }
-        val iconSize = if (composing) 18.dp else 20.dp
-        val enabled = !state.engine.password
+    }
+}
+
+@Composable
+private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardController) {
+    val enabled = !state.engine.password
+    Row(
+        Modifier.fillMaxWidth().height(46.dp).padding(horizontal = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        ToolButton(palette, onClick = controller::toggleMenu) { GridIcon(palette.icon, Modifier.size(22.dp)) }
+        Box(Modifier.weight(1f))
         Row(
             Modifier
                 .clip(RoundedCornerShape(14.dp))
@@ -222,11 +243,11 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                 .padding(horizontal = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            ToolButton(palette, enabled = enabled, onClick = controller::ask) { AskIcon(palette.icon, Modifier.size(iconSize)) }
-            ToolButton(palette, enabled = enabled, onClick = controller::translate) { TranslateIcon(palette.icon, Modifier.size(iconSize)) }
-            ToolButton(palette, enabled = enabled, onClick = controller::polish) { PolishIcon(palette.icon, Modifier.size(iconSize)) }
+            ToolButton(palette, enabled = enabled, onClick = controller::ask) { AskIcon(palette.icon, Modifier.size(20.dp)) }
+            ToolButton(palette, enabled = enabled, onClick = controller::translate) { TranslateIcon(palette.icon, Modifier.size(20.dp)) }
+            ToolButton(palette, enabled = enabled, onClick = controller::polish) { PolishIcon(palette.icon, Modifier.size(20.dp)) }
         }
-        ToolButton(palette, onClick = controller::dismiss) { DismissIcon(palette.icon, Modifier.size(iconSize)) }
+        ToolButton(palette, onClick = controller::dismiss) { DismissIcon(palette.icon, Modifier.size(20.dp)) }
     }
 }
 
