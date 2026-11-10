@@ -1,0 +1,12 @@
+Keyboard
+Copyright (c) 2026 cheng
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, version 3 of the License.
+
+The Chinese lexicon is derived from 雾凇拼音 (https://github.com/iDvel/rime-ice),
+which is licensed under GPL-3.0-only. See app/src/main/assets/dict/SOURCES.txt.
+
+The English word list is derived from FrequencyWords by Hermit Dave
+(https://github.com/hermitdave/FrequencyWords), licensed under the MIT License.

@@ -1,0 +1,11 @@
+Chinese lexicon
+Derived from 雾凇拼音 cn_dicts: every entry in 8105, plus base entries with weight >= 2000.
+Each row stores syllable initials so abbreviated pinyin can be queried.
+ext stays out of the bundled file because its weights sit below that line.
+Upstream: https://github.com/iDvel/rime-ice
+License: GPL-3.0-only
+
+English lexicon
+Derived from FrequencyWords content/2018/en/en_50k.txt
+Upstream: https://github.com/hermitdave/FrequencyWords
+License: MIT
