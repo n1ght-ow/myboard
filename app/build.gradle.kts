@@ -17,8 +17,8 @@ android {
         applicationId = "dev.cheng.keyboard"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.1.1"
+        versionCode = 5
+        versionName = "0.1.2"
     }
 
     buildTypes {
@@ -74,4 +74,5 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20250517")
 }

@@ -159,6 +159,8 @@ private fun displayBottomPad(context: android.content.Context, density: androidx
     return if (px > 0) with(density) { px.toDp() } else 24.dp
 }
 
+private val ToolbarHeight = 46.dp
+
 private fun keyHeight(widthDp: Int, smallestDp: Int, orientation: Int, scale: Float): Dp {
     val tablet = smallestDp >= 600
     val landscape = orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
@@ -178,17 +180,21 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
         return
     }
     val preedit = state.engine.preedit.ifBlank { state.engine.raw }
-    Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 2.dp)) {
+    Column(Modifier.fillMaxWidth().height(ToolbarHeight).padding(horizontal = 6.dp)) {
         if (preedit.isNotEmpty()) {
             Text(
                 preedit,
                 color = palette.accent,
-                fontSize = 12.sp,
+                fontSize = 11.sp,
+                lineHeight = 13.sp,
                 maxLines = 1,
-                modifier = Modifier.padding(start = 4.dp, bottom = 1.dp),
+                modifier = Modifier.padding(start = 8.dp, top = 2.dp),
             )
         }
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Row(
                 Modifier.weight(1f).horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically,
@@ -202,19 +208,20 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                     Text(
                         shown,
                         color = palette.label,
-                        fontSize = 18.sp,
+                        fontSize = 16.sp,
+                        maxLines = 1,
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
                             .background(if (index == 0) palette.pressed else Color.Transparent)
                             .clickable { controller.pick(index) }
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                            .padding(horizontal = 8.dp, vertical = 2.dp),
                     )
                 }
             }
             Box(
                 Modifier
                     .clickable(onClick = controller::toggleExpanded)
-                    .padding(horizontal = 6.dp, vertical = 8.dp),
+                    .padding(horizontal = 6.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 DismissIcon(
@@ -230,7 +237,7 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
 private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardController) {
     val enabled = !state.engine.password
     Row(
-        Modifier.fillMaxWidth().height(46.dp).padding(horizontal = 6.dp),
+        Modifier.fillMaxWidth().height(ToolbarHeight).padding(horizontal = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         ToolButton(palette, onClick = controller::toggleMenu) { GridIcon(palette.icon, Modifier.size(22.dp)) }

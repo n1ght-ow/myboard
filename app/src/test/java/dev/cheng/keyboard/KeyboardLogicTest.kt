@@ -25,6 +25,8 @@ import dev.cheng.keyboard.model.LexRow
 import dev.cheng.keyboard.model.MemoryLexicon
 import dev.cheng.keyboard.model.ShiftState
 import dev.cheng.keyboard.engine.SylTrie
+import dev.cheng.keyboard.update.isNewerVersion
+import dev.cheng.keyboard.update.parseLatestRelease
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -70,6 +72,39 @@ class KeyboardLogicTest {
         assertTrue(decoder.decode("womend", fuzzy = false).candidates.any { it.text == "我们的" })
         assertTrue(decoder.decode("womende", fuzzy = false).candidates.any { it.text == "我们的" })
         assertTrue(decoder.decode("nihaom", fuzzy = false).candidates.any { it.text.startsWith("你好") })
+    }
+
+    @Test
+    fun commonPhrasesBeatFrequentCharacters() {
+        val decoder = PinyinDecoder(
+            setOf("ji", "xu", "jia", "you", "wo", "mei", "sha", "yi", "si"),
+        )
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("级", "ji", "ji", 5_992_040),
+                LexRow("许", "xu", "xu", 1_299_512),
+                LexRow("家", "jia", "jia", 4_546_765),
+                LexRow("有", "you", "you", 17_847_013),
+                LexRow("又", "you", "you", 3_710_252),
+                LexRow("继续", "ji xu", "jixu", 501_276),
+                LexRow("加油", "jia you", "jiayou", 308_090),
+                LexRow("家有", "jia you", "jiayou", 56_625),
+                LexRow("我", "wo", "wo", 29_569_261),
+                LexRow("没", "mei", "mei", 7_560_391),
+                LexRow("啥", "sha", "sha", 976_190),
+                LexRow("一", "yi", "yi", 35_278_860),
+                LexRow("死", "si", "si", 1_979_349),
+                LexRow("四", "si", "si", 1_598_102),
+                LexRow("思", "si", "si", 1_438_567),
+                LexRow("意思", "yi si", "yisi", 500_314),
+                LexRow("一死", "yi si", "yisi", 23_175),
+                LexRow("没啥", "mei sha", "meisha", 38_090),
+                LexRow("我没", "wo mei", "womei", 205_370),
+                LexRow("啥意思", "sha yi si", "shayisi", 4_815),
+            ),
+        )
+        assertEquals("继续加油", decoder.decode("jixujiayou", fuzzy = false).candidates.first().text)
+        assertEquals("我没啥意思", decoder.decode("womeishayisi", fuzzy = false).candidates.first().text)
     }
 
     @Test
@@ -266,5 +301,30 @@ class KeyboardLogicTest {
         assertEquals("你好", applyAskDraft("你好 世界", listOf(Cmd.DeleteWord)))
         assertEquals("hi", parseSseLine("data: {\"content\":\"hi\"}")?.content)
         assertEquals(true, parseSseLine("data: [DONE]")?.done)
+    }
+
+    @Test
+    fun newerReleaseIsChosenFromTheVersionNumbers() {
+        assertTrue(isNewerVersion("0.1.2", "0.1.1"))
+        assertTrue(isNewerVersion("v0.1.10", "0.1.9"))
+        assertTrue(isNewerVersion("0.2", "0.1.9"))
+        assertFalse(isNewerVersion("v0.1.1", "0.1.1"))
+        assertFalse(isNewerVersion("0.1.1", "0.1.2"))
+        assertFalse(isNewerVersion("0.1", "0.1.0"))
+    }
+
+    @Test
+    fun latestReleaseJsonPicksTheApk() {
+        val body = """
+            {"tag_name":"v0.1.2","body":"修复闪烁","assets":[
+              {"name":"notes.txt","url":"https://example.test/notes","size":10,"content_type":"text/plain"},
+              {"name":"myboard-0.1.2.apk","url":"https://example.test/apk","size":20,"content_type":"application/vnd.android.package-archive"}
+            ]}
+        """.trimIndent()
+        val release = parseLatestRelease(body)
+        assertEquals("0.1.2", release?.version)
+        assertEquals("https://example.test/apk", release?.assetUrl)
+        assertEquals("修复闪烁", release?.notes)
+        assertEquals(null, parseLatestRelease("{}"))
     }
 }

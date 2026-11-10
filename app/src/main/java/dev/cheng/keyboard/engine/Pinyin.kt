@@ -265,9 +265,9 @@ class PinyinDecoder(syllables: Set<String>) {
         if (parts.size < 2) return emptyList()
         val fixed = if (seg.partial) parts.dropLast(1) else parts
         if (fixed.isEmpty()) return emptyList()
-        val paths = bestCovers(fixed).take(2)
+        val paths = bestCovers(fixed)
         if (!seg.partial) {
-            return paths.map { Candidate(it.text, it.syllables, it.freq) }
+            return paths.map { Candidate(it.text, it.syllables, coverScore(it.shape, it.weight)) }
         }
         val tails = topChars(parts.last(), partial = true).take(6)
         val out = ArrayList<Candidate>(8)
@@ -276,7 +276,7 @@ class PinyinDecoder(syllables: Set<String>) {
                 out += Candidate(
                     path.text + tail.text,
                     "${path.syllables} ${tail.syllables}".trim(),
-                    minOf(path.freq, tail.freq),
+                    coverScore(path.shape + 1, path.weight + freqWeight(tail.freq)),
                 )
                 if (out.size >= 8) return out.distinctBy { it.text }
             }
@@ -284,31 +284,46 @@ class PinyinDecoder(syllables: Set<String>) {
         return out.distinctBy { it.text }
     }
 
-    private data class Cover(val text: String, val syllables: String, val freq: Int)
+    private fun coverScore(shape: Int, weight: Int): Int = shape * 2_000_000 + weight.coerceIn(0, 1_999_999)
+
+    private data class Cover(
+        val text: String,
+        val syllables: String,
+        val freq: Int,
+        val shape: Int,
+        val weight: Int,
+    )
 
     private fun bestCovers(parts: List<String>): List<Cover> {
         val dp = Array(parts.size + 1) { mutableListOf<Cover>() }
-        dp[0].add(Cover("", "", Int.MAX_VALUE))
+        dp[0].add(Cover("", "", Int.MAX_VALUE, 0, 0))
         for (end in 1..parts.size) {
             val found = ArrayList<Cover>()
             for (start in maxOf(0, end - 6) until end) {
                 for (prev in dp[start]) {
                     val slice = parts.subList(start, end)
                     val choices = if (slice.size == 1) {
-                        topChars(slice[0], partial = false).take(3)
+                        topChars(slice[0], partial = false).take(4)
                     } else {
-                        lookupPhrase(slice).take(2)
+                        lookupPhrase(slice).take(4)
                     }
                     for (choice in choices) {
+                        val count = choice.syllables.count { it == ' ' } + 1
                         found += Cover(
                             prev.text + choice.text,
                             (prev.syllables + " " + choice.syllables).trim(),
                             minOf(prev.freq, choice.freq),
+                            prev.shape + count * count,
+                            prev.weight + freqWeight(choice.freq),
                         )
                     }
                 }
             }
-            dp[end] = found.sortedByDescending { it.freq }.distinctBy { it.text }.take(3).toMutableList()
+            dp[end] = found
+                .sortedWith(compareByDescending<Cover> { it.shape }.thenByDescending { it.weight })
+                .distinctBy { it.text }
+                .take(6)
+                .toMutableList()
             if (dp[end].isEmpty()) {
                 val prev = dp[end - 1].firstOrNull() ?: continue
                 val fallback = topChars(parts[end - 1], partial = false).firstOrNull() ?: continue
@@ -317,6 +332,8 @@ class PinyinDecoder(syllables: Set<String>) {
                         prev.text + fallback.text,
                         (prev.syllables + " " + fallback.syllables).trim(),
                         minOf(prev.freq, fallback.freq),
+                        prev.shape + 1,
+                        prev.weight + freqWeight(fallback.freq),
                     ),
                 )
             }
@@ -324,10 +341,12 @@ class PinyinDecoder(syllables: Set<String>) {
         return dp[parts.size]
     }
 
+    private fun freqWeight(freq: Int): Int = (kotlin.math.ln(freq.coerceAtLeast(1).toDouble()) * 1000).toInt()
+
     private fun lookupPhrase(syllables: List<String>): List<LexRow> {
         if (syllables.isEmpty()) return emptyList()
         val expect = syllables.joinToString(" ")
-        return lexicon.exact(syllables.joinToString(""), 16).filter { it.syllables == expect }
+        return lexicon.exact(syllables.joinToString(""), 24).filter { it.syllables == expect }
     }
 
     private fun topChars(syllable: String, partial: Boolean): List<LexRow> {

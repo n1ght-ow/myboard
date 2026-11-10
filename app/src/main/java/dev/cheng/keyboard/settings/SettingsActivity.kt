@@ -3,6 +3,8 @@ package dev.cheng.keyboard.settings
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
@@ -29,11 +31,14 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -56,8 +61,19 @@ import dev.cheng.keyboard.data.UserStore
 import dev.cheng.keyboard.data.settingsStore
 import dev.cheng.keyboard.data.themeMode
 import dev.cheng.keyboard.model.ThemeMode
+import dev.cheng.keyboard.update.UpdateClient
+import dev.cheng.keyboard.update.UpdateDownload
+import dev.cheng.keyboard.update.UpdatePhase
+import dev.cheng.keyboard.update.checkForUpdate
+import dev.cheng.keyboard.update.installedVersionName
+import dev.cheng.keyboard.update.markDownloaded
+import dev.cheng.keyboard.update.openInstallPermission
+import dev.cheng.keyboard.update.prepareInstall
+import dev.cheng.keyboard.update.updateApk
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private val Ink = Color(0xFF10131C)
 private val Field = Color(0xFF242838)
@@ -224,12 +240,187 @@ private fun Controls(
             }
         }
     }
+    UpdateSection(context, secrets)
     Spacer(Modifier.height(18.dp))
     Text(
         "按键、词库和用户词只留在这台设备上。询问、翻译和润色会把这一次的文字发给 DeepSeek。应用与中文词库按 GPL-3.0 授权。",
         color = Mute,
         fontSize = 14.sp,
         lineHeight = 21.sp,
+    )
+}
+
+@Composable
+private fun UpdateSection(context: Context, secrets: Secrets) {
+    val version = remember { installedVersionName(context) }
+    val client = remember { UpdateClient() }
+    val ticket = remember { intArrayOf(0) }
+    val main = remember { Handler(Looper.getMainLooper()) }
+    val scope = rememberCoroutineScope()
+    var phase by remember { mutableStateOf<UpdatePhase>(UpdatePhase.Idle) }
+    var showToken by remember { mutableStateOf(secrets.githubToken().isNullOrBlank()) }
+    var draft by remember { mutableStateOf("") }
+    DisposableEffect(client) {
+        onDispose {
+            client.cancel()
+            main.removeCallbacksAndMessages(null)
+        }
+    }
+
+    fun publish(current: Int, next: UpdatePhase) {
+        if (ticket[0] == current) phase = next
+    }
+
+    fun run(block: suspend (Int) -> Unit) {
+        val current = ++ticket[0]
+        client.cancel()
+        scope.launch { block(current) }
+    }
+
+    fun check(token: String) {
+        run { current ->
+            publish(current, UpdatePhase.Checking)
+            val next = withContext(Dispatchers.IO) {
+                markDownloaded(context, checkForUpdate(client, version, token))
+            }
+            if (ticket[0] == current && (next is UpdatePhase.UpToDate || next is UpdatePhase.Available)) {
+                showToken = false
+            }
+            publish(current, next)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        val token = secrets.githubToken().orEmpty()
+        if (token.isNotEmpty()) check(token)
+    }
+    LaunchedEffect(phase) {
+        if (phase is UpdatePhase.Failed && (phase as UpdatePhase.Failed).askToken) showToken = true
+    }
+
+    Section("更新")
+    Text("当前版本 $version", color = Mute, fontSize = 14.sp)
+    when (val current = phase) {
+        UpdatePhase.Idle -> Unit
+        UpdatePhase.Checking -> Status("正在检查…", Mute)
+        UpdatePhase.UpToDate -> Status("已是最新版本", Mute)
+        is UpdatePhase.Available -> {
+            Text(
+                "${current.release.version} 可以安装",
+                color = InkText,
+                fontSize = 16.sp,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            if (current.release.notes.isNotBlank()) {
+                Text(
+                    current.release.notes.take(280),
+                    color = Mute,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+        }
+        is UpdatePhase.Downloading -> Status("正在下载 ${current.percent}%", InkText)
+        is UpdatePhase.NeedsPermission -> Status("请允许 myboard 安装未知应用，然后继续安装。", InkText)
+        is UpdatePhase.Ready -> Status("如果安装界面没弹出，再点一次安装。", Mute)
+        is UpdatePhase.Failed -> Status(current.message, Color(0xFFF2B8B5))
+    }
+    if (showToken) {
+        Text(
+            "私有仓库需要一个能读取 myboard 的 GitHub 令牌，只保存在这台设备上。",
+            color = Mute,
+            fontSize = 14.sp,
+            lineHeight = 20.sp,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+        BasicTextField(
+            value = draft,
+            onValueChange = { draft = it },
+            textStyle = TextStyle(color = InkText, fontSize = 16.sp),
+            cursorBrush = SolidColor(Accent),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 10.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Field)
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            decorationBox = { inner ->
+                Box(Modifier.fillMaxWidth()) {
+                    if (draft.isEmpty()) {
+                        Text(
+                            if (secrets.githubToken().isNullOrBlank()) "GitHub 令牌" else "已保存，点此更换",
+                            color = Mute,
+                            fontSize = 16.sp,
+                        )
+                    }
+                    inner()
+                }
+            },
+        )
+    }
+    when (val current = phase) {
+        UpdatePhase.Checking, is UpdatePhase.Downloading -> Unit
+        is UpdatePhase.Available -> {
+            Link(if (current.downloaded) "安装" else "下载并安装") {
+                val token = secrets.githubToken().orEmpty()
+                if (current.downloaded) {
+                    phase = prepareInstall(context, updateApk(context, current.release.version))
+                } else {
+                    val release = current.release
+                    run { ticketId ->
+                        publish(ticketId, UpdatePhase.Downloading(0))
+                        val file = updateApk(context, release.version)
+                        val result = withContext(Dispatchers.IO) {
+                            client.download(token, release, file) { percent ->
+                                main.post { publish(ticketId, UpdatePhase.Downloading(percent)) }
+                            }
+                        }
+                        if (ticket[0] != ticketId) return@run
+                        val next = when (result) {
+                            is UpdateDownload.Ok -> prepareInstall(context, result.file)
+                            UpdateDownload.Unauthorized -> UpdatePhase.Failed("令牌无效。", askToken = true)
+                            is UpdateDownload.Failed -> UpdatePhase.Failed(result.message, askToken = false)
+                        }
+                        publish(ticketId, next)
+                    }
+                }
+            }
+        }
+        is UpdatePhase.NeedsPermission -> {
+            Link("去允许") { openInstallPermission(context) }
+            Link("继续安装") { phase = prepareInstall(context, current.file) }
+        }
+        is UpdatePhase.Ready -> Link("安装") { phase = prepareInstall(context, current.file) }
+        else -> {
+            Link(if (showToken && draft.isNotBlank()) "保存并检查" else "检查更新") {
+                if (draft.isNotBlank()) {
+                    secrets.setGithubToken(draft)
+                    draft = ""
+                }
+                val token = secrets.githubToken().orEmpty()
+                if (token.isBlank()) {
+                    showToken = true
+                    phase = UpdatePhase.Failed("先填写 GitHub 令牌。", askToken = true)
+                } else {
+                    check(token)
+                }
+            }
+        }
+    }
+    if (!showToken && !secrets.githubToken().isNullOrBlank()) {
+        Link("更换令牌") { showToken = true }
+    }
+}
+
+@Composable
+private fun Status(text: String, color: Color) {
+    Text(
+        text,
+        color = color,
+        fontSize = 15.sp,
+        lineHeight = 22.sp,
+        modifier = Modifier.padding(top = 8.dp),
     )
 }
 

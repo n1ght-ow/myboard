@@ -35,16 +35,27 @@ class Secrets(context: Context) {
     private val plain = app.getSharedPreferences("keyboard_secret_plain", Context.MODE_PRIVATE)
     private val encrypted = runCatching { openEncrypted(app) }.getOrNull()
 
-    fun get(): String? {
-        val fromEncrypted = encrypted?.getString(KEY, null)?.trim().orEmpty()
-        if (fromEncrypted.isNotEmpty()) return fromEncrypted
-        return plain.getString(KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
-    }
+    fun get(): String? = read(KEY)
 
     fun set(value: String) {
-        val trimmed = value.trim()
-        plain.edit().putString(KEY, trimmed).commit()
-        encrypted?.edit()?.putString(KEY, trimmed)?.commit()
+        write(KEY, value.trim())
+    }
+
+    fun githubToken(): String? = read(GITHUB)
+
+    fun setGithubToken(value: String) {
+        write(GITHUB, value.trim())
+    }
+
+    private fun read(name: String): String? {
+        val fromEncrypted = encrypted?.getString(name, null)?.trim().orEmpty()
+        if (fromEncrypted.isNotEmpty()) return fromEncrypted
+        return plain.getString(name, null)?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun write(name: String, value: String) {
+        plain.edit().putString(name, value).commit()
+        encrypted?.edit()?.putString(name, value)?.commit()
     }
 
     private fun openEncrypted(context: Context) = EncryptedSharedPreferences.create(
@@ -57,6 +68,7 @@ class Secrets(context: Context) {
 
     private companion object {
         const val KEY = "api_key"
+        const val GITHUB = "github_token"
     }
 }
 
