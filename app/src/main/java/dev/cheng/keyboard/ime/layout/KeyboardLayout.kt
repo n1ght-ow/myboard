@@ -27,6 +27,13 @@ data class KeyPlacement(val keys: List<PlacedKey>, val width: Float, val height:
 
 data class PopupBox(val x: Float, val y: Float, val cell: Float, val height: Float, val gap: Float)
 
+data class FloatingPopupBounds(
+    val x: Float,
+    val y: Float,
+    val width: Float,
+    val height: Float,
+)
+
 val NoPriors: List<Float> = List(26) { 0f }
 
 data class HitContext(
@@ -97,13 +104,46 @@ fun placeKeys(
     return KeyPlacement(placed, widthPx, height)
 }
 
-fun popupBox(key: PlacedKey, boardWidth: Float, sidePx: Float, gapX: Float): PopupBox {
+fun placeFloatingPopup(
+    anchor: PlacedKey,
+    popupWidth: Float,
+    popupHeight: Float,
+    gapAbove: Float,
+    boardWidth: Float,
+    sidePx: Float,
+    topClearancePx: Float,
+): FloatingPopupBounds {
+    val maxX = (boardWidth - sidePx - popupWidth).coerceAtLeast(sidePx)
+    val x = (anchor.x + anchor.w * 0.5f - popupWidth * 0.5f).coerceIn(sidePx, maxX)
+    val minY = -topClearancePx.coerceAtLeast(0f)
+    val y = (anchor.y - popupHeight - gapAbove).coerceAtLeast(minY)
+    return FloatingPopupBounds(
+        x = x,
+        y = y,
+        width = popupWidth,
+        height = popupHeight,
+    )
+}
+
+fun popupBox(
+    key: PlacedKey,
+    boardWidth: Float,
+    sidePx: Float,
+    gapX: Float,
+    topClearancePx: Float = 0f,
+): PopupBox {
     val cell = key.w
     val width = cell * 3f + gapX * 2f
-    val maxX = (boardWidth - sidePx - width).coerceAtLeast(sidePx)
-    val x = (key.x + key.w / 2f - width / 2f).coerceIn(sidePx, maxX)
-    val y = (key.y - gapX - key.h).coerceAtLeast(0f)
-    return PopupBox(x, y, cell, key.h, gapX)
+    val bounds = placeFloatingPopup(
+        anchor = key,
+        popupWidth = width,
+        popupHeight = key.h,
+        gapAbove = gapX,
+        boardWidth = boardWidth,
+        sidePx = sidePx,
+        topClearancePx = topClearancePx,
+    )
+    return PopupBox(bounds.x, bounds.y, cell, key.h, gapX)
 }
 
 fun hitKey(keys: List<PlacedKey>, x: Float, y: Float): PlacedKey? {

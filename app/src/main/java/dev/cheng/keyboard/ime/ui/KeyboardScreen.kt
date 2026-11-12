@@ -34,7 +34,11 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -46,6 +50,8 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.changedToDown
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -56,6 +62,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import dev.cheng.keyboard.ai.PolishTone
 import dev.cheng.keyboard.engine.applyCase
 import dev.cheng.keyboard.ime.KeyboardController
@@ -66,6 +73,7 @@ import dev.cheng.keyboard.ime.gesture.PopupPreview
 import dev.cheng.keyboard.ime.gesture.TapPreview
 import dev.cheng.keyboard.ime.layout.PlacedKey
 import dev.cheng.keyboard.ime.layout.hitKey
+import dev.cheng.keyboard.ime.layout.placeFloatingPopup
 import dev.cheng.keyboard.ime.layout.placeKeys
 import dev.cheng.keyboard.ime.layout.touchSampleOf
 import dev.cheng.keyboard.model.Candidate
@@ -76,6 +84,7 @@ import dev.cheng.keyboard.model.KeyboardPage
 import dev.cheng.keyboard.model.Language
 import dev.cheng.keyboard.model.ShiftState
 import dev.cheng.keyboard.model.ThemeMode
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 
 internal data class Palette(
@@ -609,7 +618,19 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
         CandidateGrid(state, palette, controller, keyHeight)
         return
     }
-    BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 0.dp)) {
+    val outerDensity = LocalDensity.current
+    val topSafeMarginPx = with(outerDensity) { 2.dp.toPx() }
+    val minTopClearancePx = with(outerDensity) { (ToolbarHeight - 2.dp).toPx() }
+    var topClearancePx by remember(outerDensity) { mutableFloatStateOf(minTopClearancePx) }
+    BoxWithConstraints(
+        Modifier
+            .fillMaxWidth()
+            .zIndex(1f)
+            .onGloballyPositioned { coords ->
+                topClearancePx = (coords.positionInParent().y - topSafeMarginPx).coerceAtLeast(minTopClearancePx)
+            }
+            .padding(horizontal = 0.dp),
+    ) {
         val density = LocalDensity.current
         val widthPx = with(density) { maxWidth.toPx() }
         val heightPx = with(density) { keyHeight.toPx() }
@@ -717,13 +738,13 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
                 if (tapAnchor != null) {
                     val showUpper = state.engine.language == Language.English &&
                         state.engine.shift != ShiftState.Off
-                    TapBubble(tapPreview, showUpper, tapAnchor, widthPx, side, palette, density)
+                    TapBubble(tapPreview, showUpper, tapAnchor, widthPx, side, topClearancePx, palette, density)
                 }
             }
             val popup = state.popup
             val anchor = placement.keys.firstOrNull { it.model.id == popup?.keyId }
             if (popup != null && anchor != null) {
-                PopupKeys(popup, anchor, widthPx, side, gapX, palette, density)
+                PopupKeys(popup, anchor, widthPx, side, topClearancePx, palette, density)
             }
         }
     }
@@ -867,34 +888,57 @@ private fun TapBubble(
     anchor: PlacedKey,
     boardWidth: Float,
     side: Float,
+    topClearancePx: Float,
     palette: Palette,
     density: androidx.compose.ui.unit.Density,
 ) {
-    val bubbleWidth = 48.dp
-    val bubbleHeight = 56.dp
-    val bubbleWidthPx = with(density) { bubbleWidth.toPx() }
-    val bubbleHeightPx = with(density) { bubbleHeight.toPx() }
-    val gapAbovePx = with(density) { 4.dp.toPx() }
-    val maxX = (boardWidth - side - bubbleWidthPx).coerceAtLeast(side)
-    val x = (anchor.x + anchor.w / 2f - bubbleWidthPx / 2f).coerceIn(side, maxX)
-    val y = (anchor.y - bubbleHeightPx - gapAbovePx).coerceAtLeast(0f)
-    val bubbleShape = RoundedCornerShape(12.dp)
+    val anchorWidthDp = with(density) { anchor.w.toDp() }
+    val bubbleWidth = (anchorWidthDp + 4.dp).coerceIn(34.dp, 40.dp)
+    val bubbleHeight = 38.dp
+    val gapAbove = 5.dp
+    val bounds = placeFloatingPopup(
+        anchor = anchor,
+        popupWidth = with(density) { bubbleWidth.toPx() },
+        popupHeight = with(density) { bubbleHeight.toPx() },
+        gapAbove = with(density) { gapAbove.toPx() },
+        boardWidth = boardWidth,
+        sidePx = side,
+        topClearancePx = topClearancePx,
+    )
+    val tickWidth = 8.dp
+    val tickWidthPx = with(density) { tickWidth.toPx() }
+    val tickInsetPx = with(density) { 6.dp.toPx() }
+    val tickMaxX = (bounds.width - tickInsetPx - tickWidthPx).coerceAtLeast(tickInsetPx)
+    val tickX = (anchor.x + anchor.w * 0.5f - bounds.x - tickWidthPx * 0.5f).coerceIn(tickInsetPx, tickMaxX)
+    val bubbleShape = RoundedCornerShape(10.dp)
     Box(
         Modifier
-            .offset { IntOffset(x.toInt(), y.toInt()) }
+            .zIndex(2f)
+            .offset { IntOffset(bounds.x.roundToInt(), bounds.y.roundToInt()) }
             .size(bubbleWidth, bubbleHeight)
-            .shadow(elevation = 4.dp, shape = bubbleShape, clip = false)
+            .shadow(elevation = 3.dp, shape = bubbleShape, clip = false)
             .clip(bubbleShape)
             .background(palette.sheetElevated)
-            .border(0.8.dp, palette.keyBorder, bubbleShape),
+            .border(0.7.dp, palette.divider, bubbleShape),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             if (showUpper) tap.label.uppercase() else tap.label,
             color = palette.label,
-            fontSize = 24.sp,
-            fontWeight = FontWeight.Medium,
+            fontSize = 19.sp,
+            lineHeight = 20.sp,
+            fontWeight = FontWeight.SemiBold,
             maxLines = 1,
+            modifier = Modifier.offset(y = (-1).dp),
+        )
+        Box(
+            Modifier
+                .align(Alignment.BottomStart)
+                .offset { IntOffset(tickX.roundToInt(), 0) }
+                .padding(bottom = 3.dp)
+                .size(width = tickWidth, height = 2.dp)
+                .clip(CircleShape)
+                .background(palette.accent.copy(alpha = 0.5f)),
         )
     }
 }
@@ -905,47 +949,56 @@ private fun PopupKeys(
     anchor: PlacedKey,
     boardWidth: Float,
     side: Float,
-    gapX: Float,
+    topClearancePx: Float,
     palette: Palette,
     density: androidx.compose.ui.unit.Density,
 ) {
-    val cell = 48.dp
-    val gap = 3.dp
-    val pad = 5.dp
-    val barWidth = pad * 2 + cell * 3 + gap * 2
-    val barHeight = 58.dp
-    val barWidthPx = with(density) { barWidth.toPx() }
-    val barHeightPx = with(density) { barHeight.toPx() }
-    val maxX = (boardWidth - side - barWidthPx).coerceAtLeast(side)
-    val x = (anchor.x + anchor.w / 2f - barWidthPx / 2f).coerceIn(side, maxX)
-    val y = (anchor.y - barHeightPx + with(density) { 8.dp.toPx() }).coerceAtLeast(0f)
+    val cellWidth = 34.dp
+    val cellHeight = 32.dp
+    val gap = 2.dp
+    val pad = 3.dp
+    val barWidth = pad * 2 + cellWidth * 3 + gap * 2
+    val barHeight = pad * 2 + cellHeight
+    val gapAbove = 5.dp
+    val bounds = placeFloatingPopup(
+        anchor = anchor,
+        popupWidth = with(density) { barWidth.toPx() },
+        popupHeight = with(density) { barHeight.toPx() },
+        gapAbove = with(density) { gapAbove.toPx() },
+        boardWidth = boardWidth,
+        sidePx = side,
+        topClearancePx = topClearancePx,
+    )
     val cells = listOf(Choice.Upper to popup.upper, Choice.Symbol to popup.symbol, Choice.Lower to popup.lower)
-    val bubbleShape = RoundedCornerShape(16.dp)
+    val bubbleShape = RoundedCornerShape(11.dp)
     Box(
         Modifier
-            .offset { IntOffset(x.toInt(), y.toInt()) }
+            .zIndex(2f)
+            .offset { IntOffset(bounds.x.roundToInt(), bounds.y.roundToInt()) }
             .size(barWidth, barHeight)
-            .shadow(elevation = 6.dp, shape = bubbleShape, clip = false)
+            .shadow(elevation = 4.dp, shape = bubbleShape, clip = false)
             .clip(bubbleShape)
             .background(palette.sheetElevated)
-            .border(0.8.dp, palette.divider, bubbleShape)
+            .border(0.7.dp, palette.divider, bubbleShape)
             .padding(pad),
     ) {
         cells.forEachIndexed { index, (choice, label) ->
             val selected = popup.choice == choice
             Box(
                 Modifier
-                    .offset(x = (cell + gap) * index)
-                    .size(cell)
-                    .clip(RoundedCornerShape(11.dp))
+                    .offset(x = (cellWidth + gap) * index)
+                    .size(width = cellWidth, height = cellHeight)
+                    .clip(RoundedCornerShape(8.dp))
                     .background(if (selected) palette.accent else Color.Transparent),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
                     label,
-                    color = if (selected) palette.onAccent else palette.label,
-                    fontSize = if (selected) 22.sp else 19.sp,
+                    color = if (selected) palette.onAccent else palette.label.copy(alpha = 0.76f),
+                    fontSize = if (selected) 17.sp else 14.sp,
+                    lineHeight = 18.sp,
                     fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                    maxLines = 1,
                 )
             }
         }

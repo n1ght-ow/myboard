@@ -11,6 +11,7 @@ import dev.cheng.keyboard.ime.layout.HitContext
 import dev.cheng.keyboard.ime.layout.NoPriors
 import dev.cheng.keyboard.ime.layout.effectivePriors
 import dev.cheng.keyboard.ime.layout.hitKey
+import dev.cheng.keyboard.ime.layout.placeFloatingPopup
 import dev.cheng.keyboard.ime.layout.placeKeys
 import dev.cheng.keyboard.ime.layout.touchSampleOf
 import dev.cheng.keyboard.ime.touch.TouchCalibrator
@@ -401,5 +402,35 @@ class TouchTypingTest {
             EnterKind.Go,
         ).state
         assertTrue(uriState.touchSamples.all { it == null })
+    }
+
+    @Test
+    fun topRowFloatingPopupsBreakIntoToolbarWithoutOverlappingKeys() {
+        val density = 3f
+        val topClearancePx = 44f * density
+        val gapAbovePx = 5f * density
+        val popupHeightPx = 38f * density
+        val tapWidthPx = 38f * density
+        val barWidthPx = 112f * density
+
+        val qKey = placement.keys.first { it.model.id == "l-q" }
+        val yKey = placement.keys.first { it.model.id == "l-y" }
+        val pKey = placement.keys.first { it.model.id == "l-p" }
+        assertEquals(0f, qKey.y, 1e-4f)
+
+        val qTap = placeFloatingPopup(qKey, tapWidthPx, popupHeightPx, gapAbovePx, 1080f, 12f, topClearancePx)
+        val yBar = placeFloatingPopup(yKey, barWidthPx, popupHeightPx, gapAbovePx, 1080f, 12f, topClearancePx)
+        val pBar = placeFloatingPopup(pKey, barWidthPx, popupHeightPx, gapAbovePx, 1080f, 12f, topClearancePx)
+
+        assertTrue(qTap.y < 0f)
+        assertEquals(-gapAbovePx, qTap.y + qTap.height, 1e-4f)
+        assertEquals(12f, qTap.x, 1e-4f)
+
+        assertTrue(yBar.y < 0f)
+        assertEquals(-gapAbovePx, yBar.y + yBar.height, 1e-4f)
+        assertEquals(yKey.x + yKey.w * 0.5f - barWidthPx * 0.5f, yBar.x, 1e-4f)
+
+        assertEquals(1080f - 12f - barWidthPx, pBar.x, 1e-4f)
+        assertTrue(pBar.y >= -topClearancePx)
     }
 }
