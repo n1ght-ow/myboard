@@ -1013,6 +1013,53 @@ class KeyboardLogicTest {
     }
 
     @Test
+    fun wholeSyllableBeatsGluedSingleCharacters() {
+        val dictDir = sequenceOf(
+            File("src/main/assets/dict"),
+            File("app/src/main/assets/dict"),
+        ).firstOrNull { it.isDirectory } ?: return
+        val realSyllables = File(dictDir, "syllables.txt").readLines().filter { it.isNotBlank() }.toSet()
+        val decoder = PinyinDecoder(realSyllables)
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("小", "xiao", "xiao", 6_383_822),
+                LexRow("先", "xian", "xian", 5_900_000),
+                LexRow("当", "dang", "dang", 3_437_226),
+                LexRow("用", "yong", "yong", 3_100_000),
+                LexRow("蛋糕", "dan gao", "dangao", 815_478),
+                LexRow("西安", "xi an", "xian", 300_000),
+                LexRow("西奥", "xi ao", "xiao", 100_000),
+                LexRow("洗", "xi", "xi", 2_290_306),
+                LexRow("啊", "a", "a", 5_366_043),
+                LexRow("哦", "o", "o", 3_563_330),
+                LexRow("呢", "ne", "ne", 2_000_000),
+            ),
+        )
+
+        // A syllable typed in full must stay one syllable: no "xi'a'o" split, no 洗啊哦 chain.
+        val xiao = decoder.decode("xiao", fuzzy = false)
+        assertEquals("小", xiao.candidates.first().text)
+        assertEquals("xiao", xiao.preedit)
+        assertTrue(xiao.candidates.take(3).none { it.text == "洗啊哦" })
+        assertTrue(xiao.candidates.any { it.text == "西奥" })
+
+        val xian = decoder.decode("xian", fuzzy = false)
+        assertEquals("先", xian.candidates.first().text)
+        assertEquals("xian", xian.preedit)
+
+        // One letter can never be eaten by a neighbouring syllable of the same length, so
+        // "dang" is 当 and not the initials 蛋(dan)+糕(gao).
+        assertEquals("当", decoder.decode("dang", fuzzy = false).candidates.first().text)
+        assertEquals("dang", decoder.decode("dang", fuzzy = false).preedit)
+        assertEquals("用", decoder.decode("yong", fuzzy = false).candidates.first().text)
+
+        // Multi-syllable input keeps preferring the split that spells real words.
+        val dangao = decoder.decode("dangao", fuzzy = false)
+        assertEquals("蛋糕", dangao.candidates.first().text)
+        assertEquals("dan gao", dangao.candidates.first().syllables)
+    }
+
+    @Test
     fun realBundledSyllablesAndEnglishLexiconDecodeAccurately() {
         val dictDir = sequenceOf(
             File("src/main/assets/dict"),

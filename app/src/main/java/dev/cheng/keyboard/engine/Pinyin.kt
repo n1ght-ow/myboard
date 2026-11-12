@@ -389,16 +389,30 @@ class PinyinDecoder(syllables: Set<String>) {
         val pinyin = ArrayList<Scored>()
         val ordered = ArrayList<Scored>()
         val seen = HashSet<String>()
-        for ((index, seg) in chosen.withIndex()) {
-            val block = book.rank(book.candidates(seg))
-            val leading = if (index == 0) book.rank(book.prefixes(seg)) else emptyList()
-            for (item in block + leading) {
+        val blocks = chosen.map { seg -> book.rank(book.candidates(seg)) }
+        // The segmentation with the most convincing spelling leads: "dan'gao" (蛋糕) beats
+        // "dang'ao", "xiao" (小) beats "xi'ao" (西奥), and junk splits sink to the tail.
+        val primaryIndex = if (full.firstOrNull()?.parts?.size == 1 && trie.isWord(letters)) {
+            0
+        } else {
+            blocks.indices.maxByOrNull { index -> blocks[index].maxOfOrNull { book.worth(it) } ?: Double.NEGATIVE_INFINITY } ?: -1
+        }
+        val order = if (primaryIndex >= 0) {
+            listOf(primaryIndex) + blocks.indices.filter { it != primaryIndex }
+        } else {
+            blocks.indices.toList()
+        }
+        for ((position, index) in order.withIndex()) {
+            val seg = chosen[index]
+            val leading = if (position == 0) book.rank(book.prefixes(seg)) else emptyList()
+            for (item in blocks[index] + leading) {
                 pinyin += item
                 if (seen.add(item.text)) ordered += item
             }
         }
 
-        val solid = full.firstOrNull()?.parts?.all { it.length >= 2 } == true && ordered.isNotEmpty()
+        val primarySeg = chosen.getOrNull(primaryIndex)
+        val solid = primarySeg?.parts?.all { it.length >= 2 } == true && ordered.isNotEmpty()
         val wholeAbbrev = if (solid || letters.length !in 2..64) {
             emptyList()
         } else {
@@ -411,7 +425,7 @@ class PinyinDecoder(syllables: Set<String>) {
         }
 
         var body = if (solid) ordered else book.rank(pinyin + wholeAbbrev + mixedAbbrev)
-        val primary = full.firstOrNull() ?: open.firstOrNull()
+        val primary = primarySeg ?: full.firstOrNull() ?: open.firstOrNull()
 
         if (fuzzy && primary != null) {
             val fuzzyTarget = if (!primary.partial) {
@@ -731,9 +745,16 @@ class PinyinDecoder(syllables: Set<String>) {
         val preedit: String,
         val typo: Boolean,
         val consumed: Int,
+        val pieces: Int = 1,
     )
 
-    private data class Piece(val text: String, val syllables: String, val freq: Int, val score: Double)
+    private data class Piece(
+        val text: String,
+        val syllables: String,
+        val freq: Int,
+        val score: Double,
+        val pieces: Int = 1,
+    )
 
     private inner class Book {
         private val cache = HashMap<String, List<LexRow>>()
@@ -753,7 +774,7 @@ class PinyinDecoder(syllables: Set<String>) {
             }
             for (piece in cover(seg.parts)) {
                 if (piece.text.isEmpty()) continue
-                items += Scored(piece.text, piece.syllables, piece.freq, piece.score, preedit, false, used)
+                items += Scored(piece.text, piece.syllables, piece.freq, piece.score, preedit, false, used, piece.pieces)
             }
             if ((seg.partial || seg.parts.size >= 2) && seg.parts.isNotEmpty() && trie.hasExtension(seg.parts.last())) {
                 items += opened(seg)
@@ -938,6 +959,16 @@ class PinyinDecoder(syllables: Set<String>) {
             }
         }
 
+        // Scores add up per piece and grow with the square of the text length, so a chain of cheap
+        // single characters ("xi'a'o" -> 洗啊哦) outranks an obvious word. Charge for every glued piece.
+        private fun effective(item: Scored): Double = item.score - FRAGMENT_PENALTY * (item.pieces - 1)
+
+        // Per-syllable worth, used to decide which syllable split of the same input is the believable one.
+        fun worth(item: Scored): Double {
+            val syllables = if (item.syllables.isBlank()) 1 else item.syllables.count { it == ' ' } + 1
+            return item.score / (syllables.toDouble() * syllables)
+        }
+
         fun fuzzy(seg: Seg): List<Scored> {
             if (seg.parts.isEmpty() || seg.parts.size > 6) return emptyList()
             val used = typedLength(seg.parts)
@@ -960,7 +991,7 @@ class PinyinDecoder(syllables: Set<String>) {
                     } else if (parts.size >= 2) {
                         for (piece in cover(parts).take(1)) {
                             if (piece.text.isNotEmpty()) {
-                                items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 36.0, preedit, false, used)
+                                items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 36.0, preedit, false, used, piece.pieces)
                             }
                         }
                     }
@@ -1043,7 +1074,7 @@ class PinyinDecoder(syllables: Set<String>) {
                 } else if (seg.parts.size >= 2) {
                     for (piece in cover(seg.parts).take(1)) {
                         if (piece.text.isNotEmpty()) {
-                            items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 40.0 * cost, letters, true, letters.length)
+                            items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 40.0 * cost, letters, true, letters.length, piece.pieces)
                         }
                     }
                 }
@@ -1068,7 +1099,7 @@ class PinyinDecoder(syllables: Set<String>) {
                     } else {
                         for (piece in cover(seg.parts).take(1)) {
                             if (piece.text.isNotEmpty()) {
-                                items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 38.0, letters, true, letters.length)
+                                items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 38.0, letters, true, letters.length, piece.pieces)
                             }
                         }
                     }
@@ -1099,6 +1130,7 @@ class PinyinDecoder(syllables: Set<String>) {
                                     letters,
                                     true,
                                     letters.length,
+                                    hp.pieces + 1,
                                 )
                             }
                         }
@@ -1163,9 +1195,9 @@ class PinyinDecoder(syllables: Set<String>) {
             for (item in items) {
                 if (item.text.isEmpty()) continue
                 val previous = best[item.text]
-                if (previous == null || item.score > previous.score) best[item.text] = item
+                if (previous == null || effective(item) > effective(previous)) best[item.text] = item
             }
-            return best.values.sortedByDescending { it.score }
+            return best.values.sortedByDescending { effective(it) }
         }
 
         private fun opened(seg: Seg): List<Scored> {
@@ -1201,6 +1233,7 @@ class PinyinDecoder(syllables: Set<String>) {
                                 preedit,
                                 false,
                                 used,
+                                hp.pieces + 1,
                             )
                         }
                     }
@@ -1219,6 +1252,7 @@ class PinyinDecoder(syllables: Set<String>) {
                         preedit,
                         false,
                         used,
+                        piece.pieces + 1,
                     )
                 }
             }
@@ -1251,6 +1285,7 @@ class PinyinDecoder(syllables: Set<String>) {
                                 joinSyl(prev.syllables, row.syllables),
                                 if (prev.text.isEmpty()) row.freq else minOf(prev.freq, row.freq),
                                 prev.score + wordScore(row.text, row.freq),
+                                prev.pieces + 1,
                             )
                         }
                     }
@@ -1265,6 +1300,7 @@ class PinyinDecoder(syllables: Set<String>) {
                                 joinSyl(prev.syllables, row.syllables),
                                 if (prev.text.isEmpty()) row.freq else minOf(prev.freq, row.freq),
                                 prev.score + wordScore(row.text, row.freq) - 24.0,
+                                prev.pieces + 1,
                             )
                         }
                     }
@@ -1431,8 +1467,14 @@ class PinyinDecoder(syllables: Set<String>) {
             return last.startsWith(typed) && last.length > typed.length
         }
 
-        private fun scored(row: LexRow, score: Double, preedit: String, typo: Boolean, consumed: Int) =
-            Scored(row.text, row.syllables, row.freq, score, preedit, typo, consumed)
+        private fun scored(
+            row: LexRow,
+            score: Double,
+            preedit: String,
+            typo: Boolean,
+            consumed: Int,
+            pieces: Int = 1,
+        ) = Scored(row.text, row.syllables, row.freq, score, preedit, typo, consumed, pieces)
 
         private fun typedLength(parts: List<String>) = parts.sumOf { it.length }
 
@@ -1460,6 +1502,7 @@ class PinyinDecoder(syllables: Set<String>) {
 
     private companion object {
         const val FULL_WORD_BONUS = 28.0
+        const val FRAGMENT_PENALTY = 10.0
         val shengmu = setOf("zh", "ch", "sh")
         val commonContinuations = mapOf(
             "我" to listOf("们", "的", "是", "在", "有", "也", "觉得", "想"),
