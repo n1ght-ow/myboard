@@ -9,6 +9,7 @@ import dev.cheng.keyboard.engine.LatinDecoder
 import dev.cheng.keyboard.engine.PinyinDecoder
 import dev.cheng.keyboard.engine.expandSyllable
 import dev.cheng.keyboard.engine.applyAskDraft
+import dev.cheng.keyboard.engine.applyCase
 import dev.cheng.keyboard.engine.previousWordUnits
 import dev.cheng.keyboard.engine.segmentPinyin
 import dev.cheng.keyboard.engine.shouldAutoCap
@@ -510,4 +511,346 @@ class KeyboardLogicTest {
         assertEquals("修复闪烁", release?.notes)
         assertEquals(null, parseLatestRelease("{}"))
     }
+
+    @Test
+    fun pinyinNormalizesNueLueAndUmlautAliases() {
+        val decoder = PinyinDecoder(setOf("zhan", "lve", "nve", "dai", "jue", "ding", "xue", "xi"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("战略", "zhan lve", "zhanlve", 500_000),
+                LexRow("虐待", "nve dai", "nvedai", 300_000),
+                LexRow("决定", "jue ding", "jueding", 600_000),
+                LexRow("学习", "xue xi", "xuexi", 800_000),
+            ),
+        )
+        assertEquals("战略", decoder.decode("zhanlue", fuzzy = false).candidates.first().text)
+        assertEquals("虐待", decoder.decode("nuedai", fuzzy = false).candidates.first().text)
+        assertEquals("决定", decoder.decode("jveding", fuzzy = false).candidates.first().text)
+        assertEquals("学习", decoder.decode("xvexi", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun expandedFuzzyPinyinCoversFHAndOngEng() {
+        assertTrue("fu" in expandSyllable("hu"))
+        assertTrue("dong" in expandSyllable("deng"))
+        val decoder = PinyinDecoder(setOf("fu", "hu", "jian", "dong", "deng", "xi"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("福建", "fu jian", "fujian", 500_000),
+                LexRow("东西", "dong xi", "dongxi", 700_000),
+            ),
+        )
+        assertTrue(decoder.decode("hujian", fuzzy = true).candidates.any { it.text == "福建" })
+        assertTrue(decoder.decode("dengxi", fuzzy = true).candidates.any { it.text == "东西" })
+    }
+
+    @Test
+    fun progressiveSelectionLearnsComposedChinesePhrase() {
+        val decoder = PinyinDecoder(setOf("ren", "gong", "zhi", "neng", "ti"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("人工", "ren gong", "rengong", 400_000),
+                LexRow("智能", "zhi neng", "zhineng", 500_000),
+                LexRow("人工智能", "ren gong zhi neng", "rengongzhineng", 600_000),
+                LexRow("体", "ti", "ti", 300_000),
+            ),
+        )
+        val engine = InputEngine(LatinDecoder())
+        val firstDecode = decoder.decode("rengongzhinengti", fuzzy = false)
+        val prefixIndex = firstDecode.candidates.indexOfFirst { it.text == "人工智能" }
+        assertTrue(prefixIndex >= 0)
+
+        var state = EngineState(raw = "rengongzhinengti", candidates = firstDecode.candidates)
+        val step1 = engine.reduce(state, EngineAct.Pick(prefixIndex), EnterKind.Newline)
+        assertEquals("ti", step1.state.raw)
+        assertEquals("人工智能", step1.state.partialText)
+
+        val secondDecode = decoder.decode(step1.state.raw, fuzzy = false)
+        state = step1.state.copy(candidates = secondDecode.candidates)
+        val step2 = engine.reduce(state, EngineAct.Pick(0), EnterKind.Newline)
+        val learned = step2.cmds.filterIsInstance<Cmd.LearnZh>().single()
+        assertEquals("人工智能体", learned.text)
+        assertEquals("ren gong zhi neng ti", learned.syllables)
+
+        decoder.learn(learned.text, learned.syllables)
+        assertEquals("人工智能体", decoder.decode("rengongzhinengti", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun chineseInlineEnglishAndMidWordLanguageSwitchKeepInput() {
+        val latin = LatinDecoder().apply {
+            load(sequenceOf("wifi" to 500_000, "hello" to 800_000, "app" to 600_000))
+        }
+        val decoder = PinyinDecoder(setOf("a", "ni", "hao")).apply {
+            this.latin = latin
+            lexicon = MemoryLexicon(listOf(LexRow("阿", "a", "a", 500_000)))
+        }
+        assertEquals("wifi", decoder.decode("wifi", fuzzy = false).candidates.first().text)
+        assertEquals("hello", decoder.decode("hello", fuzzy = false).candidates.first().text)
+
+        val engine = InputEngine(latin)
+        var state = EngineState(language = Language.Chinese, raw = "hel", preedit = "hel")
+        val switched = engine.reduce(state, EngineAct.Language, EnterKind.Newline)
+        assertEquals(Language.English, switched.state.language)
+        assertEquals("hel", switched.state.raw)
+        assertEquals("hello", switched.state.candidates.first().text)
+    }
+
+    @Test
+    fun englishContractionsPronounAndExactWordPriority() {
+        val latin = LatinDecoder().apply {
+            load(sequenceOf("app" to 50_000, "application" to 80_000, "don't" to 400_000, "ill" to 90_000))
+        }
+        val engine = InputEngine(latin)
+
+        // Complete valid word "app" is not hijacked by higher-frequency longer word "application"
+        assertEquals("app", latin.suggest("app").first().text)
+
+        // Contraction auto-apostrophe and standalone "i" -> "I"
+        assertEquals("don't", latin.suggest("dont").first().text)
+        assertEquals("I'm", applyCase(latin.suggest("im").first().text, "im"))
+        assertTrue(latin.suggest("ill").map { it.text }.containsAll(listOf("ill", "i'll")))
+
+        var state = EngineState(language = Language.English)
+        state = engine.reduce(state, EngineAct.Letter('i', null, ""), EnterKind.Newline).state
+        val step = engine.reduce(state, EngineAct.Space, EnterKind.Newline)
+        assertEquals("I ", (step.cmds.first() as Cmd.Commit).text)
+    }
+
+    @Test
+    fun englishTypoAutocorrectUndoAndSmartPunctuation() {
+        val latin = LatinDecoder().apply {
+            load(sequenceOf("the" to 2_000_000, "hello" to 800_000, "thanks" to 600_000, "world" to 700_000))
+        }
+        assertEquals("the", latin.suggest("teh").first().text)
+        assertEquals("hello", latin.suggest("hellp").first().text)
+        assertEquals("thanks", latin.suggest("thnks").first().text)
+
+        val engine = InputEngine(latin)
+        var state = EngineState(language = Language.English)
+        for (ch in "teh") {
+            state = engine.reduce(state, EngineAct.Letter(ch, null, ""), EnterKind.Newline).state
+        }
+        // Space autocorrects "teh" -> "the "
+        val spaced = engine.reduce(state, EngineAct.Space, EnterKind.Newline)
+        assertEquals("the ", (spaced.cmds.first() as Cmd.Commit).text)
+
+        // Immediate Backspace undoes autocorrect back to "teh" and preserves verbatim on next Space
+        val undone = engine.reduce(spaced.state, EngineAct.Backspace, EnterKind.Newline)
+        assertEquals("teh", undone.state.raw)
+        assertTrue(undone.cmds.any { it is Cmd.DeleteCount && it.count == 4 })
+        val kept = engine.reduce(undone.state, EngineAct.Space, EnterKind.Newline)
+        assertEquals("teh ", (kept.cmds.first() as Cmd.Commit).text)
+
+        // Smart punctuation swallows trailing auto-space ("teh " + "." -> "teh. ") and arms Shift
+        val punctuated = engine.reduce(kept.state, EngineAct.Direct("."), EnterKind.Newline)
+        assertTrue(punctuated.cmds.first() is Cmd.DeleteOne)
+        assertEquals(". ", (punctuated.cmds[1] as Cmd.Commit).text)
+        assertEquals(ShiftState.Once, punctuated.state.shift)
+
+        // Double-space after word commit inserts ". " and arms Shift
+        val wordStep = engine.reduce(
+            engine.reduce(EngineState(language = Language.English), EngineAct.Letter('h', null, ""), EnterKind.Newline).state,
+            EngineAct.Space,
+            EnterKind.Newline,
+        )
+        val doubleSpaced = engine.reduce(wordStep.state, EngineAct.Space, EnterKind.Newline)
+        assertTrue(doubleSpaced.cmds.first() is Cmd.DeleteOne)
+        assertEquals(". ", (doubleSpaced.cmds[1] as Cmd.Commit).text)
+        assertEquals(ShiftState.Once, doubleSpaced.state.shift)
+    }
+
+    @Test
+    fun englishBigramPredictionAndFlickAndSpaceCursorGestures() {
+        val latin = LatinDecoder().apply {
+            load(sequenceOf("thank" to 500_000, "you" to 1_000_000))
+        }
+        val engine = InputEngine(latin)
+        var state = EngineState(language = Language.English)
+        for (ch in "thank") {
+            state = engine.reduce(state, EngineAct.Letter(ch, null, ""), EnterKind.Newline).state
+        }
+        val committed = engine.reduce(state, EngineAct.Space, EnterKind.Newline)
+        assertTrue(committed.state.associating)
+        assertEquals("you", committed.state.candidates.first().text)
+
+        // Flick up on letter -> Choice.Symbol; flick down -> Choice.Upper
+        val gesture = KeyGesture(slopPx = 16f, caseSlopPx = 24f, swipePx = 36f)
+        val qKey = KeyModel("l-q", KeyKind.Letter, "q", hint = "1")
+        gesture.down(qKey, 50f, 50f, 0L)
+        val flickUp = gesture.move(50f, 5f, 60L, null)
+        assertEquals(Choice.Symbol, flickUp.popup?.choice)
+        assertEquals(Choice.Symbol, (gesture.up().actions.single() as EngineAct.Letter).force)
+
+        gesture.down(qKey, 50f, 50f, 0L)
+        val flickDown = gesture.move(50f, 95f, 60L, null)
+        assertEquals(Choice.Upper, flickDown.popup?.choice)
+        assertEquals(Choice.Upper, (gesture.up().actions.single() as EngineAct.Letter).force)
+
+        // Spacebar horizontal slide moves cursor without committing a space on release
+        val spaceKey = KeyModel("space", KeyKind.Space, "")
+        gesture.down(spaceKey, 100f, 50f, 0L)
+        val slide = gesture.move(140f, 50f, 50L, spaceKey)
+        assertTrue(slide.actions.single() is EngineAct.MoveCursor)
+        assertTrue(gesture.up().actions.isEmpty())
+    }
+
+    @Test
+    fun multiWordMixedAndPureAbbreviationsNeverReturnEmpty() {
+        val decoder = PinyinDecoder(
+            setOf(
+                "a", "e", "o", "m", "n",
+                "jin", "tian", "qi", "zhe", "shi", "shen", "me",
+                "wo", "men", "meng", "gong", "si", "zuo", "bu", "zhi", "dao",
+                "zhong", "guo", "ren", "ni", "hao", "ma", "you", "kong",
+            ),
+        )
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("今天", "jin tian", "jintian", 600_000),
+                LexRow("天气", "tian qi", "tianqi", 500_000),
+                LexRow("这是", "zhe shi", "zheshi", 550_000),
+                LexRow("什么", "shen me", "shenme", 700_000),
+                LexRow("我", "wo", "wo", 2_000_000),
+                LexRow("我们", "wo men", "women", 900_000),
+                LexRow("梦", "meng", "meng", 150_000),
+                LexRow("死", "si", "si", 100_000),
+                LexRow("公司", "gong si", "gongsi", 650_000),
+                LexRow("工作", "gong zuo", "gongzuo", 700_000),
+                LexRow("不知道", "bu zhi dao", "buzhidao", 500_000),
+                LexRow("我是", "wo shi", "woshi", 600_000),
+                LexRow("中国人", "zhong guo ren", "zhongguoren", 450_000),
+                LexRow("你好", "ni hao", "nihao", 800_000),
+                LexRow("吗", "ma", "ma", 1_200_000),
+                LexRow("有空", "you kong", "youkong", 350_000),
+            ),
+        )
+
+        assertEquals("今天天气", decoder.decode("jintiantq", fuzzy = false).candidates.first().text)
+        assertEquals("这是什么", decoder.decode("zheshism", fuzzy = false).candidates.first().text)
+        assertEquals("我不知道", decoder.decode("wobzd", fuzzy = false).candidates.first().text)
+        assertEquals("我不知道", decoder.decode("wbzd", fuzzy = false).candidates.first().text)
+        assertEquals("我是中国人", decoder.decode("wszgr", fuzzy = false).candidates.first().text)
+        assertEquals("我是中国人", decoder.decode("woshzgr", fuzzy = false).candidates.first().text)
+        assertEquals("你好吗", decoder.decode("nhm", fuzzy = false).candidates.first().text)
+        assertEquals("我们公司", decoder.decode("womengs", fuzzy = false).candidates.first().text)
+        assertEquals("我们工作", decoder.decode("womengz", fuzzy = false).candidates.first().text)
+        assertEquals("今天有空吗", decoder.decode("jintianyoukma", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun manualSeparatorErhuaAndDeadEndSyllablesStayDecodableInSentences() {
+        val decoder = PinyinDecoder(
+            setOf(
+                "a", "e", "o", "m", "n",
+                "wo", "de", "fang", "fan", "gan", "an", "hen", "hao",
+                "ni", "qu", "na", "er", "le", "wan", "yi", "dian", "dou", "bu",
+                "zhei", "zhe", "ge", "shi", "shen", "me", "en", "ma",
+            ),
+        )
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("我", "wo", "wo", 2_000_000),
+                LexRow("的", "de", "de", 3_000_000),
+                LexRow("我的", "wo de", "wode", 800_000),
+                LexRow("方案", "fang an", "fangan", 450_000),
+                LexRow("很好", "hen hao", "henhao", 500_000),
+                LexRow("你", "ni", "ni", 1_500_000),
+                LexRow("去", "qu", "qu", 900_000),
+                LexRow("你去", "ni qu", "niqu", 300_000),
+                LexRow("哪儿", "na er", "naer", 450_000),
+                LexRow("了", "le", "le", 2_500_000),
+                LexRow("玩儿", "wan er", "waner", 250_000),
+                LexRow("一点儿", "yi dian er", "yidianer", 350_000),
+                LexRow("都不", "dou bu", "doubu", 300_000),
+                LexRow("这", "zhe", "zhe", 1_800_000),
+                LexRow("这个", "zhei ge", "zheige", 200_000),
+                LexRow("是", "shi", "shi", 2_200_000),
+                LexRow("什么", "shen me", "shenme", 700_000),
+                LexRow("嗯", "en", "en", 400_000),
+                LexRow("你好", "ni hao", "nihao", 800_000),
+                LexRow("吗", "ma", "ma", 1_100_000),
+            ),
+        )
+
+        // Multi-syllable manual apostrophe separator inside a longer phrase
+        assertEquals("我的方案很好", decoder.decode("wodefang'anhenhao", fuzzy = false).candidates.first().text)
+
+        // Trailing and mid-sentence erhua with exact consumed length for partial selection
+        assertEquals("玩儿", decoder.decode("wanr", fuzzy = false).candidates.first().text)
+        assertEquals("你去哪儿", decoder.decode("niqunar", fuzzy = false).candidates.first().text)
+        val erhuaSentence = decoder.decode("niqunarle", fuzzy = false)
+        assertEquals("你去哪儿了", erhuaSentence.candidates.first().text)
+        assertEquals(9, erhuaSentence.candidates.first().consumed)
+        assertEquals("一点儿都不", decoder.decode("yidianrdoubu", fuzzy = false).candidates.first().text)
+
+        // Colloquial "zhei" and single-letter "n"/"m" missing standalone nsy=1 entries never collapse multi-word DP
+        val zheiResult = decoder.decode("zheishishenme", fuzzy = false)
+        assertEquals("这是什么", zheiResult.candidates.first().text)
+        assertTrue(decoder.decode("nihaon", fuzzy = false).candidates.isNotEmpty())
+        assertTrue(decoder.decode("nihaom", fuzzy = false).candidates.any { it.text == "你好吗" })
+    }
+
+    @Test
+    fun longSentencesUnparseableTailsAndRichDictTyposAlwaysProduceCandidates() {
+        val decoder = PinyinDecoder(
+            setOf(
+                "jin", "tian", "wan", "shang", "wo", "men", "dou", "qu", "chi", "fan",
+                "ni", "hao", "he", "shi", "o", "zai", "zi",
+            ),
+        )
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("今", "jin", "jin", 400_000),
+                LexRow("今天", "jin tian", "jintian", 800_000),
+                LexRow("晚上", "wan shang", "wanshang", 700_000),
+                LexRow("我", "wo", "wo", 2_000_000),
+                LexRow("我们", "wo men", "women", 900_000),
+                LexRow("都", "dou", "dou", 1_000_000),
+                LexRow("去", "qu", "qu", 1_100_000),
+                LexRow("吃饭", "chi fan", "chifan", 650_000),
+                LexRow("你", "ni", "ni", 1_800_000),
+                LexRow("好", "hao", "hao", 1_600_000),
+                LexRow("你好", "ni hao", "nihao", 900_000),
+                LexRow("合适", "he shi", "heshi", 350_000),
+                LexRow("哦", "o", "o", 500_000),
+                LexRow("在", "zai", "zai", 2_100_000),
+                LexRow("子", "zi", "zi", 400_000),
+            ),
+        )
+
+        // 10-character full sentence decodes completely AND keeps leading word "今天" for left-to-right progressive confirm
+        val longSentence = decoder.decode("jintianwanshangwomendouquchifan", fuzzy = false)
+        assertEquals("今天晚上我们都去吃饭", longSentence.candidates.first().text)
+        assertTrue(longSentence.candidates.any { it.text == "今天" && it.consumed == 7 })
+
+        // Unparseable trailing letters ("xyz" / "i") never blank out candidates; picking prefix keeps the tail
+        val withBadTail = decoder.decode("womenjintianxyz", fuzzy = false)
+        assertTrue(withBadTail.candidates.isNotEmpty())
+        assertEquals("我们今天", withBadTail.candidates.first().text)
+        assertEquals(12, withBadTail.candidates.first().consumed)
+        assertEquals("wo'men'jin'tian'xyz", withBadTail.preedit)
+
+        val engine = InputEngine(LatinDecoder())
+        val picked = engine.reduce(
+            EngineState(raw = "womenjintianxyz", candidates = withBadTail.candidates),
+            EngineAct.Pick(0),
+            EnterKind.Newline,
+        )
+        assertEquals("我们今天", (picked.cmds.first() as Cmd.Commit).text)
+        assertEquals("xyz", picked.state.raw)
+
+        assertTrue(decoder.decode("womeni", fuzzy = false).candidates.isNotEmpty())
+        assertTrue(decoder.decode("womenii", fuzzy = false).candidates.isNotEmpty())
+        val trailingTripleI = decoder.decode("womeniii", fuzzy = false)
+        assertEquals("我们", trailingTripleI.candidates.first().text)
+        assertEquals(5, trailingTripleI.candidates.first().consumed)
+
+        // Even when "合适" (hs), "哦" (o), and "子" (zi) exist in the dictionary, typos still offer intended words
+        assertTrue(decoder.decode("nihso", fuzzy = false).candidates.any { it.text == "你好" })
+        assertTrue(decoder.decode("nihsow", fuzzy = false).candidates.any { it.text == "你好我" })
+        assertTrue(decoder.decode("nihsoz", fuzzy = false).candidates.any { it.text == "你好在" })
+    }
 }
+
+

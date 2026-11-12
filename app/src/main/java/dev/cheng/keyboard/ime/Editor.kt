@@ -1,11 +1,13 @@
 package dev.cheng.keyboard.ime
 
+import android.view.KeyEvent
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import dev.cheng.keyboard.engine.Cmd
 import dev.cheng.keyboard.engine.previousWordUnits
 import dev.cheng.keyboard.model.EnterKind
+import kotlin.math.abs
 
 fun isPasswordField(info: EditorInfo): Boolean {
     val variation = info.inputType and EditorInfo.TYPE_MASK_VARIATION
@@ -96,7 +98,7 @@ class EditorBridge(private val connection: () -> InputConnection?) {
         for (cmd in cmds) {
             when (cmd) {
                 is Cmd.Commit -> {
-                    input.commitText(cmd.text, 1)
+                    commitSmart(input, cmd.text)
                     composing = false
                 }
                 is Cmd.Compose -> {
@@ -108,7 +110,9 @@ class EditorBridge(private val connection: () -> InputConnection?) {
                     composing = false
                 }
                 Cmd.DeleteOne -> deleteOne(input)
+                is Cmd.DeleteCount -> if (cmd.count > 0) input.deleteSurroundingText(cmd.count, 0)
                 Cmd.DeleteWord -> deleteWord(input)
+                is Cmd.MoveCursor -> moveCursor(input, cmd.delta)
                 is Cmd.EditorAction -> input.performEditorAction(cmd.kind.imeAction())
                 is Cmd.LearnZh, is Cmd.LearnEn -> Unit
             }
@@ -117,6 +121,50 @@ class EditorBridge(private val connection: () -> InputConnection?) {
 
     fun reset() {
         composing = false
+    }
+
+    private fun commitSmart(input: InputConnection, text: String) {
+        // Convert <digit>。<digit> -> <digit>.<digit> and <digit>：<digit> -> <digit>:<digit> automatically
+        if (!composing && text.isNotEmpty() && text[0] in '0'..'9') {
+            val before = input.getTextBeforeCursor(2, 0)?.toString().orEmpty()
+            if (before.length == 2 && before[0] in '0'..'9') {
+                when (before[1]) {
+                    '。' -> {
+                        input.deleteSurroundingText(1, 0)
+                        input.commitText(".$text", 1)
+                        return
+                    }
+                    '：' -> {
+                        input.deleteSurroundingText(1, 0)
+                        input.commitText(":$text", 1)
+                        return
+                    }
+                }
+            }
+        }
+        input.commitText(text, 1)
+    }
+
+    private fun moveCursor(input: InputConnection, delta: Int) {
+        if (delta == 0) return
+        val extracted = input.getExtractedText(ExtractedTextRequest(), 0)
+        if (extracted?.text != null && extracted.selectionEnd >= 0) {
+            val content = extracted.text.toString()
+            var pos = extracted.selectionEnd.coerceIn(0, content.length)
+            val direction = if (delta > 0) 1 else -1
+            repeat(abs(delta)) {
+                pos = runCatching {
+                    content.offsetByCodePoints(pos, direction)
+                }.getOrDefault((pos + direction).coerceIn(0, content.length))
+            }
+            input.setSelection(pos, pos)
+            return
+        }
+        val code = if (delta < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
+        repeat(abs(delta)) {
+            input.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+            input.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+        }
     }
 
     private fun deleteOne(input: InputConnection) {

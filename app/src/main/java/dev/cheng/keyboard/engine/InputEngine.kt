@@ -18,6 +18,12 @@ data class EngineState(
     val password: Boolean = false,
     val noLearn: Boolean = false,
     val page: KeyboardPage = KeyboardPage.Letters,
+    val partialText: String = "",
+    val partialSyllables: String = "",
+    val autoSpace: Boolean = false,
+    val lastEnglishWord: String? = null,
+    val undoAutocorrect: Pair<String, Int>? = null,
+    val verbatimFirst: Boolean = false,
 )
 
 sealed interface Cmd {
@@ -25,10 +31,12 @@ sealed interface Cmd {
     data class Compose(val text: String) : Cmd
     data object ClearCompose : Cmd
     data object DeleteOne : Cmd
+    data class DeleteCount(val count: Int) : Cmd
     data object DeleteWord : Cmd
+    data class MoveCursor(val delta: Int) : Cmd
     data class EditorAction(val kind: EnterKind) : Cmd
     data class LearnZh(val text: String, val syllables: String) : Cmd
-    data class LearnEn(val word: String) : Cmd
+    data class LearnEn(val word: String, val prevWord: String? = null) : Cmd
 }
 
 sealed interface EngineAct {
@@ -37,6 +45,7 @@ sealed interface EngineAct {
     data object Space : EngineAct
     data object Backspace : EngineAct
     data object BackspaceWord : EngineAct
+    data class MoveCursor(val delta: Int) : EngineAct
     data object Enter : EngineAct
     data object Shift : EngineAct
     data object Language : EngineAct
@@ -60,6 +69,7 @@ class InputEngine(private val latin: LatinDecoder) {
             EngineAct.Space -> space(state)
             EngineAct.Backspace -> backspace(state)
             EngineAct.BackspaceWord -> backspaceWord(state)
+            is EngineAct.MoveCursor -> moveCursor(state, act.delta)
             EngineAct.Enter -> enter(state, enter)
             EngineAct.Shift -> if (state.language == Language.Chinese && state.raw.isNotEmpty() && !state.password) {
                 separate(state)
@@ -105,7 +115,14 @@ class InputEngine(private val latin: LatinDecoder) {
                 }
                 val raw = state.raw + base
                 return EngineStep(
-                    state.copy(raw = raw, preedit = raw, associating = false, candidates = emptyList()),
+                    state.copy(
+                        raw = raw,
+                        preedit = raw,
+                        associating = false,
+                        candidates = emptyList(),
+                        autoSpace = false,
+                        undoAutocorrect = null,
+                    ),
                     listOf(Cmd.Compose(raw)),
                     pending = Pending.Pinyin,
                 )
@@ -115,13 +132,7 @@ class InputEngine(private val latin: LatinDecoder) {
 
     private fun englishLetter(state: EngineState, base: Char, act: EngineAct.Letter): EngineStep {
         return when (act.force) {
-            Choice.Symbol -> {
-                val pending = takePending(state)
-                EngineStep(
-                    pending.first.copy(shift = shiftAfter(state.shift, act.symbol), candidates = emptyList()),
-                    pending.second + Cmd.Commit(act.symbol),
-                )
-            }
+            Choice.Symbol -> commitEnglishSymbolOrPunctuation(state, act.symbol)
             Choice.Upper -> appendEnglish(state, base.uppercaseChar(), consumeShift = false)
             Choice.Lower -> appendEnglish(state, base, consumeShift = false)
             null -> appendEnglish(
@@ -134,13 +145,17 @@ class InputEngine(private val latin: LatinDecoder) {
 
     private fun appendEnglish(state: EngineState, ch: Char, consumeShift: Boolean): EngineStep {
         val raw = state.raw + ch
+        val keepVerbatim = state.verbatimFirst && state.raw.isNotEmpty()
         return EngineStep(
             state.copy(
                 raw = raw,
                 preedit = raw,
-                candidates = latin.suggest(raw.lowercase()),
+                candidates = latin.suggest(raw.lowercase(), verbatimFirst = keepVerbatim),
                 associating = false,
                 shift = if (consumeShift) ShiftState.Off else state.shift,
+                autoSpace = false,
+                undoAutocorrect = null,
+                verbatimFirst = keepVerbatim,
             ),
             listOf(Cmd.Compose(raw)),
         )
@@ -148,10 +163,51 @@ class InputEngine(private val latin: LatinDecoder) {
 
     private fun direct(state: EngineState, text: String): EngineStep {
         if (state.password) return EngineStep(state, listOf(Cmd.Commit(text)))
+        if (state.language == Language.English) {
+            return commitEnglishSymbolOrPunctuation(state, text)
+        }
         val pending = takePending(state)
-        val shift = if (state.language == Language.English) shiftAfter(state.shift, text) else pending.first.shift
         return EngineStep(
-            pending.first.copy(shift = shift, associating = false, candidates = emptyList()),
+            pending.first.copy(
+                associating = false,
+                candidates = emptyList(),
+                partialText = "",
+                partialSyllables = "",
+                autoSpace = false,
+                undoAutocorrect = null,
+            ),
+            pending.second + Cmd.Commit(text),
+        )
+    }
+
+    private fun commitEnglishSymbolOrPunctuation(state: EngineState, text: String): EngineStep {
+        if (state.raw.isEmpty() && state.autoSpace && text in englishAttachPunctuation) {
+            val nextShift = shiftAfter(state.shift, text)
+            return EngineStep(
+                state.copy(
+                    shift = nextShift,
+                    associating = false,
+                    candidates = emptyList(),
+                    autoSpace = false,
+                    undoAutocorrect = null,
+                    verbatimFirst = false,
+                    lastEnglishWord = if (text in sentenceEndings) null else state.lastEnglishWord,
+                ),
+                listOf(Cmd.DeleteOne, Cmd.Commit("$text ")),
+            )
+        }
+        val pending = takePending(state)
+        val nextShift = shiftAfter(state.shift, text)
+        return EngineStep(
+            pending.first.copy(
+                shift = nextShift,
+                associating = false,
+                candidates = emptyList(),
+                autoSpace = false,
+                undoAutocorrect = null,
+                verbatimFirst = false,
+                lastEnglishWord = if (text in sentenceEndings) null else state.lastEnglishWord,
+            ),
             pending.second + Cmd.Commit(text),
         )
     }
@@ -163,7 +219,14 @@ class InputEngine(private val latin: LatinDecoder) {
                 val chosen = state.candidates.firstOrNull()
                 if (chosen == null) {
                     return EngineStep(
-                        state.copy(raw = "", preedit = "", candidates = emptyList(), associating = true),
+                        state.copy(
+                            raw = "",
+                            preedit = "",
+                            candidates = emptyList(),
+                            associating = true,
+                            partialText = "",
+                            partialSyllables = "",
+                        ),
                         listOf(Cmd.Commit(state.raw)),
                         pending = Pending.Associate,
                         associateFrom = state.raw,
@@ -180,44 +243,137 @@ class InputEngine(private val latin: LatinDecoder) {
                     associateFrom = text,
                 )
             }
-            return EngineStep(state, listOf(Cmd.Commit(" ")))
+            return EngineStep(state.copy(partialText = "", partialSyllables = ""), listOf(Cmd.Commit(" ")))
         }
+
+        // English Spacebar handling
         if (state.raw.isEmpty()) {
+            // Double-space after an auto-spaced word inserts ". " and arms auto-capitalization
+            if (state.autoSpace) {
+                val nextShift = if (state.shift == ShiftState.Caps) ShiftState.Caps else ShiftState.Once
+                return EngineStep(
+                    state.copy(
+                        shift = nextShift,
+                        associating = false,
+                        candidates = emptyList(),
+                        autoSpace = false,
+                        undoAutocorrect = null,
+                        lastEnglishWord = null,
+                        verbatimFirst = false,
+                    ),
+                    listOf(Cmd.DeleteOne, Cmd.Commit(". ")),
+                )
+            }
             val shift = if (state.shift == ShiftState.Caps) ShiftState.Caps else ShiftState.Off
-            return EngineStep(state.copy(shift = shift), listOf(Cmd.Commit(" ")))
+            return EngineStep(
+                state.copy(shift = shift, associating = false, candidates = emptyList(), autoSpace = false, undoAutocorrect = null),
+                listOf(Cmd.Commit(" ")),
+            )
         }
-        val word = state.candidates.firstOrNull()?.let { applyCase(it.text, state.raw) } ?: state.raw
-        val cmds = mutableListOf<Cmd>(Cmd.Commit("$word "))
-        if (learnable(state)) cmds += Cmd.LearnEn(word.lowercase())
+
+        val chosen = if (state.verbatimFirst) {
+            applyCase(state.raw, state.raw)
+        } else {
+            state.candidates.firstOrNull()?.let { applyCase(it.text, state.raw) } ?: applyCase(state.raw, state.raw)
+        }
+        val committed = "$chosen "
+        val cmds = mutableListOf<Cmd>(Cmd.Commit(committed))
+        if (learnable(state)) cmds += Cmd.LearnEn(chosen.lowercase(), state.lastEnglishWord)
         val shift = if (state.shift == ShiftState.Caps) ShiftState.Caps else ShiftState.Off
+        val nextPredictions = latin.predictNext(chosen.lowercase())
+        val undo = if (!state.verbatimFirst && chosen != state.raw) {
+            state.raw to committed.length
+        } else {
+            null
+        }
         return EngineStep(
-            state.copy(raw = "", preedit = "", candidates = emptyList(), shift = shift),
+            state.copy(
+                raw = "",
+                preedit = "",
+                candidates = nextPredictions,
+                associating = nextPredictions.isNotEmpty(),
+                shift = shift,
+                autoSpace = true,
+                lastEnglishWord = chosen.lowercase(),
+                undoAutocorrect = undo,
+                verbatimFirst = false,
+            ),
             cmds,
         )
     }
 
     private fun backspace(state: EngineState): EngineStep {
         if (state.raw.isEmpty()) {
+            // Undo English Spacebar autocorrect on immediate Backspace
+            val undo = state.undoAutocorrect
+            if (state.language == Language.English && undo != null) {
+                val (originalRaw, committedLen) = undo
+                return EngineStep(
+                    state.copy(
+                        raw = originalRaw,
+                        preedit = originalRaw,
+                        candidates = latin.suggest(originalRaw.lowercase(), verbatimFirst = true),
+                        associating = false,
+                        autoSpace = false,
+                        undoAutocorrect = null,
+                        verbatimFirst = true,
+                    ),
+                    listOf(Cmd.DeleteCount(committedLen), Cmd.Compose(originalRaw)),
+                )
+            }
             return EngineStep(
-                state.copy(associating = false, candidates = emptyList(), preedit = ""),
+                state.copy(
+                    associating = false,
+                    candidates = emptyList(),
+                    preedit = "",
+                    partialText = "",
+                    partialSyllables = "",
+                    autoSpace = false,
+                    undoAutocorrect = null,
+                    verbatimFirst = false,
+                ),
                 listOf(Cmd.DeleteOne),
             )
         }
         val raw = state.raw.dropLast(1)
         if (raw.isEmpty()) {
             return EngineStep(
-                state.copy(raw = "", preedit = "", candidates = emptyList(), associating = false),
+                state.copy(
+                    raw = "",
+                    preedit = "",
+                    candidates = emptyList(),
+                    associating = false,
+                    partialText = "",
+                    partialSyllables = "",
+                    autoSpace = false,
+                    undoAutocorrect = null,
+                    verbatimFirst = false,
+                ),
                 listOf(Cmd.ClearCompose),
             )
         }
         if (state.language == Language.English) {
             return EngineStep(
-                state.copy(raw = raw, preedit = raw, candidates = latin.suggest(raw.lowercase()), associating = false),
+                state.copy(
+                    raw = raw,
+                    preedit = raw,
+                    candidates = latin.suggest(raw.lowercase(), verbatimFirst = state.verbatimFirst),
+                    associating = false,
+                    autoSpace = false,
+                    undoAutocorrect = null,
+                ),
                 listOf(Cmd.Compose(raw)),
             )
         }
         return EngineStep(
-            state.copy(raw = raw, preedit = raw, candidates = emptyList(), associating = false),
+            state.copy(
+                raw = raw,
+                preedit = raw,
+                candidates = emptyList(),
+                associating = false,
+                partialText = "",
+                partialSyllables = "",
+            ),
             listOf(Cmd.Compose(raw)),
             pending = Pending.Pinyin,
         )
@@ -226,13 +382,48 @@ class InputEngine(private val latin: LatinDecoder) {
     private fun backspaceWord(state: EngineState): EngineStep {
         if (state.raw.isNotEmpty()) {
             return EngineStep(
-                state.copy(raw = "", preedit = "", candidates = emptyList(), associating = false),
+                state.copy(
+                    raw = "",
+                    preedit = "",
+                    candidates = emptyList(),
+                    associating = false,
+                    partialText = "",
+                    partialSyllables = "",
+                    autoSpace = false,
+                    undoAutocorrect = null,
+                    verbatimFirst = false,
+                ),
                 listOf(Cmd.ClearCompose),
             )
         }
         return EngineStep(
-            state.copy(associating = false, candidates = emptyList()),
+            state.copy(
+                associating = false,
+                candidates = emptyList(),
+                partialText = "",
+                partialSyllables = "",
+                autoSpace = false,
+                undoAutocorrect = null,
+                verbatimFirst = false,
+            ),
             listOf(Cmd.DeleteWord),
+        )
+    }
+
+    private fun moveCursor(state: EngineState, delta: Int): EngineStep {
+        if (delta == 0) return EngineStep(state)
+        if (state.raw.isNotEmpty()) return EngineStep(state)
+        return EngineStep(
+            state.copy(
+                associating = false,
+                candidates = emptyList(),
+                partialText = "",
+                partialSyllables = "",
+                autoSpace = false,
+                undoAutocorrect = null,
+                verbatimFirst = false,
+            ),
+            listOf(Cmd.MoveCursor(delta)),
         )
     }
 
@@ -249,7 +440,14 @@ class InputEngine(private val latin: LatinDecoder) {
                 for (ch in state.raw) if (ch in 'a'..'z' || ch in 'A'..'Z') append(ch)
             }
             return EngineStep(
-                state.copy(raw = "", preedit = "", candidates = emptyList(), associating = false),
+                state.copy(
+                    raw = "",
+                    preedit = "",
+                    candidates = emptyList(),
+                    associating = false,
+                    partialText = "",
+                    partialSyllables = "",
+                ),
                 listOf(Cmd.Commit(spelling)),
             )
         }
@@ -267,11 +465,87 @@ class InputEngine(private val latin: LatinDecoder) {
             state.language == Language.English -> ShiftState.Off
             else -> cleared.shift
         }
-        return EngineStep(cleared.copy(raw = "", preedit = "", associating = false, shift = shift), cmds)
+        return EngineStep(
+            cleared.copy(
+                raw = "",
+                preedit = "",
+                associating = false,
+                shift = shift,
+                partialText = "",
+                partialSyllables = "",
+                autoSpace = false,
+                lastEnglishWord = null,
+                undoAutocorrect = null,
+                verbatimFirst = false,
+            ),
+            cmds,
+        )
     }
 
     private fun switchLanguage(state: EngineState): EngineStep {
         val next = if (state.language == Language.Chinese) Language.English else Language.Chinese
+        // Seamless mid-word language switch: keep typed letters instead of discarding them!
+        if (!state.password && state.raw.isNotEmpty()) {
+            val letters = state.raw.filter { it in 'a'..'z' || it in 'A'..'Z' }
+            if (letters.isNotEmpty()) {
+                if (next == Language.English) {
+                    return EngineStep(
+                        state.copy(
+                            language = Language.English,
+                            raw = letters,
+                            preedit = letters,
+                            candidates = latin.suggest(letters.lowercase()),
+                            associating = false,
+                            shift = ShiftState.Off,
+                            page = KeyboardPage.Letters,
+                            partialText = "",
+                            partialSyllables = "",
+                            autoSpace = false,
+                            undoAutocorrect = null,
+                            verbatimFirst = false,
+                        ),
+                        listOf(Cmd.Compose(letters)),
+                    )
+                } else if (letters.all { it in 'a'..'z' }) {
+                    return EngineStep(
+                        state.copy(
+                            language = Language.Chinese,
+                            raw = letters,
+                            preedit = letters,
+                            candidates = emptyList(),
+                            associating = false,
+                            shift = ShiftState.Off,
+                            page = KeyboardPage.Letters,
+                            partialText = "",
+                            partialSyllables = "",
+                            autoSpace = false,
+                            undoAutocorrect = null,
+                            verbatimFirst = false,
+                        ),
+                        listOf(Cmd.Compose(letters)),
+                        pending = Pending.Pinyin,
+                    )
+                } else {
+                    return EngineStep(
+                        state.copy(
+                            language = Language.Chinese,
+                            raw = "",
+                            preedit = "",
+                            candidates = emptyList(),
+                            associating = false,
+                            shift = ShiftState.Off,
+                            page = KeyboardPage.Letters,
+                            partialText = "",
+                            partialSyllables = "",
+                            autoSpace = false,
+                            undoAutocorrect = null,
+                            verbatimFirst = false,
+                        ),
+                        listOf(Cmd.Commit(letters)),
+                    )
+                }
+            }
+        }
         val cmds = if (state.raw.isNotEmpty()) listOf<Cmd>(Cmd.ClearCompose) else emptyList()
         return EngineStep(
             state.copy(
@@ -282,6 +556,11 @@ class InputEngine(private val latin: LatinDecoder) {
                 associating = false,
                 shift = ShiftState.Off,
                 page = KeyboardPage.Letters,
+                partialText = "",
+                partialSyllables = "",
+                autoSpace = false,
+                undoAutocorrect = null,
+                verbatimFirst = false,
             ),
             cmds,
         )
@@ -291,12 +570,28 @@ class InputEngine(private val latin: LatinDecoder) {
         val item = state.candidates.getOrNull(index) ?: return EngineStep(state)
         if (state.password) return EngineStep(state)
         if (state.language == Language.English) {
-            val word = applyCase(item.text, state.raw.ifEmpty { item.text })
+            val typedRef = if (state.associating) {
+                if (state.shift != ShiftState.Off) item.text.replaceFirstChar { it.uppercaseChar() } else item.text
+            } else {
+                state.raw.ifEmpty { item.text }
+            }
+            val word = applyCase(item.text, typedRef)
             val cmds = mutableListOf<Cmd>(Cmd.Commit("$word "))
-            if (learnable(state)) cmds += Cmd.LearnEn(word.lowercase())
+            if (learnable(state)) cmds += Cmd.LearnEn(word.lowercase(), state.lastEnglishWord)
             val shift = if (state.shift == ShiftState.Caps) ShiftState.Caps else ShiftState.Off
+            val nextPredictions = latin.predictNext(word.lowercase())
             return EngineStep(
-                state.copy(raw = "", preedit = "", candidates = emptyList(), associating = false, shift = shift),
+                state.copy(
+                    raw = "",
+                    preedit = "",
+                    candidates = nextPredictions,
+                    associating = nextPredictions.isNotEmpty(),
+                    shift = shift,
+                    autoSpace = true,
+                    lastEnglishWord = word.lowercase(),
+                    undoAutocorrect = null,
+                    verbatimFirst = false,
+                ),
                 cmds,
             )
         }
@@ -305,20 +600,48 @@ class InputEngine(private val latin: LatinDecoder) {
 
     private fun chooseChinese(state: EngineState, item: Candidate): EngineStep {
         val cmds = mutableListOf<Cmd>(Cmd.Commit(item.text))
-        if (!state.associating && learnable(state) && item.syllables.isNotBlank()) {
-            cmds += Cmd.LearnZh(item.text, item.syllables)
-        }
         val rest = if (state.associating) "" else leftover(state.raw, item.consumed)
         if (rest.isNotEmpty()) {
+            val nextPartialText = if (item.syllables.isNotBlank()) state.partialText + item.text else ""
+            val nextPartialSyl = if (item.syllables.isNotBlank()) joinSpace(state.partialSyllables, item.syllables) else ""
             cmds += Cmd.Compose(rest)
             return EngineStep(
-                state.copy(raw = rest, preedit = rest, candidates = emptyList(), associating = false),
+                state.copy(
+                    raw = rest,
+                    preedit = rest,
+                    candidates = emptyList(),
+                    associating = false,
+                    partialText = nextPartialText,
+                    partialSyllables = nextPartialSyl,
+                ),
                 cmds,
                 pending = Pending.Pinyin,
             )
         }
+
+        if (!state.associating && learnable(state)) {
+            if (state.partialText.isNotEmpty() && item.syllables.isNotBlank()) {
+                val composedText = state.partialText + item.text
+                val composedSyl = joinSpace(state.partialSyllables, item.syllables)
+                if (composedText.length in 2..8) {
+                    cmds += Cmd.LearnZh(composedText, composedSyl)
+                }
+            } else if (item.syllables.isNotBlank()) {
+                cmds += Cmd.LearnZh(item.text, item.syllables)
+            } else if (item.text.all { it in 'a'..'z' || it in 'A'..'Z' || it == '\'' }) {
+                cmds += Cmd.LearnEn(item.text.lowercase())
+            }
+        }
+
         return EngineStep(
-            state.copy(raw = "", preedit = "", candidates = emptyList(), associating = true),
+            state.copy(
+                raw = "",
+                preedit = "",
+                candidates = emptyList(),
+                associating = true,
+                partialText = "",
+                partialSyllables = "",
+            ),
             cmds,
             pending = Pending.Associate,
             associateFrom = item.text,
@@ -341,7 +664,14 @@ class InputEngine(private val latin: LatinDecoder) {
     private fun confirmThen(state: EngineState, extra: String): EngineStep {
         val pending = takePending(state)
         return EngineStep(
-            pending.first.copy(associating = false, candidates = emptyList(), preedit = "", raw = ""),
+            pending.first.copy(
+                associating = false,
+                candidates = emptyList(),
+                preedit = "",
+                raw = "",
+                partialText = "",
+                partialSyllables = "",
+            ),
             pending.second + Cmd.Commit(extra),
         )
     }
@@ -352,10 +682,31 @@ class InputEngine(private val latin: LatinDecoder) {
             val chosen = state.candidates.firstOrNull()
             val text = chosen?.text ?: state.raw
             val cmds = mutableListOf<Cmd>(Cmd.Commit(text))
-            if (chosen != null && learnable(state)) cmds += Cmd.LearnZh(chosen.text, chosen.syllables)
-            return state.copy(raw = "", preedit = "", candidates = emptyList(), associating = false) to cmds
+            if (chosen != null && learnable(state) && chosen.syllables.isNotBlank()) {
+                if (state.partialText.isNotEmpty() && (state.partialText.length + chosen.text.length) in 2..8) {
+                    cmds += Cmd.LearnZh(state.partialText + chosen.text, joinSpace(state.partialSyllables, chosen.syllables))
+                } else {
+                    cmds += Cmd.LearnZh(chosen.text, chosen.syllables)
+                }
+            }
+            return state.copy(
+                raw = "",
+                preedit = "",
+                candidates = emptyList(),
+                associating = false,
+                partialText = "",
+                partialSyllables = "",
+            ) to cmds
         }
-        return state.copy(raw = "", preedit = "", candidates = emptyList()) to listOf(Cmd.Commit(state.raw))
+        // English pending before punctuation: resolve contractions & standalone "i" -> "I" while preserving initials like "H."
+        val top = state.candidates.firstOrNull()?.text
+        val lowerRaw = state.raw.lowercase()
+        val resolved = when {
+            lowerRaw == "i" -> "I"
+            top != null && top.contains('\'') && top.replace("'", "") == lowerRaw -> applyCase(top, state.raw)
+            else -> state.raw
+        }
+        return state.copy(raw = "", preedit = "", candidates = emptyList()) to listOf(Cmd.Commit(resolved))
     }
 
     private fun separate(state: EngineState): EngineStep {
@@ -368,11 +719,22 @@ class InputEngine(private val latin: LatinDecoder) {
         )
     }
 
+    private fun joinSpace(left: String, right: String): String = when {
+        left.isBlank() -> right.trim()
+        right.isBlank() -> left.trim()
+        else -> "${left.trim()} ${right.trim()}"
+    }
+
     private fun learnable(state: EngineState) = !state.password && !state.noLearn
 
     private fun cycle(shift: ShiftState): ShiftState = when (shift) {
         ShiftState.Off -> ShiftState.Once
         ShiftState.Once -> ShiftState.Caps
         ShiftState.Caps -> ShiftState.Off
+    }
+
+    private companion object {
+        val englishAttachPunctuation = setOf(".", ",", "!", "?", ";", ":")
+        val sentenceEndings = setOf(".", "!", "?")
     }
 }

@@ -57,7 +57,7 @@ interface Lexicon {
     fun prefixed(letters: String, limit: Int): List<LexRow>
     fun charsStarting(syllablePrefix: String, limit: Int): List<LexRow>
     fun phrasesStarting(text: String, limit: Int): List<LexRow>
-    fun byInitials(prefix: String, limit: Int): List<LexRow>
+    fun byInitials(prefix: String, limit: Int, exactOnly: Boolean = false): List<LexRow>
     fun spelling(syllables: String, limit: Int): List<LexRow>
     fun spellingStarting(prefix: String, nsy: Int, limit: Int): List<LexRow>
 }
@@ -81,9 +81,12 @@ class MemoryLexicon(private val rows: List<LexRow>) : Lexicon {
             .sortedByDescending { it.freq }
             .take(limit)
 
-    override fun byInitials(prefix: String, limit: Int): List<LexRow> {
+    override fun byInitials(prefix: String, limit: Int, exactOnly: Boolean): List<LexRow> {
         if (prefix.isEmpty()) return emptyList()
-        return rows.filter { initialsOf(it.syllables).startsWith(prefix) }
+        return rows.filter {
+            val init = initialsOf(it.syllables)
+            if (exactOnly) init == prefix else init.startsWith(prefix)
+        }
             .sortedWith(compareBy<LexRow> { initialsOf(it.syllables) != prefix }.thenByDescending { it.freq })
             .take(limit)
     }

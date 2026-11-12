@@ -3,7 +3,17 @@ package dev.cheng.keyboard.engine
 import dev.cheng.keyboard.model.ShiftState
 
 fun applyCase(suggestion: String, typed: String): String {
-    if (typed.length > 1 && typed.all { it.isUpperCase() }) return suggestion.uppercase()
+    if (suggestion.equals("i", ignoreCase = true)) return "I"
+    if (suggestion.length >= 3 && suggestion.startsWith("i'", ignoreCase = true)) {
+        return if (typed.length > 1 && typed.all { !it.isLetter() || it.isUpperCase() }) {
+            suggestion.uppercase()
+        } else {
+            "I'" + suggestion.substring(2)
+        }
+    }
+    if (typed.length > 1 && typed.all { !it.isLetter() || it.isUpperCase() } && typed.any { it.isUpperCase() }) {
+        return suggestion.uppercase()
+    }
     if (typed.firstOrNull()?.isUpperCase() == true) {
         return suggestion.replaceFirstChar { char ->
             if (char.isLowerCase()) char.uppercaseChar() else char
@@ -44,6 +54,9 @@ fun applyAskDraft(draft: String, cmds: List<Cmd>): String {
         when (cmd) {
             is Cmd.Commit -> text += cmd.text.replace("\n", "")
             Cmd.DeleteOne -> text = dropLastCodePoint(text)
+            is Cmd.DeleteCount -> {
+                if (cmd.count > 0) text = text.dropLast(cmd.count.coerceAtMost(text.length))
+            }
             Cmd.DeleteWord -> {
                 val count = previousWordUnits(text)
                 if (count > 0) text = text.dropLast(count)

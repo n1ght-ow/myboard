@@ -60,7 +60,7 @@ class KeyboardController(
 ) {
     private val latin = LatinDecoder()
     @Volatile
-    private var pinyin = PinyinDecoder(emptySet())
+    private var pinyin = PinyinDecoder(emptySet()).also { it.latin = latin }
     private val engine = InputEngine(latin)
     private val bridge = EditorBridge(connection)
     private val secrets = Secrets(context)
@@ -76,6 +76,7 @@ class KeyboardController(
     private var fuzzy = false
     private var askModel = MODEL_FLASH
     private var userEpoch = 0L
+    @Volatile
     private var token = 0
     private var alarmJob: Job? = null
     private var source: FieldSource? = null
@@ -533,14 +534,18 @@ class KeyboardController(
         if (!asking) {
             step.cmds.filterIsInstance<Cmd.LearnZh>().forEach { cmd ->
                 val letters = cmd.syllables.replace("'", "").replace(" ", "")
-                val row = dev.cheng.keyboard.model.LexRow(cmd.text, cmd.syllables.replace("'", " "), letters, 1_200_000_000)
-                pinyin.learn(cmd.text, cmd.syllables)
-                scope.launch(db) { users.saveZh(row) }
+                val freq = pinyin.learn(cmd.text, cmd.syllables)
+                if (freq > 0) {
+                    val row = dev.cheng.keyboard.model.LexRow(cmd.text, cmd.syllables.replace("'", " "), letters, freq)
+                    scope.launch(db) { users.saveZh(row) }
+                }
             }
             step.cmds.filterIsInstance<Cmd.LearnEn>().forEach { cmd ->
-                latin.learn(cmd.word)
-                val freq = latin.userWords().firstOrNull { it.first == cmd.word }?.second ?: 20_000
-                scope.launch(db) { users.saveEn(cmd.word, freq) }
+                latin.learn(cmd.word, cmd.prevWord)
+                if (cmd.word.length >= 2) {
+                    val freq = latin.userWords().firstOrNull { it.first == cmd.word }?.second ?: 20_000
+                    scope.launch(db) { users.saveEn(cmd.word, freq) }
+                }
             }
             bridge.apply(step.cmds)
         } else {
@@ -618,7 +623,9 @@ class KeyboardController(
         val current = ++token
         val useFuzzy = fuzzy
         scope.launch(db) {
+            if (current != token) return@launch
             val decoded = pinyin.decode(raw, useFuzzy)
+            if (current != token) return@launch
             withContext(Dispatchers.Main) {
                 if (current != token || engineState.raw != raw || engineState.language != Language.Chinese) return@withContext
                 candidateRaw = raw
@@ -645,6 +652,7 @@ class KeyboardController(
             }
         }.getOrDefault(emptySet())
         val fresh = if (syllables.isEmpty()) pinyin else PinyinDecoder(syllables)
+        fresh.latin = latin
         val file = installLexicon(context)
         if (file != null) {
             val sqlite = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY)
@@ -672,7 +680,23 @@ class KeyboardController(
     }
 
     private fun publish() {
-        update { it.copy(engine = engineState, enter = enter, fuzzy = fuzzy) }
+        if (engineState.raw.isEmpty()) candidateRaw = ""
+        update { prev ->
+            val shownEngine = if (
+                engineState.language == Language.Chinese &&
+                engineState.raw.isNotEmpty() &&
+                engineState.candidates.isEmpty() &&
+                !engineState.associating &&
+                candidateRaw.isNotEmpty() &&
+                candidateRaw != engineState.raw &&
+                prev.engine.candidates.isNotEmpty()
+            ) {
+                engineState.copy(candidates = prev.engine.candidates)
+            } else {
+                engineState
+            }
+            prev.copy(engine = shownEngine, enter = enter, fuzzy = fuzzy)
+        }
     }
 
     private fun update(block: (UiState) -> UiState) {

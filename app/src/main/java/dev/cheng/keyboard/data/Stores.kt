@@ -108,12 +108,13 @@ class SqliteLexicon(private val db: SQLiteDatabase) : Lexicon {
         )
     }
 
-    override fun byInitials(prefix: String, limit: Int): List<LexRow> {
+    override fun byInitials(prefix: String, limit: Int, exactOnly: Boolean): List<LexRow> {
         if (prefix.isEmpty()) return emptyList()
         val exact = query(
             "SELECT text, syllables, letters, freq FROM entry WHERE initials = ? ORDER BY freq DESC LIMIT ?",
             arrayOf(prefix, limit.toString()),
-        )
+        ).distinctBy { it.text }
+        if (exactOnly || exact.size >= limit) return exact.take(limit)
         val longer = query(
             "SELECT text, syllables, letters, freq FROM entry WHERE initials > ? AND initials < ? ORDER BY freq DESC LIMIT ?",
             arrayOf(prefix, prefixEnd(prefix), limit.toString()),

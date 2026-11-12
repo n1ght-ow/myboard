@@ -44,6 +44,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -191,17 +192,28 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                 modifier = Modifier.padding(start = 8.dp, top = 2.dp),
             )
         }
+        val candidateScroll = rememberScrollState()
+        LaunchedEffect(state.engine.raw, state.engine.candidates.firstOrNull()?.text) {
+            candidateScroll.scrollTo(0)
+        }
         Row(
             Modifier.weight(1f),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Row(
-                Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                Modifier.weight(1f).horizontalScroll(candidateScroll),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 state.engine.candidates.forEachIndexed { index, candidate ->
                     val shown = if (state.engine.language == Language.English && !state.engine.associating) {
                         applyCase(candidate.text, state.engine.raw)
+                    } else if (state.engine.language == Language.English && state.engine.associating) {
+                        val ref = if (state.engine.shift != ShiftState.Off) {
+                            candidate.text.replaceFirstChar { it.uppercaseChar() }
+                        } else {
+                            candidate.text
+                        }
+                        applyCase(candidate.text, ref)
                     } else {
                         candidate.text
                     }
@@ -212,7 +224,7 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                         maxLines = 1,
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
-                            .background(if (index == 0) palette.pressed else Color.Transparent)
+                            .background(if (index == 0 && !state.engine.associating) palette.pressed else Color.Transparent)
                             .clickable { controller.pick(index) }
                             .padding(horizontal = 8.dp, vertical = 2.dp),
                     )
@@ -313,6 +325,26 @@ private fun MenuPanel(state: UiState, palette: Palette, controller: KeyboardCont
                         .padding(horizontal = 10.dp, vertical = 6.dp),
                 )
             }
+        }
+        Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                "模糊音",
+                color = if (state.fuzzy) palette.accent else palette.label,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (state.fuzzy) palette.key else Color.Transparent)
+                    .clickable { controller.setFuzzy(!state.fuzzy) }
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+            )
+            Text(
+                "按键振动",
+                color = if (state.haptic) palette.accent else palette.label,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (state.haptic) palette.key else Color.Transparent)
+                    .clickable { controller.setHaptic(!state.haptic) }
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+            )
         }
         Text(
             "更多设置",
@@ -511,7 +543,7 @@ private fun PopupKeys(
 
 @Composable
 private fun CandidateGrid(state: UiState, palette: Palette, controller: KeyboardController, keyHeight: Dp) {
-    val rows = state.engine.candidates.chunked(4)
+    val rows = state.engine.candidates.withIndex().chunked(4)
     Column(
         Modifier
             .fillMaxWidth()
@@ -522,20 +554,29 @@ private fun CandidateGrid(state: UiState, palette: Palette, controller: Keyboard
     ) {
         rows.forEach { row ->
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                row.forEach { candidate ->
-                    val index = state.engine.candidates.indexOf(candidate)
+                row.forEach { (index, candidate) ->
+                    val shown = if (state.engine.language == Language.English && !state.engine.associating) {
+                        applyCase(candidate.text, state.engine.raw)
+                    } else {
+                        candidate.text
+                    }
                     Text(
-                        candidate.text,
+                        shown,
                         color = palette.label,
                         fontSize = 16.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         textAlign = TextAlign.Center,
                         modifier = Modifier
                             .weight(1f)
                             .clip(RoundedCornerShape(8.dp))
-                            .background(palette.key)
+                            .background(if (index == 0 && !state.engine.associating) palette.pressed else palette.key)
                             .clickable { controller.pick(index) }
-                            .padding(vertical = 12.dp),
+                            .padding(horizontal = 4.dp, vertical = 12.dp),
                     )
+                }
+                repeat((4 - row.size).coerceAtLeast(0)) {
+                    Box(Modifier.weight(1f))
                 }
             }
         }

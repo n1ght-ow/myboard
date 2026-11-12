@@ -136,9 +136,9 @@ private fun numberRows(language: Language): List<KeyRow> {
         KeyRow(
             listOf(
                 KeyModel("to-letters", KeyKind.PageLetters, "ABC", weight = 1.6f),
-                KeyModel("comma", KeyKind.Char, comma(language), insert = comma(language)),
+                KeyModel("comma", KeyKind.Char, ",", insert = ","),
                 KeyModel("space", KeyKind.Space, "", weight = 4f),
-                KeyModel("period", KeyKind.Char, period(language), insert = period(language)),
+                KeyModel("period", KeyKind.Char, ".", insert = "."),
                 KeyModel("enter", KeyKind.Enter, "", weight = 1.8f, accent = true),
             ),
         ),
