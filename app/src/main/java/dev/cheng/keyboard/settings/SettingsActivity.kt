@@ -58,7 +58,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -70,6 +70,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.toBitmap
 import androidx.core.view.WindowCompat
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
@@ -278,6 +280,17 @@ private fun SettingsRoot(refreshTick: Int) {
 }
 
 @Composable
+private fun BrandMark(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val bitmap = remember(context) {
+        val drawable = checkNotNull(ContextCompat.getDrawable(context, R.drawable.ic_brand_badge))
+        val pixels = (96 * context.resources.displayMetrics.density).toInt().coerceAtLeast(1)
+        drawable.toBitmap(width = pixels, height = pixels).asImageBitmap()
+    }
+    Image(bitmap = bitmap, contentDescription = null, modifier = modifier)
+}
+
+@Composable
 private fun BrandHeader(version: String, imeStatus: ImeStatus, colors: SettingsColors) {
     Row(
         Modifier
@@ -286,10 +299,8 @@ private fun BrandHeader(version: String, imeStatus: ImeStatus, colors: SettingsC
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Image(
-            painter = painterResource(R.drawable.ic_brand_badge),
-            contentDescription = null,
-            modifier = Modifier
+        BrandMark(
+            Modifier
                 .size(46.dp)
                 .clip(RoundedCornerShape(14.dp)),
         )
