@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">myboard</string>
-    <string name="ime_name">myboard</string>
+    <string name="app_name">N1ghtKey</string>
+    <string name="ime_name">N1ghtKey</string>
     <string name="subtype_pinyin">拼音</string>
     <string name="subtype_english">English</string>
 </resources>

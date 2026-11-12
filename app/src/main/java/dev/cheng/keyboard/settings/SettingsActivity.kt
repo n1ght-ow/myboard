@@ -11,6 +11,7 @@ import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -57,6 +58,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -71,6 +73,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import dev.cheng.keyboard.R
 import dev.cheng.keyboard.ai.MODEL_FLASH
 import dev.cheng.keyboard.ai.MODEL_PRO
 import dev.cheng.keyboard.data.PrefKeys
@@ -283,22 +286,20 @@ private fun BrandHeader(version: String, imeStatus: ImeStatus, colors: SettingsC
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Box(
-            Modifier
+        Image(
+            painter = painterResource(R.drawable.ic_brand_badge),
+            contentDescription = null,
+            modifier = Modifier
                 .size(46.dp)
-                .clip(RoundedCornerShape(14.dp))
-                .background(colors.accent),
-            contentAlignment = Alignment.Center,
-        ) {
-            GridIcon(colors.onAccent, Modifier.size(24.dp))
-        }
+                .clip(RoundedCornerShape(14.dp)),
+        )
         Column(Modifier.weight(1f)) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
-                    "myboard",
+                    "N1ghtKey",
                     color = colors.text,
                     fontSize = 26.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -330,7 +331,7 @@ private fun SetupCard(context: Context, imeStatus: ImeStatus, colors: SettingsCo
     SettingsCard(colors) {
         CardHeader(
             title = "启用与切换",
-            subtitle = "先在系统设置里启用 myboard，再将其选为当前输入法。小米路径：设置 → 更多设置 → 语言与输入法 → 输入法管理。",
+            subtitle = "先在系统设置里启用 N1ghtKey，再将其选为当前输入法。小米路径：设置 → 更多设置 → 语言与输入法 → 输入法管理。",
             colors = colors,
         ) {
             SettingsIcon(colors.accent, Modifier.size(18.dp))
@@ -925,14 +926,14 @@ private fun UpdateSection(
                 }
             }
         }
-        is UpdatePhase.NeedsPermission -> StatusNote("请允许 myboard 安装未知应用权限，随后点击继续安装。", colors.text)
+        is UpdatePhase.NeedsPermission -> StatusNote("请允许 N1ghtKey 安装未知应用权限，随后点击继续安装。", colors.text)
         is UpdatePhase.Ready -> StatusNote("若系统安装界面未自动弹出，可再次点击安装。", colors.subtle)
         is UpdatePhase.Failed -> StatusNote(current.message, colors.danger)
     }
 
     if (showToken) {
         Text(
-            "私有仓库需要一个能读取 myboard 的 GitHub 令牌，只保存在这台设备上。",
+            "私有仓库需要一个能读取 N1ghtKey 的 GitHub 令牌，只保存在这台设备上。",
             color = colors.subtle,
             fontSize = 12.5.sp,
             lineHeight = 18.sp,

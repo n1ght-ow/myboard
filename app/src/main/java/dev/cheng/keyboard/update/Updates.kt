@@ -243,7 +243,7 @@ internal fun prepareInstall(context: Context, file: File): UpdatePhase {
     }
     if (info.packageName != context.packageName) {
         file.delete()
-        return UpdatePhase.Failed("安装包不是 myboard", askToken = false)
+        return UpdatePhase.Failed("安装包不是 N1ghtKey", askToken = false)
     }
     if (!signatureOk(context, info)) {
         file.delete()
@@ -334,7 +334,7 @@ private fun openPackageInstaller(context: Context, file: File): Boolean {
     val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     val intent = Intent(Intent.ACTION_VIEW).apply {
         setDataAndType(uri, "application/vnd.android.package-archive")
-        clipData = ClipData.newRawUri("myboard", uri)
+        clipData = ClipData.newRawUri("N1ghtKey", uri)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     return try {
