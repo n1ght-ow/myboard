@@ -3,6 +3,7 @@ package dev.cheng.keyboard.engine
 import dev.cheng.keyboard.model.Candidate
 import dev.cheng.keyboard.model.LexRow
 import dev.cheng.keyboard.model.Lexicon
+import dev.cheng.keyboard.model.TouchSample
 import java.time.DayOfWeek
 import java.time.LocalDateTime
 import java.util.ArrayDeque
@@ -95,6 +96,27 @@ class SylTrie(words: Collection<String>) {
             node = node.next[ch - 'a'] ?: return null
         }
         return node.canonical
+    }
+
+    fun continuationLetters(prefix: String): Set<Char> {
+        if (prefix.isEmpty()) return emptySet()
+        var node = root
+        for (ch in prefix) {
+            if (ch !in 'a'..'z') return emptySet()
+            node = node.next[ch - 'a'] ?: return emptySet()
+        }
+        return buildSet {
+            for (i in 0..25) if (node.next[i] != null) add('a' + i)
+        }
+    }
+
+    fun initialLetters(): Set<Char> = buildSet {
+        for (i in 0..25) {
+            if (root.next[i] != null) {
+                val ch = 'a' + i
+                if (ch !in "iuv") add(ch)
+            }
+        }
     }
 }
 
@@ -335,6 +357,7 @@ class PinyinDecoder(syllables: Set<String>) {
         fuzzy: Boolean,
         context: String = "",
         touchHints: List<String> = emptyList(),
+        touchSamples: List<TouchSample?> = emptyList(),
     ): Decode {
         val rawLettersOnly = raw.filter { it in 'a'..'z' || it in 'A'..'Z' }
         val text = raw.lowercase().filter { it in 'a'..'z' || it == '\'' }
@@ -415,7 +438,7 @@ class PinyinDecoder(syllables: Set<String>) {
             else -> false
         }
         if (shouldTryTypos) {
-            val typoItems = book.typos(letters, touchHints)
+            val typoItems = book.typos(letters, touchHints, touchSamples)
             if (typoItems.isNotEmpty()) {
                 body = if (body.isEmpty()) typoItems else book.rank(body + typoItems)
             }
@@ -432,6 +455,11 @@ class PinyinDecoder(syllables: Set<String>) {
                 prefixCandidates += book.prefixes(seg)
             }
             body = book.rank(prefixCandidates)
+        }
+
+        if (touchSamples.isNotEmpty() && letters.length >= 2) {
+            val soft = book.softFirstLetter(letters, touchSamples)
+            if (soft.isNotEmpty()) body = if (body.isEmpty()) soft else book.rank(body + soft)
         }
 
         val cjkContext = extractTrailingCjk(context, maxChars = 4)
@@ -544,6 +572,44 @@ class PinyinDecoder(syllables: Set<String>) {
                 }
             }
         }
+        return out
+    }
+
+    fun nextLetterPriors(raw: String, @Suppress("UNUSED_PARAMETER") context: String = ""): FloatArray {
+        val cleaned = raw.lowercase().filter { it in 'a'..'z' || it == '\'' }
+        if (cleaned.isEmpty()) return baseInitialPriors()
+        val chunk = cleaned.substringAfterLast('\'')
+        if (chunk.isEmpty()) return baseInitialPriors()
+        var sub: String? = null
+        val maxLen = minOf(6, chunk.length)
+        for (len in maxLen downTo 1) {
+            val candidate = chunk.substring(chunk.length - len)
+            if (trie.hasPrefix(candidate, 0) || trie.canonicalOf(candidate) != null) {
+                sub = candidate
+                break
+            }
+        }
+        if (sub == null) return FloatArray(26)
+        val out = FloatArray(26) { -0.30f }
+        for (ch in trie.continuationLetters(sub)) {
+            if (ch in 'a'..'z') out[ch - 'a'] = 0.85f
+        }
+        if (trie.canonicalOf(sub) != null) {
+            for (ch in trie.initialLetters()) {
+                if (ch in 'a'..'z') {
+                    val idx = ch - 'a'
+                    out[idx] = maxOf(out[idx], 0.30f)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun baseInitialPriors(): FloatArray {
+        val out = FloatArray(26)
+        for (ch in "iuv") out[ch - 'a'] = -0.30f
+        for (ch in "aeo") out[ch - 'a'] = 0.10f
+        for (ch in "bpmfdtnlgkhjqxzcsryw") out[ch - 'a'] = 0.20f
         return out
     }
 
@@ -957,13 +1023,17 @@ class PinyinDecoder(syllables: Set<String>) {
             return rank(rescored)
         }
 
-        fun typos(letters: String, touchHints: List<String> = emptyList()): List<Scored> {
+        fun typos(
+            letters: String,
+            touchHints: List<String> = emptyList(),
+            touchSamples: List<TouchSample?> = emptyList(),
+        ): List<Scored> {
             val items = ArrayList<Scored>()
-            for ((seg, cost, spatialHit) in correctedSegments(letters, touchHints)) {
-                val directPenalty = when {
-                    spatialHit && cost == 1 -> 12.0
-                    cost == 1 -> 18.0
-                    else -> 36.0 * cost
+            for ((seg, cost, spatialPenalty) in correctedSegments(letters, touchHints, touchSamples)) {
+                val directPenalty = if (cost == 1) {
+                    18.0 - 6.0 * (1.0 - spatialPenalty.coerceIn(0f, 1f))
+                } else {
+                    36.0 * cost
                 }
                 val directRows = spell(seg.parts, boostUser = true).take(2)
                 if (directRows.isNotEmpty()) {
@@ -1011,7 +1081,11 @@ class PinyinDecoder(syllables: Set<String>) {
                     val tailText = letters.takeLast(tailLen)
                     val tailChars = charsOf(tailText)
                     if (tailChars.isEmpty()) continue
-                    for ((seg, cost, _) in correctedSegments(headText, touchHints.take(headText.length)).filter { it.second == 1 }.take(2)) {
+                    for ((seg, cost, _) in correctedSegments(
+                        headText,
+                        touchHints.take(headText.length),
+                        touchSamples.take(headText.length),
+                    ).filter { it.second == 1 }.take(2)) {
                         val headPieces = spell(seg.parts, boostUser = true).take(1).map {
                             Piece(it.text, it.syllables, it.freq, wordScore(it.text, it.freq))
                         }.ifEmpty { cover(seg.parts).take(1) }
@@ -1030,6 +1104,29 @@ class PinyinDecoder(syllables: Set<String>) {
                         }
                     }
                     if (items.isNotEmpty()) break
+                }
+            }
+            return rank(items)
+        }
+
+        fun softFirstLetter(letters: String, samples: List<TouchSample?>): List<Scored> {
+            if (letters.length < 2) return emptyList()
+            val sample = samples.getOrNull(0) ?: return emptyList()
+            val ambiguous = (sample.primary == letters[0]) ||
+                ((sample.penaltyOf(letters[0]) ?: 1f) >= 0.55f)
+            if (!ambiguous) return emptyList()
+            val alts = sample.alternatives
+                .filter { it.penalty <= 0.35f && it.ch in 'a'..'z' && it.ch != letters[0] }
+                .sortedBy { it.penalty }
+                .take(2)
+            if (alts.isEmpty()) return emptyList()
+            val items = ArrayList<Scored>()
+            for (alt in alts) {
+                val variant = alt.ch + letters.substring(1)
+                val penalty = 6.0 + 16.0 * alt.penalty
+                for (seg in segmentPinyin(variant, trie).take(2)) {
+                    items += candidates(seg).take(4).map { it.copy(score = it.score - penalty) }
+                    items += prefixes(seg).take(2).map { it.copy(score = it.score - penalty) }
                 }
             }
             return rank(items)
@@ -1381,22 +1478,32 @@ class PinyinDecoder(syllables: Set<String>) {
         )
     }
 
-    private fun correctedSegments(text: String, touchHints: List<String> = emptyList()): List<Triple<Seg, Int, Boolean>> {
+    private fun correctedSegments(
+        text: String,
+        touchHints: List<String> = emptyList(),
+        touchSamples: List<TouchSample?> = emptyList(),
+    ): List<Triple<Seg, Int, Float>> {
         val paths = Array(text.length + 1) { ArrayList<Node>(4) }
-        paths[0].add(Node(emptyList(), 0, 0, false))
+        paths[0].add(Node(emptyList(), 0, 0.0, 1f))
         for (start in 0 until text.length) {
             val from = paths[start]
             if (from.isEmpty()) continue
-            for (edge in syllableEdges(text, start, touchHints)) {
+            for (edge in syllableEdges(text, start, touchHints, touchSamples)) {
                 val dest = paths[edge.end]
                 for (node in from) {
                     val cost = node.cost + edge.cost
                     if (cost > 2) continue
+                    val nextPenalty = if (edge.cost > 0) {
+                        minOf(node.spatialPenalty, edge.spatialPenalty)
+                    } else {
+                        node.spatialPenalty
+                    }
+                    val spatialBonus = if (edge.cost > 0) 2.0 * (1.0 - edge.spatialPenalty) else 0.0
                     dest += Node(
                         node.parts + edge.syllable,
                         cost,
-                        node.score + edge.syllable.length * edge.syllable.length - edge.cost * 5 + (if (edge.spatial) 2 else 0),
-                        node.spatial || edge.spatial,
+                        node.score + edge.syllable.length * edge.syllable.length - edge.cost * 5.0 + spatialBonus,
+                        nextPenalty,
                     )
                 }
                 prune(dest)
@@ -1404,14 +1511,19 @@ class PinyinDecoder(syllables: Set<String>) {
         }
         return paths[text.length]
             .filter { it.cost > 0 && it.parts.isNotEmpty() }
-            .map { Triple(Seg(it.parts, partial = false), it.cost, it.spatial) }
+            .map { Triple(Seg(it.parts, partial = false), it.cost, it.spatialPenalty) }
             .distinctBy { it.first.parts to it.second }
             .take(8)
     }
 
-    private data class Edge(val syllable: String, val end: Int, val cost: Int, val spatial: Boolean = false)
+    private data class Edge(val syllable: String, val end: Int, val cost: Int, val spatialPenalty: Float = 1f)
 
-    private fun syllableEdges(text: String, start: Int, touchHints: List<String>): List<Edge> {
+    private fun syllableEdges(
+        text: String,
+        start: Int,
+        touchHints: List<String>,
+        touchSamples: List<TouchSample?>,
+    ): List<Edge> {
         val exact = trie.canonicalEndings(text, start).map { (end, canonical) ->
             Edge(canonical, end, 0)
         }
@@ -1419,30 +1531,46 @@ class PinyinDecoder(syllables: Set<String>) {
         val remain = text.length - start
         for (syllable in syllableList) {
             if (syllable.length < 2 || syllable.length > remain + 1) continue
-            val edge = typoEdge(text, start, syllable, touchHints) ?: continue
+            val edge = typoEdge(text, start, syllable, touchHints, touchSamples) ?: continue
             typos += edge
         }
-        typos.sortWith(compareBy<Edge> { it.cost }.thenByDescending { it.spatial }.thenByDescending { it.syllable.length })
+        typos.sortWith(
+            compareBy<Edge> { it.cost }
+                .thenBy { it.spatialPenalty }
+                .thenByDescending { it.syllable.length },
+        )
         return exact + typos.take(6)
     }
 
-    private fun typoEdge(text: String, start: Int, syllable: String, touchHints: List<String>): Edge? {
+    private fun typoEdge(
+        text: String,
+        start: Int,
+        syllable: String,
+        touchHints: List<String>,
+        touchSamples: List<TouchSample?>,
+    ): Edge? {
         val remain = text.length - start
         var best: Edge? = null
         for (take in intArrayOf(syllable.length, syllable.length - 1, syllable.length + 1)) {
             if (take < 1 || take > remain) continue
             val sub = text.substring(start, start + take)
-            val (cost, spatial) = editCost(sub, syllable, touchHints, start) ?: continue
+            val (cost, spatialPenalty) = editCost(sub, syllable, touchHints, touchSamples, start) ?: continue
             if (cost != 1) continue
-            val edge = Edge(syllable, start + take, cost, spatial)
-            if (best == null || take > best.end - start) best = edge
+            val edge = Edge(syllable, start + take, cost, spatialPenalty)
+            if (
+                best == null ||
+                edge.spatialPenalty < best.spatialPenalty ||
+                (edge.spatialPenalty == best.spatialPenalty && take > best.end - start)
+            ) {
+                best = edge
+            }
         }
         return best
     }
 
     private fun prune(nodes: MutableList<Node>) {
         if (nodes.size <= 8) return
-        nodes.sortWith(compareBy<Node>({ it.cost }, { -it.score }))
+        nodes.sortWith(compareBy<Node> { it.cost }.thenByDescending { it.score })
         val kept = ArrayList<Node>(8)
         var plain = 0
         var edited = 0
@@ -1459,16 +1587,17 @@ class PinyinDecoder(syllables: Set<String>) {
         nodes.addAll(kept)
     }
 
-    private data class Node(val parts: List<String>, val cost: Int, val score: Int, val spatial: Boolean)
+    private data class Node(val parts: List<String>, val cost: Int, val score: Double, val spatialPenalty: Float)
 }
 
 private fun editCost(
     typed: String,
     target: String,
     touchHints: List<String> = emptyList(),
+    touchSamples: List<TouchSample?> = emptyList(),
     offset: Int = 0,
-): Pair<Int, Boolean>? {
-    if (typed == target) return 0 to false
+): Pair<Int, Float>? {
+    if (typed == target) return 0 to 1f
     val gap = typed.length - target.length
     if (gap > 1 || gap < -1) return null
     if (gap == 0) {
@@ -1481,14 +1610,25 @@ private fun editCost(
                 for (cursor in i + 1 until typed.length) {
                     if (typed[cursor] != target[cursor]) return null
                 }
-                return 1 to false
+                return 1 to 1f
             } else {
                 return null
             }
         }
-        if (diff < 0) return 0 to false
-        val spatialHit = target[diff] in touchHints.getOrNull(offset + diff).orEmpty()
-        return if (spatialHit || adjacentKey(typed[diff], target[diff])) 1 to spatialHit else null
+        if (diff < 0) return 0 to 1f
+        val sample = touchSamples.getOrNull(offset + diff)
+        val samplePenalty = sample?.penaltyOf(target[diff])
+        val legacyHit = sample == null && target[diff] in touchHints.getOrNull(offset + diff).orEmpty()
+        val spatialPenalty = when {
+            samplePenalty != null -> samplePenalty.coerceIn(0f, 1f)
+            legacyHit -> 0.2f
+            else -> 1f
+        }
+        return if (samplePenalty != null || legacyHit || adjacentKey(typed[diff], target[diff])) {
+            1 to spatialPenalty
+        } else {
+            null
+        }
     }
     val longer = if (gap > 0) typed else target
     val shorter = if (gap > 0) target else typed
@@ -1508,8 +1648,8 @@ private fun editCost(
     }
     if (j != shorter.length) return null
     val leftover = longer.length - i
-    if (!skipped && leftover == 1) return 1 to false
-    if (skipped && leftover == 0) return 1 to false
+    if (!skipped && leftover == 1) return 1 to 1f
+    if (skipped && leftover == 0) return 1 to 1f
     return null
 }
 

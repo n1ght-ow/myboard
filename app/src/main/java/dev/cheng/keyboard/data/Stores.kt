@@ -25,6 +25,10 @@ object PrefKeys {
     val fuzzy = booleanPreferencesKey("fuzzy")
     val askModel = stringPreferencesKey("ask_model")
     val userEpoch = longPreferencesKey("user_epoch")
+    val calibLeft = floatPreferencesKey("calib_left")
+    val calibRight = floatPreferencesKey("calib_right")
+    val calibDy = floatPreferencesKey("calib_dy")
+    val calibEpoch = longPreferencesKey("calib_epoch")
 }
 
 fun Preferences.themeMode(): ThemeMode =

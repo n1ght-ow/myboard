@@ -495,6 +495,7 @@ private fun AppearanceAndInputSection(
     colors: SettingsColors,
 ) {
     if (current == null) return
+    var calibResetNotice by remember { mutableStateOf(false) }
     SettingsCard(colors) {
         CardHeader(
             title = "外观与手感",
@@ -569,6 +570,38 @@ private fun AppearanceAndInputSection(
             colors = colors,
         ) { value ->
             scope.launch { context.settingsStore.edit { it[PrefKeys.fuzzy] = value } }
+        }
+        CardDivider(colors)
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("触控校准", color = colors.text, fontSize = 15.5.sp, fontWeight = FontWeight.Medium)
+                Text(
+                    if (calibResetNotice) {
+                        "已恢复默认触控落点偏移基线"
+                    } else {
+                        "自适应修正双拇指落点偏移，更换握姿后可重置"
+                    },
+                    color = if (calibResetNotice) colors.accent else colors.subtle,
+                    fontSize = 12.5.sp,
+                    lineHeight = 18.sp,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+            SmallChipButton("重置触控校准", colors) {
+                calibResetNotice = true
+                scope.launch {
+                    context.settingsStore.edit { prefs ->
+                        prefs[PrefKeys.calibLeft] = 0f
+                        prefs[PrefKeys.calibRight] = 0f
+                        prefs[PrefKeys.calibDy] = 0f
+                        prefs[PrefKeys.calibEpoch] = (prefs[PrefKeys.calibEpoch] ?: 0L) + 1L
+                    }
+                }
+            }
         }
     }
 }

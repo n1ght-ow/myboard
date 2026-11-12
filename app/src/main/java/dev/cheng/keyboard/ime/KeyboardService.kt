@@ -1,6 +1,11 @@
 package dev.cheng.keyboard.ime
 
 import android.inputmethodservice.InputMethodService
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodSubtype
@@ -23,7 +28,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import android.view.HapticFeedbackConstants
 
 class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {
     private val lifecycleRegistry = LifecycleRegistry(this)
@@ -32,6 +36,14 @@ class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwne
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var controller: KeyboardController? = null
     private var inputView: View? = null
+    private val vibrator: Vibrator? by lazy {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            getSystemService(VibratorManager::class.java)?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Vibrator::class.java)
+        }
+    }
 
     override val lifecycle: Lifecycle get() = lifecycleRegistry
     override val viewModelStore: ViewModelStore get() = store
@@ -125,12 +137,39 @@ class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwne
     }
 
     private fun performKeyboardHaptic(kind: HapticKind) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vib = vibrator
+            val (primitive, scale) = when (kind) {
+                HapticKind.Down -> VibrationEffect.Composition.PRIMITIVE_LOW_TICK to 0.55f
+                HapticKind.Delete -> VibrationEffect.Composition.PRIMITIVE_LOW_TICK to 0.40f
+                HapticKind.Step -> VibrationEffect.Composition.PRIMITIVE_TICK to 0.40f
+                HapticKind.Arm -> VibrationEffect.Composition.PRIMITIVE_CLICK to 0.65f
+            }
+            val composed = runCatching {
+                if (vib != null && vib.hasVibrator() && vib.areAllPrimitivesSupported(primitive)) {
+                    val effect = VibrationEffect.startComposition()
+                        .addPrimitive(primitive, scale)
+                        .compose()
+                    vib.vibrate(effect)
+                    true
+                } else {
+                    false
+                }
+            }.getOrDefault(false)
+            if (composed) return
+        }
         val view = inputView ?: return
         val constant = when (kind) {
-            HapticKind.Arm -> HapticFeedbackConstants.LONG_PRESS
+            HapticKind.Down -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                HapticFeedbackConstants.KEYBOARD_PRESS
+            } else {
+                HapticFeedbackConstants.KEYBOARD_TAP
+            }
+            HapticKind.Delete -> HapticFeedbackConstants.KEYBOARD_TAP
             HapticKind.Step -> HapticFeedbackConstants.CLOCK_TICK
-            HapticKind.Down, HapticKind.Delete -> HapticFeedbackConstants.KEYBOARD_TAP
+            HapticKind.Arm -> HapticFeedbackConstants.LONG_PRESS
         }
+        @Suppress("DEPRECATION")
         view.performHapticFeedback(constant, HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING)
     }
 }

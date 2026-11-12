@@ -686,7 +686,7 @@ class KeyboardLogicTest {
         assertEquals("you", committed.state.candidates.first().text)
 
         // Flick up on letter -> Choice.Symbol; flick down -> Choice.Upper
-        val gesture = KeyGesture(slopPx = 16f, caseSlopPx = 24f, swipePx = 36f)
+        val gesture = KeyGesture(slopPx = 16f, caseSlopPx = 24f, swipePx = 36f, verticalFlickPx = 45f)
         val qKey = KeyModel("l-q", KeyKind.Letter, "q", hint = "1")
         gesture.down(qKey, 50f, 50f, 0L)
         val flickUp = gesture.move(50f, 5f, 60L, null)

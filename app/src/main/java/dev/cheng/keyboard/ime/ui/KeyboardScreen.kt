@@ -6,8 +6,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -44,6 +42,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerId
+import androidx.compose.ui.input.pointer.changedToDown
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -62,10 +63,11 @@ import dev.cheng.keyboard.ime.Overlay
 import dev.cheng.keyboard.ime.ResultKind
 import dev.cheng.keyboard.ime.UiState
 import dev.cheng.keyboard.ime.gesture.PopupPreview
+import dev.cheng.keyboard.ime.gesture.TapPreview
 import dev.cheng.keyboard.ime.layout.PlacedKey
 import dev.cheng.keyboard.ime.layout.hitKey
-import dev.cheng.keyboard.ime.layout.nearbyLetters
 import dev.cheng.keyboard.ime.layout.placeKeys
+import dev.cheng.keyboard.ime.layout.touchSampleOf
 import dev.cheng.keyboard.model.Candidate
 import dev.cheng.keyboard.model.Choice
 import dev.cheng.keyboard.model.EnterKind
@@ -74,6 +76,7 @@ import dev.cheng.keyboard.model.KeyboardPage
 import dev.cheng.keyboard.model.Language
 import dev.cheng.keyboard.model.ShiftState
 import dev.cheng.keyboard.model.ThemeMode
+import kotlinx.coroutines.CancellationException
 
 internal data class Palette(
     val board: Color,
@@ -613,37 +616,109 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
         val gapX = with(density) { 6.dp.toPx() }
         val gapY = with(density) { 10.dp.toPx() }
         val side = with(density) { 4.dp.toPx() }
+        val refWidthPx = ((widthPx - side * 2f - gapX * 9f) / 10f).coerceAtLeast(1f)
         val placement = placeKeys(state.engine.page, state.engine.language, widthPx, heightPx, gapX, gapY, side)
         val placementState = rememberUpdatedState(placement)
+        val widthState = rememberUpdatedState(widthPx)
+        val refWidthState = rememberUpdatedState(refWidthPx)
+        val heightState = rememberUpdatedState(heightPx)
         Box(
             Modifier
                 .fillMaxWidth()
                 .height(with(density) { placement.height.toDp() })
                 .pointerInput(Unit) {
-                    awaitEachGesture {
-                        val down = awaitFirstDown()
-                        val keysNow = placementState.value.keys
-                        val hit = hitKey(keysNow, down.position.x, down.position.y)
-                        if (hit != null) {
-                            val neighbors = nearbyLetters(keysNow, down.position.x, down.position.y, hit.model)
-                            controller.onDown(hit.model, down.position.x, down.position.y, SystemClock.uptimeMillis(), neighbors)
-                        }
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull { it.id == down.id } ?: continue
-                            if (!change.pressed) {
-                                if (hit != null) controller.onUp(SystemClock.uptimeMillis())
-                                break
+                    try {
+                        awaitPointerEventScope {
+                            var activeId: PointerId? = null
+                            var pendingAdopt = false
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Main)
+                                val keysNow = placementState.value.keys
+                                val ctxNow = controller.hitContext(
+                                    widthState.value,
+                                    refWidthState.value,
+                                    heightState.value,
+                                )
+                                val downs = event.changes.filter { it.changedToDown() }
+                                if (activeId == null) {
+                                    val down = downs.firstOrNull()
+                                        ?: if (pendingAdopt) event.changes.firstOrNull { it.pressed } else null
+                                    if (down == null) {
+                                        pendingAdopt = false
+                                        continue
+                                    }
+                                    pendingAdopt = false
+                                    val hit = hitKey(keysNow, down.position.x, down.position.y, ctxNow) ?: continue
+                                    controller.onDown(
+                                        hit.model,
+                                        down.position.x,
+                                        down.position.y,
+                                        SystemClock.uptimeMillis(),
+                                        touchSampleOf(keysNow, down.position.x, down.position.y, hit.model, ctxNow),
+                                    )
+                                    down.consume()
+                                    activeId = down.id
+                                    continue
+                                }
+                                val second = downs.firstOrNull { it.id != activeId && it.pressed }
+                                if (second != null) {
+                                    val hit = hitKey(keysNow, second.position.x, second.position.y, ctxNow)
+                                    if (hit != null) {
+                                        val switched = controller.onRollover(
+                                            hit.model,
+                                            second.position.x,
+                                            second.position.y,
+                                            SystemClock.uptimeMillis(),
+                                            touchSampleOf(keysNow, second.position.x, second.position.y, hit.model, ctxNow),
+                                        )
+                                        if (switched) activeId = second.id
+                                    }
+                                    second.consume()
+                                }
+                                val active = event.changes.firstOrNull { it.id == activeId }
+                                if (active == null) {
+                                    controller.onCancel()
+                                    activeId = null
+                                    pendingAdopt = false
+                                    continue
+                                }
+                                if (!active.pressed) {
+                                    controller.onUp(SystemClock.uptimeMillis())
+                                    activeId = null
+                                    pendingAdopt = event.changes.any { it.id != active.id && it.pressed }
+                                    active.consume()
+                                    continue
+                                }
+                                val current = hitKey(keysNow, active.position.x, active.position.y, ctxNow)
+                                controller.onMove(
+                                    active.position.x,
+                                    active.position.y,
+                                    SystemClock.uptimeMillis(),
+                                    current?.model,
+                                    current?.let {
+                                        touchSampleOf(keysNow, active.position.x, active.position.y, it.model, ctxNow)
+                                    },
+                                )
+                                active.consume()
                             }
-                            val current = hitKey(placementState.value.keys, change.position.x, change.position.y)
-                            controller.onMove(change.position.x, change.position.y, SystemClock.uptimeMillis(), current?.model)
-                            change.consume()
                         }
+                    } catch (cancelled: CancellationException) {
+                        controller.onCancel()
+                        throw cancelled
                     }
                 },
         ) {
             placement.keys.forEach { key ->
                 KeyCap(key, state, palette, keyHeight)
+            }
+            val tapPreview = state.tapPreview
+            if (tapPreview != null && state.popup == null && !state.engine.password) {
+                val tapAnchor = placement.keys.firstOrNull { it.model.id == tapPreview.keyId }
+                if (tapAnchor != null) {
+                    val showUpper = state.engine.language == Language.English &&
+                        state.engine.shift != ShiftState.Off
+                    TapBubble(tapPreview, showUpper, tapAnchor, widthPx, side, palette, density)
+                }
             }
             val popup = state.popup
             val anchor = placement.keys.firstOrNull { it.model.id == popup?.keyId }
@@ -781,6 +856,45 @@ private fun LanguageMark(language: Language, palette: Palette) {
             fontSize = 9.5.sp,
             fontWeight = FontWeight.SemiBold,
             lineHeight = 10.sp,
+        )
+    }
+}
+
+@Composable
+private fun TapBubble(
+    tap: TapPreview,
+    showUpper: Boolean,
+    anchor: PlacedKey,
+    boardWidth: Float,
+    side: Float,
+    palette: Palette,
+    density: androidx.compose.ui.unit.Density,
+) {
+    val bubbleWidth = 48.dp
+    val bubbleHeight = 56.dp
+    val bubbleWidthPx = with(density) { bubbleWidth.toPx() }
+    val bubbleHeightPx = with(density) { bubbleHeight.toPx() }
+    val gapAbovePx = with(density) { 4.dp.toPx() }
+    val maxX = (boardWidth - side - bubbleWidthPx).coerceAtLeast(side)
+    val x = (anchor.x + anchor.w / 2f - bubbleWidthPx / 2f).coerceIn(side, maxX)
+    val y = (anchor.y - bubbleHeightPx - gapAbovePx).coerceAtLeast(0f)
+    val bubbleShape = RoundedCornerShape(12.dp)
+    Box(
+        Modifier
+            .offset { IntOffset(x.toInt(), y.toInt()) }
+            .size(bubbleWidth, bubbleHeight)
+            .shadow(elevation = 4.dp, shape = bubbleShape, clip = false)
+            .clip(bubbleShape)
+            .background(palette.sheetElevated)
+            .border(0.8.dp, palette.keyBorder, bubbleShape),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            if (showUpper) tap.label.uppercase() else tap.label,
+            color = palette.label,
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
         )
     }
 }

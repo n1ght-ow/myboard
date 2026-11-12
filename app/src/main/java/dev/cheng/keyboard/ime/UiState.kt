@@ -4,6 +4,7 @@ import dev.cheng.keyboard.ai.PolishCandidate
 import dev.cheng.keyboard.ai.PolishTone
 import dev.cheng.keyboard.engine.EngineState
 import dev.cheng.keyboard.ime.gesture.PopupPreview
+import dev.cheng.keyboard.ime.gesture.TapPreview
 import dev.cheng.keyboard.model.EnterKind
 import dev.cheng.keyboard.model.ThemeMode
 
@@ -25,6 +26,7 @@ data class UiState(
     val enter: EnterKind = EnterKind.Newline,
     val pressedId: String? = null,
     val popup: PopupPreview? = null,
+    val tapPreview: TapPreview? = null,
     val menu: Boolean = false,
     val clip: String? = null,
     val freshClip: String? = null,

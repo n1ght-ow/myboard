@@ -45,6 +45,29 @@ data class Candidate(
     val consumed: Int = -1,
 )
 
+data class KeyLikelihood(val ch: Char, val penalty: Float)
+
+data class TouchSample(
+    val primary: Char? = null,
+    val alternatives: List<KeyLikelihood> = emptyList(),
+    val residualX: Float = 0f,
+    val residualY: Float = 0f,
+    val leftSide: Boolean = false,
+) {
+    val neighborText: String get() = alternatives.joinToString("") { it.ch.toString() }
+
+    fun penaltyOf(ch: Char): Float? = when {
+        ch == primary -> 0f
+        else -> alternatives.firstOrNull { it.ch == ch }?.penalty
+    }
+}
+
+data class TouchBias(
+    val leftDxRatio: Float = 0f,
+    val rightDxRatio: Float = 0f,
+    val dyRatio: Float = 0f,
+)
+
 data class LexRow(
     val text: String,
     val syllables: String,

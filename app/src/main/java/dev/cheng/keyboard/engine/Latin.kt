@@ -1,8 +1,22 @@
 package dev.cheng.keyboard.engine
 
 import dev.cheng.keyboard.model.Candidate
+import dev.cheng.keyboard.model.TouchSample
 import java.util.PriorityQueue
 import kotlin.math.ln
+
+internal fun spatialSubstitutionCost(
+    candidate: Char,
+    sample: TouchSample?,
+    legacySpatial: Boolean,
+): Float? {
+    val penalty = sample?.penaltyOf(candidate)
+    return when {
+        penalty != null -> 0.35f + 0.50f * penalty.coerceIn(0f, 1f)
+        sample == null && legacySpatial -> 0.78f
+        else -> null
+    }
+}
 
 class LatinDecoder {
     private class Node {
@@ -49,6 +63,7 @@ class LatinDecoder {
         verbatimFirst: Boolean = false,
         prevWord: String? = null,
         touchHints: List<String> = emptyList(),
+        touchSamples: List<TouchSample?> = emptyList(),
     ): List<Candidate> {
         published
         val prefix = raw.lowercase()
@@ -123,7 +138,7 @@ class LatinDecoder {
 
         val strongPrefixMatch = credibleExact || completions.any { it.first != prefix && it.second >= 500 }
         if (prefix.length >= 2 && (!strongPrefixMatch || completions.size < 3)) {
-            for (hit in fuzzyMatches(prefix, touchHints)) {
+            for (hit in fuzzyMatches(prefix, touchHints, touchSamples)) {
                 val baseScore = ln(hit.freq.coerceAtLeast(1).toDouble()) - hit.cost * 3.2 + contextBonus(hit.word)
                 val adjusted = if (strongPrefixMatch) baseScore - 8.0 else baseScore
                 offer(hit.word, hit.freq, adjusted)
@@ -151,6 +166,53 @@ class LatinDecoder {
         }
 
         return ranked.take(20)
+    }
+
+    fun nextLetterPriors(prefix: String, prevWord: String? = null): FloatArray {
+        published
+        val cleaned = prefix.lowercase()
+        if (cleaned.isNotEmpty()) {
+            val node = walk(cleaned) ?: return FloatArray(26)
+            val logs = FloatArray(26)
+            var maxLog = 0f
+            for (index in 0..25) {
+                val child = node.next[index]
+                if (child != null && child.best > 0) {
+                    val value = ln((child.best + 1).toDouble()).toFloat()
+                    logs[index] = value
+                    if (value > maxLog) maxLog = value
+                }
+            }
+            if (maxLog <= 0f) return FloatArray(26)
+            return FloatArray(26) { index ->
+                val child = node.next[index]
+                if (child != null && child.best > 0) {
+                    (logs[index] / maxLog).coerceIn(0f, 1f)
+                } else {
+                    -0.20f
+                }
+            }
+        }
+        val prev = prevWord?.trim()?.lowercase().orEmpty()
+        if (prev.isNotEmpty()) {
+            val followers = bigrams[prev] ?: return FloatArray(26)
+            val counts = FloatArray(26)
+            var maxCount = 0f
+            for ((word, count) in followers) {
+                if (count <= 0) continue
+                val first = word.firstOrNull()?.lowercaseChar() ?: continue
+                if (first in 'a'..'z') {
+                    val idx = first - 'a'
+                    counts[idx] += count.toFloat()
+                    if (counts[idx] > maxCount) maxCount = counts[idx]
+                }
+            }
+            if (maxCount <= 0f) return FloatArray(26)
+            return FloatArray(26) { index ->
+                if (counts[index] > 0f) ((counts[index] / maxCount) * 0.55f).coerceIn(0f, 0.55f) else 0f
+            }
+        }
+        return FloatArray(26)
     }
 
     fun predictNext(previousWord: String): List<Candidate> {
@@ -244,7 +306,11 @@ class LatinDecoder {
 
     private data class FuzzyHit(val word: String, val freq: Int, val cost: Double)
 
-    private fun fuzzyMatches(typed: String, touchHints: List<String> = emptyList()): List<FuzzyHit> {
+    private fun fuzzyMatches(
+        typed: String,
+        touchHints: List<String> = emptyList(),
+        touchSamples: List<TouchSample?> = emptyList(),
+    ): List<FuzzyHit> {
         val maxCost = if (typed.length <= 4) 1.85 else 2.9
         val hits = HashMap<String, FuzzyHit>()
         var visits = 0
@@ -287,12 +353,14 @@ class LatinDecoder {
 
             // Substitution (QWERTY adjacent key preferred; general substitution only on longer words)
             val spatial = touchHints.getOrNull(pos).orEmpty()
+            val sample = touchSamples.getOrNull(pos)
             for (idx in 0 until 26) {
                 val child = node.next[idx] ?: continue
                 val candidateChar = 'a' + idx
                 if (candidateChar == ch) continue
+                val spatialCost = spatialSubstitutionCost(candidateChar, sample, candidateChar in spatial)?.toDouble()
                 val subCost = when {
-                    candidateChar in spatial -> 0.78
+                    spatialCost != null -> spatialCost
                     isQwertyNeighbor(ch, candidateChar) -> 1.25
                     pos >= 2 && ch in "aeiou" && candidateChar in "aeiou" -> 1.35
                     typed.length >= 4 && pos > 0 -> 2.15
