@@ -4,6 +4,8 @@ import android.view.KeyEvent
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
+import dev.cheng.keyboard.ai.HostScene
+import dev.cheng.keyboard.ai.hostSceneOf
 import dev.cheng.keyboard.engine.Cmd
 import dev.cheng.keyboard.engine.previousWordUnits
 import dev.cheng.keyboard.engine.resolveSmartCommit
@@ -95,6 +97,8 @@ data class FieldSource(
     val selection: Boolean,
     val start: Int,
     val end: Int,
+    val contextBefore: String = "",
+    val contextAfter: String = "",
 )
 
 fun readField(connection: InputConnection): FieldSource? {
@@ -106,17 +110,39 @@ fun readField(connection: InputConnection): FieldSource? {
         if (start != end) {
             val from = minOf(start, end)
             val to = maxOf(start, end)
-            return FieldSource(all.substring(from, to).take(4000), selection = true, start = from, end = to)
+            return FieldSource(
+                text = all.substring(from, to).take(4000),
+                selection = true,
+                start = from,
+                end = to,
+                contextBefore = contextBeforeOf(all, from),
+                contextAfter = contextAfterOf(all, to),
+            )
         }
         return paragraphSource(all, start)
     }
     val selected = connection.getSelectedText(0)?.toString()
-    if (!selected.isNullOrEmpty()) return FieldSource(selected.take(4000), selection = true, start = -1, end = -1)
+    if (!selected.isNullOrEmpty()) {
+        return FieldSource(
+            text = selected.take(4000),
+            selection = true,
+            start = -1,
+            end = -1,
+            contextBefore = "",
+            contextAfter = "",
+        )
+    }
     val before = connection.getTextBeforeCursor(4000, 0)?.toString()
     val after = connection.getTextAfterCursor(4000, 0)?.toString()
     if (before == null && after == null) return null
     return paragraphSource(before.orEmpty() + after.orEmpty(), before.orEmpty().length).copy(start = -1, end = -1)
 }
+
+private fun contextBeforeOf(all: String, start: Int, limit: Int = 200): String =
+    if (start <= 0) "" else all.substring(maxOf(0, start - limit), start)
+
+private fun contextAfterOf(all: String, end: Int, limit: Int = 120): String =
+    if (end < 0 || end >= all.length) "" else all.substring(end, minOf(all.length, end + limit))
 
 private fun extractedRequest() = ExtractedTextRequest().apply {
     hintMaxChars = 10000
@@ -135,7 +161,16 @@ private fun paragraphSource(all: String, cursor: Int): FieldSource {
     val text = (if (useAll) all else paragraph).take(4000)
     val start = if (useAll) 0 else safeCursor - paragraphHead.length
     val end = (start + text.length).coerceAtMost(all.length)
-    return FieldSource(text, selection = false, start = start, end = end)
+    val contextBefore = if (useAll) "" else contextBeforeOf(all, start)
+    val contextAfter = if (useAll) "" else contextAfterOf(all, end)
+    return FieldSource(
+        text = text,
+        selection = false,
+        start = start,
+        end = end,
+        contextBefore = contextBefore,
+        contextAfter = contextAfter,
+    )
 }
 
 class EditorBridge(private val connection: () -> InputConnection?) {
@@ -240,4 +275,14 @@ class EditorBridge(private val connection: () -> InputConnection?) {
         val count = previousWordUnits(before)
         if (count > 0) input.deleteSurroundingText(count, 0)
     }
+}
+
+fun extractHostScene(info: EditorInfo?, enter: EnterKind): HostScene {
+    val traits = info?.let(::fieldTraitsOf)
+    val hint = if (info == null || traits?.password == true || traits?.noLearn == true) {
+        null
+    } else {
+        info.hintText?.toString()
+    }
+    return hostSceneOf(info?.packageName, hint, enter)
 }

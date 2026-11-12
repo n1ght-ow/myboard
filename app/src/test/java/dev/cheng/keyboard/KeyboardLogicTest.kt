@@ -1,5 +1,11 @@
 package dev.cheng.keyboard
 
+import dev.cheng.keyboard.ai.HostCategory
+import dev.cheng.keyboard.ai.PolishTone
+import dev.cheng.keyboard.ai.appCategoryOf
+import dev.cheng.keyboard.ai.buildPolishUserPrompt
+import dev.cheng.keyboard.ai.hostSceneOf
+import dev.cheng.keyboard.ai.parsePolishStream
 import dev.cheng.keyboard.ai.parseSseLine
 import dev.cheng.keyboard.engine.Cmd
 import dev.cheng.keyboard.engine.EngineAct
@@ -1039,6 +1045,110 @@ class KeyboardLogicTest {
         assertEquals("definitely", latin.suggest("definately").first().text)
         assertEquals("grammar", latin.suggest("grammer").first().text)
         assertEquals("app", latin.suggest("app").first().text)
+    }
+
+    @Test
+    fun polishStreamSplitsMultipleCandidates() {
+        val raw = "【对老师·请假】\n王老师您好，\n明天早八我有冲突，想向您请假。\n\n【简短版】\n王老师好，明天早八想跟您请个假。"
+        val items = parsePolishStream(raw)
+        assertEquals(2, items.size)
+        assertEquals("对老师·请假", items[0].tag)
+        assertEquals("王老师您好，\n明天早八我有冲突，想向您请假。", items[0].text)
+        assertEquals("简短版", items[1].tag)
+        assertEquals("王老师好，明天早八想跟您请个假。", items[1].text)
+    }
+
+    @Test
+    fun polishStreamHidesHalfWrittenTag() {
+        assertTrue(parsePolishStream("【对老师").isEmpty())
+        val items = parsePolishStream("【对老师·请假】\n王老师您好\n【简短")
+        assertEquals(1, items.size)
+        assertEquals("对老师·请假", items[0].tag)
+        assertEquals("王老师您好", items[0].text)
+        assertFalse(items[0].text.contains("【简短"))
+    }
+
+    @Test
+    fun polishStreamFallsBackToPlainText() {
+        val items = parsePolishStream("润色：今天去开会路上堵车，稍晚到。")
+        assertEquals(1, items.size)
+        assertEquals("智能润色", items[0].tag)
+        assertEquals("今天去开会路上堵车，稍晚到。", items[0].text)
+        assertFalse(items[0].text.contains("润色："))
+        assertFalse(items[0].text.contains("\"") || items[0].text.contains("“") || items[0].text.contains("”"))
+
+        val quoted = parsePolishStream("“润色：今天去开会路上堵车，稍晚到。”")
+        assertEquals(1, quoted.size)
+        assertEquals("智能润色", quoted[0].tag)
+        assertEquals("今天去开会路上堵车，稍晚到。", quoted[0].text)
+    }
+
+    @Test
+    fun polishStreamDropsPreamble() {
+        val items = parsePolishStream("好的，以下是润色结果：\n【长辈·温和】\n妈，我这周末回不去啦")
+        assertEquals(1, items.size)
+        assertEquals("长辈·温和", items[0].tag)
+        assertEquals("妈，我这周末回不去啦", items[0].text)
+
+        val withEmptyTag = parsePolishStream("【空块】\n【长辈·温和】\n妈，我这周末回不去啦")
+        assertEquals(1, withEmptyTag.size)
+        assertEquals("长辈·温和", withEmptyTag[0].tag)
+    }
+
+    @Test
+    fun polishPromptIncludesContextOnlyWhenPresent() {
+        val emptyScene = hostSceneOf("com.tencent.mm", null, EnterKind.Send)
+        val withoutCtx = buildPolishUserPrompt(
+            original = "明天早八我有课去不了了",
+            contextBefore = "   ",
+            contextAfter = "",
+            scene = emptyScene,
+            tone = PolishTone.Auto,
+        )
+        assertFalse(withoutCtx.contains("【前文参考"))
+        assertFalse(withoutCtx.contains("【后文参考"))
+        assertFalse(withoutCtx.contains("输入框提示"))
+        assertTrue(withoutCtx.endsWith("【待润色原文】\n明天早八我有课去不了了"))
+
+        val richScene = hostSceneOf("com.tencent.mm", "回复 @张老师", EnterKind.Send)
+        val withCtx = buildPolishUserPrompt(
+            original = "明天早八我有课去不了了",
+            contextBefore = "王老师您好：",
+            contextAfter = "谢谢老师",
+            scene = richScene,
+            tone = PolishTone.Auto,
+        )
+        assertTrue(withCtx.contains("输入框提示：回复 @张老师"))
+        assertTrue(withCtx.contains("【前文参考（仅用于判断对象，勿润色、勿重复）】\n王老师您好："))
+        assertTrue(withCtx.contains("【后文参考（勿润色、勿重复）】\n谢谢老师"))
+        assertTrue(withCtx.endsWith("【待润色原文】\n明天早八我有课去不了了"))
+        assertTrue(withCtx.indexOf("【前文参考") < withCtx.indexOf("【后文参考"))
+        assertTrue(withCtx.indexOf("【后文参考") < withCtx.indexOf("【待润色原文】"))
+    }
+
+    @Test
+    fun polishSceneClassifiesPackages() {
+        val wechat = hostSceneOf("com.tencent.mm", null, EnterKind.Newline)
+        assertEquals(HostCategory.Im, wechat.category)
+        assertTrue(wechat.chatBubble)
+
+        val wework = hostSceneOf("com.tencent.wework", null, EnterKind.Newline)
+        assertEquals(HostCategory.Work, wework.category)
+        assertFalse(wework.chatBubble)
+        assertTrue(hostSceneOf("com.tencent.wework", null, EnterKind.Send).chatBubble)
+        assertEquals(HostCategory.Work, appCategoryOf("com.Slack"))
+        assertEquals(HostCategory.Work, appCategoryOf("com.slack.intune"))
+
+        assertEquals(HostCategory.MailDoc, hostSceneOf("com.tencent.androidqqmail", null, EnterKind.Newline).category)
+        assertEquals(HostCategory.MailDoc, appCategoryOf("com.microsoft.office.outlook"))
+        assertEquals(HostCategory.Social, hostSceneOf("com.xingin.xhs", null, EnterKind.Newline).category)
+        assertEquals(HostCategory.General, hostSceneOf(null, null, EnterKind.Newline).category)
+    }
+
+    @Test
+    fun polishToneAutoUsesAutoLabel() {
+        assertEquals("自动判断", PolishTone.Auto.promptLabel)
+        assertEquals("老师", PolishTone.Teacher.promptLabel)
     }
 }
 

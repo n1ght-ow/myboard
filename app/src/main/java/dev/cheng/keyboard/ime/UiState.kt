@@ -1,5 +1,7 @@
 package dev.cheng.keyboard.ime
 
+import dev.cheng.keyboard.ai.PolishCandidate
+import dev.cheng.keyboard.ai.PolishTone
 import dev.cheng.keyboard.engine.EngineState
 import dev.cheng.keyboard.ime.gesture.PopupPreview
 import dev.cheng.keyboard.model.EnterKind
@@ -44,4 +46,8 @@ data class UiState(
     val symbolLocked: Boolean = false,
     val symbolRecent: Boolean = false,
     val recentSymbols: List<String> = emptyList(),
+    val polishTone: PolishTone = PolishTone.Auto,
+    val polishCandidates: List<PolishCandidate> = emptyList(),
+    val polishSelected: Int = 0,
+    val canUndoPolish: Boolean = false,
 )

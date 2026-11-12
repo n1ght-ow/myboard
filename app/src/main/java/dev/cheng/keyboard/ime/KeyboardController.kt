@@ -10,13 +10,17 @@ import android.os.Build
 import android.os.SystemClock
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
+import dev.cheng.keyboard.ai.ADAPTIVE_POLISH_SYSTEM_PROMPT
 import dev.cheng.keyboard.ai.ASK_PROMPT
 import dev.cheng.keyboard.ai.AiResult
 import dev.cheng.keyboard.ai.DeepSeekClient
 import dev.cheng.keyboard.ai.MODEL_FLASH
 import dev.cheng.keyboard.ai.MODEL_PRO
-import dev.cheng.keyboard.ai.POLISH_PROMPT
+import dev.cheng.keyboard.ai.PolishTone
+import dev.cheng.keyboard.ai.PolishUndo
 import dev.cheng.keyboard.ai.TRANSLATE_PROMPT
+import dev.cheng.keyboard.ai.buildPolishUserPrompt
+import dev.cheng.keyboard.ai.parsePolishStream
 import dev.cheng.keyboard.data.PrefKeys
 import dev.cheng.keyboard.data.Secrets
 import dev.cheng.keyboard.data.SqliteLexicon
@@ -90,6 +94,7 @@ class KeyboardController(
     private var clipExpireJob: Job? = null
     private var noteClearJob: Job? = null
     private var source: FieldSource? = null
+    private var lastPolishUndo: PolishUndo? = null
     private var candidateRaw = ""
     private var aiToken = 0
     private val clipboard = context.getSystemService(ClipboardManager::class.java)
@@ -187,7 +192,8 @@ class KeyboardController(
             )
         }
         gesture.cancel()
-        update { it.copy(pressedId = null, popup = null, expanded = false, enter = enter) }
+        lastPolishUndo = null
+        update { it.copy(pressedId = null, popup = null, expanded = false, enter = enter, canUndoPolish = false) }
         publish()
     }
 
@@ -274,6 +280,9 @@ class KeyboardController(
                 askAttached = null,
                 resultText = "",
                 resultSource = "",
+                polishTone = PolishTone.Auto,
+                polishCandidates = emptyList(),
+                polishSelected = 0,
                 busy = false,
                 note = null,
             )
@@ -471,7 +480,76 @@ class KeyboardController(
     }
 
     fun translate() = transform(ResultKind.Translate, TRANSLATE_PROMPT, 0.2)
-    fun polish() = transform(ResultKind.Polish, POLISH_PROMPT, 0.3)
+
+    fun polish() = polish(PolishTone.Auto)
+
+    fun polish(tone: PolishTone) {
+        if (engineState.password) return
+        val open = state.overlay as? Overlay.Result
+        val reuse = open?.kind == ResultKind.Polish && source != null
+        val field = if (reuse) source!! else prepareTransform(ResultKind.Polish)?.also { source = it } ?: return
+        val key = secrets.get().orEmpty()
+        if (key.isBlank()) return
+        lastPolishUndo = null
+        val scene = extractHostScene(activeInfo, enter)
+        val user = buildPolishUserPrompt(field.text, field.contextBefore, field.contextAfter, scene, tone)
+        update {
+            it.copy(
+                overlay = Overlay.Result(ResultKind.Polish),
+                polishTone = tone,
+                polishCandidates = emptyList(),
+                polishSelected = 0,
+                resultText = "",
+                resultSource = field.text.take(80),
+                note = null,
+                busy = true,
+                menu = false,
+                expanded = false,
+                canUndoPolish = false,
+            )
+        }
+        launchAi(
+            key = key,
+            model = MODEL_FLASH,
+            system = ADAPTIVE_POLISH_SYSTEM_PROMPT,
+            user = user,
+            temperature = 0.35,
+            maxTokens = 2048,
+            thinking = false,
+            onStream = { _, content ->
+                val list = parsePolishStream(content)
+                if (list.isNotEmpty()) {
+                    update { prev ->
+                        val index = prev.polishSelected.coerceIn(0, list.lastIndex)
+                        prev.copy(
+                            polishCandidates = list,
+                            polishSelected = index,
+                            resultText = list[index].text,
+                        )
+                    }
+                }
+            },
+            onOk = { text ->
+                val list = parsePolishStream(text)
+                update { prev ->
+                    val index = prev.polishSelected.coerceIn(0, maxOf(0, list.lastIndex))
+                    prev.copy(
+                        busy = false,
+                        polishCandidates = list,
+                        polishSelected = index,
+                        resultText = list.getOrNull(index)?.text.orEmpty(),
+                        note = if (list.isEmpty()) "没有返回正文" else null,
+                    )
+                }
+            },
+        )
+    }
+
+    fun selectPolishCandidate(index: Int) {
+        val list = state.polishCandidates
+        if (index !in list.indices) return
+        update { it.copy(polishSelected = index, resultText = list[index].text) }
+    }
 
     fun closeOverlay() = finishOverlay(null)
 
@@ -491,6 +569,9 @@ class KeyboardController(
                 askDraft = "",
                 resultText = "",
                 resultSource = "",
+                polishTone = PolishTone.Auto,
+                polishCandidates = emptyList(),
+                polishSelected = 0,
                 note = note,
                 engine = engineState,
             )
@@ -575,12 +656,39 @@ class KeyboardController(
             if (current != null && target.end <= current.length && current.substring(target.start, target.end) == target.text) {
                 input.setSelection(target.start, target.end)
                 input.commitText(text, 1)
+                if ((state.overlay as? Overlay.Result)?.kind == ResultKind.Polish) {
+                    lastPolishUndo = PolishUndo(target.start, target.start + text.length, target.text, text)
+                    finishOverlay("已替换")
+                    update { it.copy(canUndoPolish = true) }
+                    return
+                }
                 closeOverlay()
                 return
             }
         }
         input.commitText(text, 1)
         finishOverlay("原文有变化，已改为插入")
+    }
+
+    fun undoPolish() {
+        val undo = lastPolishUndo ?: return
+        val input = connection() ?: return
+        val current = input.getExtractedText(
+            android.view.inputmethod.ExtractedTextRequest().apply {
+                hintMaxChars = 10000
+                hintMaxLines = 200
+            },
+            0,
+        )?.text?.toString() ?: return
+        if (undo.start < 0 || undo.start > undo.end || undo.end > current.length || current.substring(undo.start, undo.end) != undo.replaced) {
+            lastPolishUndo = null
+            update { it.copy(canUndoPolish = false, note = "原文已变化，无法撤回") }
+            return
+        }
+        input.setSelection(undo.start, undo.end)
+        input.commitText(undo.original, 1)
+        lastPolishUndo = null
+        update { it.copy(canUndoPolish = false, note = "已撤回") }
     }
 
     fun copyResult() {
@@ -598,27 +706,63 @@ class KeyboardController(
         }
     }
 
-    private fun transform(kind: ResultKind, prompt: String, temperature: Double) {
-        if (engineState.password) return
+    private fun prepareTransform(kind: ResultKind): FieldSource? {
+        if (engineState.password) return null
         val key = secrets.get()
         if (key.isNullOrBlank()) {
             update { it.copy(overlay = Overlay.NeedKey, menu = false, keyDraft = "") }
-            return
+            return null
         }
-        val input = connection()
-        val field = input?.let(::readField)
+        val field = connection()?.let(::readField)
         if (field == null) {
-            update { it.copy(overlay = Overlay.Result(kind), resultText = "", note = "读不到输入框内容", busy = false, menu = false) }
-            return
+            lastPolishUndo = null
+            update {
+                it.copy(
+                    overlay = Overlay.Result(kind),
+                    resultText = "",
+                    resultSource = "",
+                    polishCandidates = emptyList(),
+                    polishSelected = 0,
+                    canUndoPolish = false,
+                    note = "读不到输入框内容",
+                    busy = false,
+                    menu = false,
+                )
+            }
+            return null
         }
         if (field.text.isBlank()) {
-            update { it.copy(overlay = Overlay.Result(kind), resultText = "", note = "没有可处理的内容", busy = false, menu = false) }
-            return
+            lastPolishUndo = null
+            update {
+                it.copy(
+                    overlay = Overlay.Result(kind),
+                    resultText = "",
+                    resultSource = "",
+                    polishCandidates = emptyList(),
+                    polishSelected = 0,
+                    canUndoPolish = false,
+                    note = "没有可处理的内容",
+                    busy = false,
+                    menu = false,
+                )
+            }
+            return null
         }
+        return field
+    }
+
+    private fun transform(kind: ResultKind, prompt: String, temperature: Double) {
+        val field = prepareTransform(kind) ?: return
+        val key = secrets.get().orEmpty()
+        if (key.isBlank()) return
         source = field
+        lastPolishUndo = null
         update {
             it.copy(
                 overlay = Overlay.Result(kind),
+                polishCandidates = emptyList(),
+                polishSelected = 0,
+                canUndoPolish = false,
                 resultText = "",
                 resultSource = field.text.take(80),
                 note = null,
