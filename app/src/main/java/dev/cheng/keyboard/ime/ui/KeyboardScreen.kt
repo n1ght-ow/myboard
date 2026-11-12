@@ -513,10 +513,14 @@ private fun PopupKeys(
 private fun CandidateGrid(state: UiState, palette: Palette, controller: KeyboardController, keyHeight: Dp) {
     val rows = state.engine.candidates.chunked(4)
     Column(
-        Modifier.fillMaxWidth().height(keyHeight * 4 + 30.dp).padding(8.dp),
+        Modifier
+            .fillMaxWidth()
+            .height(keyHeight * 4 + 30.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        rows.take(4).forEach { row ->
+        rows.forEach { row ->
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 row.forEach { candidate ->
                     val index = state.engine.candidates.indexOf(candidate)

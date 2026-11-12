@@ -161,15 +161,15 @@ class InputEngine(private val latin: LatinDecoder) {
         if (state.language == Language.Chinese) {
             if (state.raw.isNotEmpty()) {
                 val chosen = state.candidates.firstOrNull()
-                val text = chosen?.text ?: state.raw
-                val cmds = mutableListOf<Cmd>(Cmd.Commit(text))
-                if (chosen != null && learnable(state)) cmds += Cmd.LearnZh(text, chosen.syllables)
-                return EngineStep(
-                    state.copy(raw = "", preedit = "", candidates = emptyList(), associating = true),
-                    cmds,
-                    pending = Pending.Associate,
-                    associateFrom = text,
-                )
+                if (chosen == null) {
+                    return EngineStep(
+                        state.copy(raw = "", preedit = "", candidates = emptyList(), associating = true),
+                        listOf(Cmd.Commit(state.raw)),
+                        pending = Pending.Associate,
+                        associateFrom = state.raw,
+                    )
+                }
+                return chooseChinese(state, chosen)
             }
             if (state.associating && state.candidates.isNotEmpty()) {
                 val text = state.candidates.first().text
@@ -244,12 +244,17 @@ class InputEngine(private val latin: LatinDecoder) {
                 EngineStep(state, listOf(Cmd.EditorAction(kind)))
             }
         }
+        if (state.language == Language.Chinese && state.raw.any { it in 'a'..'z' || it in 'A'..'Z' }) {
+            val spelling = buildString(state.raw.length) {
+                for (ch in state.raw) if (ch in 'a'..'z' || ch in 'A'..'Z') append(ch)
+            }
+            return EngineStep(
+                state.copy(raw = "", preedit = "", candidates = emptyList(), associating = false),
+                listOf(Cmd.Commit(spelling)),
+            )
+        }
         val cmds = mutableListOf<Cmd>()
-        val cleared = if (state.raw.isNotEmpty() && state.language == Language.Chinese) {
-            val pending = takePending(state)
-            cmds += pending.second
-            pending.first
-        } else if (state.raw.isNotEmpty()) {
+        val cleared = if (state.raw.isNotEmpty()) {
             cmds += Cmd.Commit(state.raw)
             state.copy(raw = "", preedit = "", candidates = emptyList())
         } else {
@@ -295,9 +300,22 @@ class InputEngine(private val latin: LatinDecoder) {
                 cmds,
             )
         }
+        return chooseChinese(state, item)
+    }
+
+    private fun chooseChinese(state: EngineState, item: Candidate): EngineStep {
         val cmds = mutableListOf<Cmd>(Cmd.Commit(item.text))
         if (!state.associating && learnable(state) && item.syllables.isNotBlank()) {
             cmds += Cmd.LearnZh(item.text, item.syllables)
+        }
+        val rest = if (state.associating) "" else leftover(state.raw, item.consumed)
+        if (rest.isNotEmpty()) {
+            cmds += Cmd.Compose(rest)
+            return EngineStep(
+                state.copy(raw = rest, preedit = rest, candidates = emptyList(), associating = false),
+                cmds,
+                pending = Pending.Pinyin,
+            )
         }
         return EngineStep(
             state.copy(raw = "", preedit = "", candidates = emptyList(), associating = true),
@@ -305,6 +323,19 @@ class InputEngine(private val latin: LatinDecoder) {
             pending = Pending.Associate,
             associateFrom = item.text,
         )
+    }
+
+    private fun leftover(raw: String, consumed: Int): String {
+        val letters = raw.count { it in 'a'..'z' || it in 'A'..'Z' }
+        if (consumed < 0 || consumed >= letters) return ""
+        var seen = 0
+        var index = 0
+        while (index < raw.length && seen < consumed) {
+            if (raw[index] in 'a'..'z' || raw[index] in 'A'..'Z') seen++
+            index++
+        }
+        if (index < raw.length && raw[index] == '\'') index++
+        return raw.substring(index)
     }
 
     private fun confirmThen(state: EngineState, extra: String): EngineStep {

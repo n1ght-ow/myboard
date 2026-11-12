@@ -113,12 +113,15 @@ def iter_rime(path: Path):
 
 def keep_entry(name: str, word: str, freq: int) -> bool:
     # tencent.dict.yaml has no pinyin column, so iter_rime skips it.
+    # Names and newer terms in 雾凇 often sit at weight 100–1999.
+    # Common phrases still outrank these inside the decoder because a
+    # frequent word scores above a weight-100 entry of the same length.
     if name == "8105.dict.yaml":
         return True
     if name == "base.dict.yaml":
-        return len(word) == 1 or freq >= 2000
+        return len(word) == 1 or freq >= 100
     if name == "ext.dict.yaml":
-        return freq >= 300 and len(word) <= 6
+        return 2 <= len(word) <= 6 and freq >= 100
     return False
 
 
@@ -213,9 +216,10 @@ def build_english() -> None:
 
 def write_sources() -> None:
     text = """Chinese lexicon
-Derived from 雾凇拼音 cn_dicts: every entry in 8105, plus base entries with weight >= 2000.
+Derived from 雾凇拼音 cn_dicts: every entry in 8105, base entries with weight >= 100,
+and ext entries of 2–6 characters with weight >= 100.
 Each row stores syllable initials so abbreviated pinyin can be queried.
-ext stays out of the bundled file because its weights sit below that line.
+The ext table is where 雾凇 keeps names and newer terms such as 特朗普.
 Upstream: https://github.com/iDvel/rime-ice
 License: GPL-3.0-only
 

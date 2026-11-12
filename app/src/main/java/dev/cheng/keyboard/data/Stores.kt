@@ -91,6 +91,23 @@ class SqliteLexicon(private val db: SQLiteDatabase) : Lexicon {
         arrayOf(syllablePrefix, prefixEnd(syllablePrefix), limit.toString()),
     )
 
+    override fun spelling(syllables: String, limit: Int): List<LexRow> {
+        if (syllables.isBlank()) return emptyList()
+        val count = syllables.count { it == ' ' } + 1
+        return query(
+            "SELECT text, syllables, letters, freq FROM entry WHERE nsy = ? AND syllables = ? ORDER BY freq DESC LIMIT ?",
+            arrayOf(count.toString(), syllables, limit.toString()),
+        )
+    }
+
+    override fun spellingStarting(prefix: String, nsy: Int, limit: Int): List<LexRow> {
+        if (prefix.isBlank() || nsy < 1) return emptyList()
+        return query(
+            "SELECT text, syllables, letters, freq FROM entry WHERE nsy = ? AND syllables >= ? AND syllables < ? AND syllables LIKE ? ORDER BY freq DESC LIMIT ?",
+            arrayOf(nsy.toString(), prefix, prefixEnd(prefix), "$prefix%", limit.toString()),
+        )
+    }
+
     override fun byInitials(prefix: String, limit: Int): List<LexRow> {
         if (prefix.isEmpty()) return emptyList()
         val exact = query(

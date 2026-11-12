@@ -42,6 +42,7 @@ data class Candidate(
     val text: String,
     val syllables: String,
     val freq: Int,
+    val consumed: Int = -1,
 )
 
 data class LexRow(
@@ -57,6 +58,8 @@ interface Lexicon {
     fun charsStarting(syllablePrefix: String, limit: Int): List<LexRow>
     fun phrasesStarting(text: String, limit: Int): List<LexRow>
     fun byInitials(prefix: String, limit: Int): List<LexRow>
+    fun spelling(syllables: String, limit: Int): List<LexRow>
+    fun spellingStarting(prefix: String, nsy: Int, limit: Int): List<LexRow>
 }
 
 class MemoryLexicon(private val rows: List<LexRow>) : Lexicon {
@@ -84,6 +87,16 @@ class MemoryLexicon(private val rows: List<LexRow>) : Lexicon {
             .sortedWith(compareBy<LexRow> { initialsOf(it.syllables) != prefix }.thenByDescending { it.freq })
             .take(limit)
     }
+
+    override fun spelling(syllables: String, limit: Int): List<LexRow> =
+        rows.filter { it.syllables == syllables }.sortedByDescending { it.freq }.take(limit)
+
+    override fun spellingStarting(prefix: String, nsy: Int, limit: Int): List<LexRow> =
+        rows.filter { row ->
+            row.syllables.startsWith(prefix) &&
+                row.syllables.length > prefix.length &&
+                row.syllables.count { it == ' ' } + 1 == nsy
+        }.sortedByDescending { it.freq }.take(limit)
 }
 
 internal fun initialsOf(syllables: String): String =

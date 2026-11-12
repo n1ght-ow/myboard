@@ -92,9 +92,21 @@ fun segmentPinyin(raw: String, trie: SylTrie): List<Seg> {
             val bonus = syllable.length * syllable.length
             val dest = paths[end]
             for (path in from) dest.add(Path(path.parts + syllable, path.score + bonus))
-            if (dest.size > 16) {
+            if (dest.size > 28) {
                 dest.sortByDescending { it.score }
-                while (dest.size > 12) dest.removeAt(dest.lastIndex)
+                val best = dest.first().score
+                val kept = ArrayList<Path>(16)
+                val tails = HashSet<String>()
+                for (option in dest) {
+                    if (kept.size >= 16) break
+                    val tail = option.parts.last()
+                    val close = option.score + 12 >= best
+                    if (!close && tail in tails && kept.size >= 8) continue
+                    kept += option
+                    tails += tail
+                }
+                dest.clear()
+                dest.addAll(kept)
             }
         }
     }
@@ -105,9 +117,10 @@ fun segmentPinyin(raw: String, trie: SylTrie): List<Seg> {
         if (start == size || !trie.hasPrefix(text, start)) continue
         val rest = text.substring(start)
         if (rest.isEmpty()) continue
-        for (path in paths[start]) partials.add(Seg(path.parts + rest, partial = true))
+        val ranked = paths[start].sortedByDescending { it.score }.take(3)
+        for (path in ranked) partials.add(Seg(path.parts + rest, partial = true))
     }
-    return (full + partials).distinctBy { it.parts to it.partial }.take(32)
+    return (full + partials).distinctBy { it.parts to it.partial }.sortedByDescending { segScore(it) }.take(24)
 }
 
 private fun forcedSegments(raw: String, trie: SylTrie): List<Seg> {
@@ -183,57 +196,51 @@ class PinyinDecoder(syllables: Set<String>) {
         if (text.isEmpty()) return Decode("", emptyList())
         val letters = text.filter { it in 'a'..'z' }
         val segs = segmentPinyin(text, trie)
-        val hits = LinkedHashMap<String, Ranked>()
-        val ordered = segs.sortedByDescending { segScore(it) }
-        for (seg in ordered.take(6)) {
-            for ((key, penalty) in letterKeys(seg, fuzzy)) {
-                consider(lexicon.exact(key, 24), seg, fuzzy, hits, penalty)
-                if (key.length >= 3) consider(lexicon.prefixed(key, 16), seg, fuzzy, hits, penalty)
-            }
-            val onlyPartial = seg.partial && seg.parts.size == 1
-            if (onlyPartial) consider(lexicon.charsStarting(seg.parts[0], 24), seg, fuzzy, hits, 0)
+        val book = Book()
+        val full = segs.filter { !it.partial }
+        val open = segs.filter { it.partial && it.parts.isNotEmpty() && !trie.isWord(it.parts.last()) }
+        val chosen = ArrayList<Seg>(5)
+        for (seg in full) {
+            if (chosen.size >= 3) break
+            chosen += seg
         }
-        for (row in user) {
-            val matched = segs.firstOrNull { matches(row, it, fuzzy) } ?: continue
-            consider(listOf(row), matched, fuzzy, hits, 0)
+        var partials = 0
+        for (seg in open) {
+            if (partials >= 2) break
+            chosen += seg
+            partials++
         }
-        if ('\'' !in text && letters.length in 2..48) {
-            for ((seg, edits) in correctedSegments(letters)) {
-                val penalty = edits + 1
-                val key = seg.parts.joinToString("")
-                consider(lexicon.exact(key, 8), seg, fuzzy = false, hits, penalty)
-                for (row in user) {
-                    if (matches(row, seg, false)) consider(listOf(row), seg, false, hits, penalty)
-                }
-            }
-        }
-        for (seg in ordered.take(2)) {
-            if (seg.parts.size >= 3 || hits.isEmpty()) {
-                for (candidate in covers(seg)) {
-                    addHit(candidate.text, candidate.syllables, candidate.freq, rank = 3, seg, hits)
-                }
+        val solid = full.firstOrNull()?.parts?.all { it.length >= 2 } == true
+        val pinyin = ArrayList<Scored>()
+        val ordered = ArrayList<Scored>()
+        val seen = HashSet<String>()
+        for ((index, seg) in chosen.withIndex()) {
+            val block = book.rank(book.candidates(seg))
+            val leading = if (index == 0 && !seg.partial) book.prefixes(seg) else emptyList()
+            for (item in block + leading) {
+                pinyin += item
+                if (seen.add(item.text)) ordered += item
             }
         }
-        val initialsRank = if (ordered.isNotEmpty() && ordered.all { seg -> seg.parts.all { it.length <= 1 } }) 0 else 4
-        val anchor = ordered.firstOrNull() ?: Seg(listOf(letters), partial = true)
-        for (row in lexicon.byInitials(letters, 16)) {
-            addHit(row.text, row.syllables, row.freq, initialsRank, anchor, hits)
+        val abbrev = if (solid || letters.length !in 2..16) emptyList() else book.abbreviations(letters)
+        var body = if (solid) ordered else book.rank(pinyin + abbrev)
+        val primary = full.firstOrNull() ?: open.firstOrNull()
+        if (fuzzy && primary != null && !primary.partial) {
+            val extra = book.fuzzy(primary).filter { item -> body.none { it.text == item.text } }
+            body = if (body.isEmpty()) extra else body + extra
         }
-        for (row in user) {
-            if (dev.cheng.keyboard.model.initialsOf(row.syllables).startsWith(letters)) {
-                addHit(row.text, row.syllables, row.freq, initialsRank, anchor, hits)
-            }
+        if (body.isEmpty() && letters.isNotEmpty()) body = book.typos(letters)
+        val single = primary != null && !primary.partial && primary.parts.size == 1
+        val chars = if (single) emptyList() else book.anchor(primary).filter { item -> body.none { it.text == item.text } }.take(8)
+        val items = if (single) body.take(200) else (body.take(40) + chars).take(48)
+        val best = items.firstOrNull()
+        val preedit = when {
+            best == null -> chosen.firstOrNull()?.parts?.joinToString("'") ?: letters
+            best.typo -> letters
+            else -> best.preedit
         }
-        if (hits.isEmpty()) return Decode(if (segs.isEmpty()) text else segs.first().parts.joinToString("'"), emptyList())
-        val ranked = hits.values.sortedWith(
-            compareBy<Ranked> { it.rank }.thenBy { it.penalty }.thenByDescending { it.row.freq },
-        )
-        val candidates = ranked.take(30).map { rankedHit ->
-            Candidate(rankedHit.row.text, rankedHit.row.syllables, rankedHit.row.freq)
-        }
-        val preedit = (ranked.firstOrNull()?.seg ?: segs.firstOrNull() ?: anchor).parts.joinToString("'")
         val shown = if (text.endsWith("'") && !preedit.endsWith("'")) "$preedit'" else preedit
-        return Decode(shown, candidates)
+        return Decode(shown, items.map { Candidate(it.text, it.syllables, it.freq, it.consumed) })
     }
 
     fun associate(text: String): List<Candidate> {
@@ -260,146 +267,313 @@ class PinyinDecoder(syllables: Set<String>) {
         user.clear()
     }
 
-    private fun covers(seg: Seg): List<Candidate> {
-        val parts = seg.parts
-        if (parts.size < 2) return emptyList()
-        val fixed = if (seg.partial) parts.dropLast(1) else parts
-        if (fixed.isEmpty()) return emptyList()
-        val paths = bestCovers(fixed)
-        if (!seg.partial) {
-            return paths.map { Candidate(it.text, it.syllables, coverScore(it.shape, it.weight)) }
-        }
-        val tails = topChars(parts.last(), partial = true).take(6)
-        val out = ArrayList<Candidate>(8)
-        for (path in paths) {
-            for (tail in tails) {
-                out += Candidate(
-                    path.text + tail.text,
-                    "${path.syllables} ${tail.syllables}".trim(),
-                    coverScore(path.shape + 1, path.weight + freqWeight(tail.freq)),
-                )
-                if (out.size >= 8) return out.distinctBy { it.text }
-            }
-        }
-        return out.distinctBy { it.text }
-    }
-
-    private fun coverScore(shape: Int, weight: Int): Int = shape * 2_000_000 + weight.coerceIn(0, 1_999_999)
-
-    private data class Cover(
+    private data class Scored(
         val text: String,
         val syllables: String,
         val freq: Int,
-        val shape: Int,
-        val weight: Int,
+        val score: Double,
+        val preedit: String,
+        val typo: Boolean,
+        val consumed: Int,
     )
 
-    private fun bestCovers(parts: List<String>): List<Cover> {
-        val dp = Array(parts.size + 1) { mutableListOf<Cover>() }
-        dp[0].add(Cover("", "", Int.MAX_VALUE, 0, 0))
-        for (end in 1..parts.size) {
-            val found = ArrayList<Cover>()
-            for (start in maxOf(0, end - 6) until end) {
-                for (prev in dp[start]) {
-                    val slice = parts.subList(start, end)
-                    val choices = if (slice.size == 1) {
-                        topChars(slice[0], partial = false).take(4)
-                    } else {
-                        lookupPhrase(slice).take(4)
+    private data class Piece(val text: String, val syllables: String, val freq: Int, val score: Double)
+
+    private inner class Book {
+        private val cache = HashMap<String, List<LexRow>>()
+
+        fun candidates(seg: Seg): List<Scored> {
+            if (seg.partial && seg.parts.isNotEmpty() && !trie.isWord(seg.parts.last())) {
+                return opened(seg)
+            }
+            val preedit = seg.parts.joinToString("'")
+            val used = typedLength(seg.parts)
+            val items = ArrayList<Scored>()
+            val fetch = if (seg.parts.size == 1) 200 else 40
+            for (row in spell(seg.parts, boostUser = true, limit = fetch)) {
+                val whole = if (!seg.partial && seg.parts.size >= 3 && row.text.length >= 3) FULL_WORD_BONUS else 0.0
+                items += scored(row, wordScore(row.text, row.freq) + whole, preedit, false, used)
+            }
+            for (piece in cover(seg.parts)) {
+                if (piece.text.isEmpty()) continue
+                items += Scored(piece.text, piece.syllables, piece.freq, piece.score, preedit, false, used)
+            }
+            if (seg.parts.size >= 2 && trie.hasExtension(seg.parts.last())) items += opened(seg)
+            return items
+        }
+
+        fun prefixes(seg: Seg): List<Scored> {
+            if (seg.partial || seg.parts.size < 2) return emptyList()
+            val items = ArrayList<Scored>()
+            for (end in seg.parts.size - 1 downTo 1) {
+                val head = seg.parts.subList(0, end)
+                val row = spell(head).firstOrNull() ?: continue
+                items += scored(
+                    row,
+                    wordScore(row.text, row.freq),
+                    head.joinToString("'"),
+                    false,
+                    typedLength(head),
+                )
+                if (items.size >= 2) break
+            }
+            return items
+        }
+
+        fun abbreviations(letters: String): List<Scored> {
+            val items = ArrayList<Scored>()
+            val paths = listOf(tokens(letters, false), tokens(letters, true)).distinct()
+            for (token in paths) {
+                val shortened = token.count { it.length < 2 || !trie.isWord(it) }
+                if (shortened == 0) continue
+                val key = buildString { for (part in token) append(part[0]) }
+                val rows = lexicon.byInitials(key, 48) + user.filter {
+                    dev.cheng.keyboard.model.initialsOf(it.syllables).startsWith(key)
+                }
+                for (row in rows) {
+                    val parts = row.syllables.split(' ')
+                    if (parts.size < token.size || parts.size > token.size + 2) continue
+                    if (!fits(parts, token)) continue
+                    val extra = parts.size - token.size
+                    var penalty = 8.0 * shortened + 12.0 * extra
+                    for (index in token.indices) {
+                        val syllable = parts[index]
+                        if ('v' !in token[index] && syllable.length >= 2 && syllable[1] == 'v') penalty += 18.0
                     }
-                    for (choice in choices) {
-                        val count = choice.syllables.count { it == ' ' } + 1
-                        found += Cover(
-                            prev.text + choice.text,
-                            (prev.syllables + " " + choice.syllables).trim(),
-                            minOf(prev.freq, choice.freq),
-                            prev.shape + count * count,
-                            prev.weight + freqWeight(choice.freq),
-                        )
+                    items += scored(
+                        row,
+                        wordScore(row.text, row.freq) - penalty,
+                        token.joinToString("'"),
+                        false,
+                        letters.length,
+                    )
+                }
+            }
+            return items
+        }
+
+        fun fuzzy(seg: Seg): List<Scored> {
+            if (seg.parts.isEmpty() || seg.parts.size > 4) return emptyList()
+            val used = typedLength(seg.parts)
+            val items = ArrayList<Scored>()
+            for (index in seg.parts.indices) {
+                for (alt in expandSyllable(seg.parts[index]).drop(1).take(2)) {
+                    val parts = seg.parts.toMutableList()
+                    parts[index] = alt
+                    val preedit = parts.joinToString("'")
+                    for (row in spell(parts).take(2)) {
+                        items += scored(row, wordScore(row.text, row.freq) - 32.0, preedit, false, used)
                     }
                 }
             }
-            dp[end] = found
-                .sortedWith(compareByDescending<Cover> { it.shape }.thenByDescending { it.weight })
+            return rank(items)
+        }
+
+        fun typos(letters: String): List<Scored> {
+            val items = ArrayList<Scored>()
+            for ((seg, cost) in correctedSegments(letters)) {
+                for (row in spell(seg.parts).take(2)) {
+                    items += scored(row, wordScore(row.text, row.freq) - 42.0 * cost, letters, true, letters.length)
+                }
+            }
+            return rank(items)
+        }
+
+        fun anchor(seg: Seg?): List<Scored> {
+            if (seg == null || seg.parts.isEmpty()) return emptyList()
+            val syllable = seg.parts.first()
+            val rows = if (seg.partial && seg.parts.size == 1) {
+                charsOf(syllable)
+            } else {
+                spell(listOf(syllable), boostUser = true).filter { it.text.length == 1 }.take(8)
+            }
+            val preedit = syllable
+            return rows.map { scored(it, wordScore(it.text, it.freq), preedit, false, syllable.length) }
+        }
+
+        fun rank(items: List<Scored>): List<Scored> {
+            val best = LinkedHashMap<String, Scored>()
+            for (item in items) {
+                if (item.text.isEmpty()) continue
+                val previous = best[item.text]
+                if (previous == null || item.score > previous.score) best[item.text] = item
+            }
+            return best.values.sortedByDescending { it.score }
+        }
+
+        private fun opened(seg: Seg): List<Scored> {
+            val preedit = seg.parts.joinToString("'")
+            val used = typedLength(seg.parts)
+            val items = ArrayList<Scored>()
+            val head = seg.parts.dropLast(1)
+            val tail = seg.parts.last()
+            val prefix = seg.parts.joinToString(" ")
+            val longer = lexicon.spellingStarting(prefix, seg.parts.size, 6) + user.filter { extends(it, seg.parts) }
+            for (row in longer) {
+                if (!extends(row, seg.parts)) continue
+                items += scored(row, wordScore(row.text, row.freq), preedit, false, used)
+            }
+            val heads = headPieces(head)
+            for (piece in heads) {
+                for (row in charsOf(tail)) {
+                    val text = piece.text + row.text
+                    if (text.isEmpty()) continue
+                    items += Scored(
+                        text,
+                        joinSyl(piece.syllables, row.syllables),
+                        if (piece.text.isEmpty()) row.freq else minOf(piece.freq, row.freq),
+                        piece.score + wordScore(row.text, row.freq),
+                        preedit,
+                        false,
+                        used,
+                    )
+                }
+            }
+            return items
+        }
+
+        private fun headPieces(head: List<String>): List<Piece> {
+            if (head.isEmpty()) return listOf(Piece("", "", 0, 0.0))
+            val words = spell(head).take(3).map { Piece(it.text, it.syllables, it.freq, wordScore(it.text, it.freq)) }
+            val built = if (head.size >= 2) cover(head) else emptyList()
+            val merged = (words + built).distinctBy { it.text }.sortedByDescending { it.score }.take(3)
+            return merged.ifEmpty { listOf(Piece("", "", 0, 0.0)) }
+        }
+
+        private fun cover(parts: List<String>): List<Piece> {
+            if (parts.isEmpty()) return emptyList()
+            val dp = Array(parts.size + 1) { ArrayList<Piece>() }
+            dp[0].add(Piece("", "", 0, 0.0))
+            val width = minOf(6, parts.size)
+            for (end in 1..parts.size) {
+                val found = ArrayList<Piece>()
+                for (start in maxOf(0, end - width) until end) {
+                    val rows = spell(parts.subList(start, end)).take(if (end - start == 1) 4 else 3)
+                    for (prev in dp[start]) {
+                        for (row in rows) {
+                            found += Piece(
+                                prev.text + row.text,
+                                joinSyl(prev.syllables, row.syllables),
+                                if (prev.text.isEmpty()) row.freq else minOf(prev.freq, row.freq),
+                                prev.score + wordScore(row.text, row.freq),
+                            )
+                        }
+                    }
+                }
+                dp[end] = ArrayList(rankPieces(found).take(3))
+            }
+            return dp[parts.size]
+        }
+
+        private fun spell(parts: List<String>, boostUser: Boolean = false, limit: Int = 12): List<LexRow> {
+            if (parts.isEmpty()) return emptyList()
+            val key = parts.joinToString(" ")
+            val cacheKey = "${if (boostUser) "u" else "d"}:$limit:$key"
+            return cache.getOrPut(cacheKey) {
+                val dict = lexicon.spelling(key, limit).ifEmpty {
+                    if (parts.size == 1) {
+                        lexicon.charsStarting(key, limit).filter { it.syllables == key && it.text.length == 1 }
+                    } else {
+                        emptyList()
+                    }
+                }
+                if (!boostUser) {
+                    dict
+                } else {
+                    val extra = user.filter { it.syllables == key }
+                    (extra + dict).distinctBy { it.text }.sortedByDescending { it.freq }
+                }
+            }
+        }
+
+        private fun charsOf(prefix: String): List<LexRow> {
+            return lexicon.charsStarting(prefix, 8)
+                .filter { it.text.length == 1 && it.syllables.startsWith(prefix) }
                 .distinctBy { it.text }
+                .sortedByDescending { it.freq }
                 .take(6)
-                .toMutableList()
-            if (dp[end].isEmpty()) {
-                val prev = dp[end - 1].firstOrNull() ?: continue
-                val fallback = topChars(parts[end - 1], partial = false).firstOrNull() ?: continue
-                dp[end].add(
-                    Cover(
-                        prev.text + fallback.text,
-                        (prev.syllables + " " + fallback.syllables).trim(),
-                        minOf(prev.freq, fallback.freq),
-                        prev.shape + 1,
-                        prev.weight + freqWeight(fallback.freq),
-                    ),
-                )
+        }
+
+        private fun tokens(text: String, mergeShengmu: Boolean): List<String> {
+            val out = ArrayList<String>()
+            var index = 0
+            while (index < text.length) {
+                var end = -1
+                for (cut in trie.endings(text, index)) {
+                    if (cut - index >= 2) end = maxOf(end, cut)
+                }
+                if (end > index) {
+                    out += text.substring(index, end)
+                    index = end
+                    continue
+                }
+                if (mergeShengmu && index + 2 <= text.length && text.substring(index, index + 2) in shengmu) {
+                    out += text.substring(index, index + 2)
+                    index += 2
+                    continue
+                }
+                out += text.substring(index, index + 1)
+                index += 1
             }
+            return out
         }
-        return dp[parts.size]
-    }
 
-    private fun freqWeight(freq: Int): Int = (kotlin.math.ln(freq.coerceAtLeast(1).toDouble()) * 1000).toInt()
-
-    private fun lookupPhrase(syllables: List<String>): List<LexRow> {
-        if (syllables.isEmpty()) return emptyList()
-        val expect = syllables.joinToString(" ")
-        return lexicon.exact(syllables.joinToString(""), 24).filter { it.syllables == expect }
-    }
-
-    private fun topChars(syllable: String, partial: Boolean): List<LexRow> {
-        val rows = if (partial) {
-            lexicon.charsStarting(syllable, 8)
-        } else {
-            val exact = lexicon.exact(syllable, 12).filter { it.syllables == syllable && it.text.length == 1 }
-            exact.ifEmpty { lexicon.charsStarting(syllable, 8).filter { it.syllables == syllable } }
-        }
-        return rows.filter { it.text.length == 1 }.distinctBy { it.text }
-    }
-
-    private fun addHit(
-        text: String,
-        syllables: String,
-        freq: Int,
-        rank: Int,
-        seg: Seg,
-        hits: LinkedHashMap<String, Ranked>,
-    ) {
-        val row = LexRow(text, syllables, syllables.replace(" ", ""), freq)
-        val previous = hits[text]
-        if (previous == null || better(previous, rank, 0, freq)) {
-            hits[text] = Ranked(row, rank, seg, 0)
-        }
-    }
-
-    private fun consider(
-        rows: List<LexRow>,
-        seg: Seg,
-        fuzzy: Boolean,
-        hits: LinkedHashMap<String, Ranked>,
-        basePenalty: Int,
-    ) {
-        for (row in rows) {
-            val penalty = when {
-                matches(row, seg, false) -> basePenalty
-                fuzzy && matches(row, seg, true) -> maxOf(basePenalty, 1)
-                else -> continue
+        private fun fits(parts: List<String>, token: List<String>): Boolean {
+            for (index in token.indices) {
+                val typed = token[index]
+                val syllable = parts[index]
+                if (typed.length >= 2 && trie.isWord(typed)) {
+                    if (syllable != typed) return false
+                } else if (!syllable.startsWith(typed)) {
+                    return false
+                }
             }
-            val rank = rankOf(row, seg)
-            val previous = hits[row.text]
-            if (previous == null || better(previous, rank, penalty, row.freq)) {
-                hits[row.text] = Ranked(row, rank, seg, penalty)
+            return true
+        }
+
+        private fun extends(row: LexRow, parts: List<String>): Boolean {
+            val syllables = row.syllables.split(' ')
+            if (syllables.size != parts.size || parts.isEmpty()) return false
+            for (index in 0 until parts.lastIndex) {
+                if (syllables[index] != parts[index]) return false
             }
+            val typed = parts.last()
+            val last = syllables.last()
+            return last.startsWith(typed) && last.length > typed.length
+        }
+
+        private fun scored(row: LexRow, score: Double, preedit: String, typo: Boolean, consumed: Int) =
+            Scored(row.text, row.syllables, row.freq, score, preedit, typo, consumed)
+
+        private fun typedLength(parts: List<String>) = parts.sumOf { it.length }
+
+        private fun rankPieces(items: List<Piece>): List<Piece> {
+            val best = LinkedHashMap<String, Piece>()
+            for (item in items) {
+                if (item.text.isEmpty()) continue
+                val previous = best[item.text]
+                if (previous == null || item.score > previous.score) best[item.text] = item
+            }
+            return best.values.sortedByDescending { it.score }
+        }
+
+        private fun joinSyl(left: String, right: String): String = when {
+            left.isEmpty() -> right
+            right.isEmpty() -> left
+            else -> "$left $right"
         }
     }
 
-    private fun better(previous: Ranked, rank: Int, penalty: Int, freq: Int): Boolean {
-        if (rank != previous.rank) return rank < previous.rank
-        if (penalty != previous.penalty) return penalty < previous.penalty
-        return freq > previous.row.freq
+    private fun wordScore(text: String, freq: Int): Double {
+        val count = text.length.coerceAtLeast(1)
+        return count * count * kotlin.math.ln(freq.coerceAtLeast(1).toDouble())
     }
+
+    private companion object {
+        const val FULL_WORD_BONUS = 28.0
+        val shengmu = setOf("zh", "ch", "sh")
+    }
+
 
     private fun correctedSegments(text: String): List<Pair<Seg, Int>> {
         val paths = Array(text.length + 1) { ArrayList<Node>(4) }
@@ -478,51 +652,6 @@ class PinyinDecoder(syllables: Set<String>) {
     }
 
     private data class Node(val parts: List<String>, val cost: Int, val score: Int)
-
-    private data class Ranked(val row: LexRow, val rank: Int, val seg: Seg, val penalty: Int)
-}
-
-private fun letterKeys(seg: Seg, fuzzy: Boolean): List<Pair<String, Int>> {
-    val parts = seg.parts
-    if (parts.isEmpty()) return emptyList()
-    val groups = parts.mapIndexed { index, part ->
-        val tail = seg.partial && index == parts.lastIndex
-        if (!fuzzy || tail) listOf(part) else expandSyllable(part).take(4)
-    }
-    fun join(choose: (Int) -> String) = buildString {
-        for (index in groups.indices) append(choose(index))
-    }
-    val keys = LinkedHashSet<Pair<String, Int>>()
-    val exact = join { groups[it].first() }
-    keys += exact to 0
-    if (!fuzzy) return keys.toList()
-    for (index in groups.indices) {
-        for (alt in groups[index].drop(1)) {
-            val key = join { if (it == index) alt else groups[it].first() }
-            if (key != exact) keys += key to 1
-            if (keys.size >= 36) return keys.toList()
-        }
-    }
-    if (parts.size <= 6) {
-        for (left in groups.indices) {
-            for (right in left + 1 until groups.size) {
-                for (a in groups[left].drop(1).take(2)) {
-                    for (b in groups[right].drop(1).take(2)) {
-                        val key = join {
-                            when (it) {
-                                left -> a
-                                right -> b
-                                else -> groups[it].first()
-                            }
-                        }
-                        if (key != exact) keys += key to 1
-                        if (keys.size >= 36) return keys.toList()
-                    }
-                }
-            }
-        }
-    }
-    return keys.toList()
 }
 
 private fun editCost(typed: String, target: String): Int? {
@@ -602,28 +731,6 @@ private fun adjacentKey(left: Char, right: Char): Boolean {
     return right in neighbors
 }
 
-internal fun matches(row: LexRow, seg: Seg, fuzzy: Boolean): Boolean {
-    val parts = row.syllables.split(' ')
-    val typed = seg.parts
-    if (typed.isEmpty() || parts.size < typed.size) return false
-    val complete = if (seg.partial) typed.lastIndex else typed.size
-    for (index in 0 until complete) {
-        if (!syllableEquals(typed[index], parts[index], fuzzy)) return false
-    }
-    if (!seg.partial) return true
-    val target = parts[typed.lastIndex]
-    val partial = typed.last()
-    if (target.startsWith(partial)) return true
-    if (!fuzzy) return false
-    return expandSyllable(partial).any { target.startsWith(it) }
-}
-
-private fun syllableEquals(typed: String, dict: String, fuzzy: Boolean): Boolean {
-    if (typed == dict) return true
-    if (!fuzzy) return false
-    return dict in expandSyllable(typed)
-}
-
 private fun segScore(seg: Seg): Int {
     return seg.parts.withIndex().sumOf { (index, part) ->
         val complete = !(seg.partial && index == seg.parts.lastIndex)
@@ -631,11 +738,3 @@ private fun segScore(seg: Seg): Int {
     }
 }
 
-private fun rankOf(row: LexRow, seg: Seg): Int {
-    val count = row.syllables.count { it == ' ' } + 1
-    return when {
-        !seg.partial && count == seg.parts.size -> 0
-        !seg.partial -> 1
-        else -> 2
-    }
-}

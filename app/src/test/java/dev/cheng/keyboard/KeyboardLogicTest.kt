@@ -239,6 +239,189 @@ class KeyboardLogicTest {
     }
 
     @Test
+    fun frequentPhraseStillBeatsRareHomophone() {
+        val decoder = PinyinDecoder(setOf("wei", "shen", "me"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("为什么", "wei shen me", "weishenme", 500_000),
+                LexRow("喂什么", "wei shen me", "weishenme", 100),
+                LexRow("为", "wei", "wei", 2_000_000),
+                LexRow("什", "shen", "shen", 800_000),
+                LexRow("么", "me", "me", 1_500_000),
+            ),
+        )
+        assertEquals("为什么", decoder.decode("weishenme", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun abbreviationBeatsAdjacentCorrection() {
+        val decoder = PinyinDecoder(setOf("bi", "da", "bei", "jing", "an"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("比大", "bi da", "bida", 80_000),
+                LexRow("北京答案", "bei jing da an", "beijingdaan", 120_000),
+            ),
+        )
+        val result = decoder.decode("bjda", fuzzy = false)
+        assertEquals("北京答案", result.candidates.first().text)
+        assertFalse(result.candidates.any { it.text == "比大" })
+    }
+
+    @Test
+    fun mixedInitialAndSyllableFindsTheCommonWord() {
+        val decoder = PinyinDecoder(setOf("n", "hao", "ni", "ha"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("嗯好", "n hao", "nhao", 30),
+                LexRow("你", "ni", "ni", 2_000_000),
+                LexRow("哈", "ha", "ha", 2_000),
+                LexRow("好", "hao", "hao", 1_500_000),
+                LexRow("你好", "ni hao", "nihao", 400_000),
+            ),
+        )
+        assertEquals("你好", decoder.decode("nhao", fuzzy = false).candidates.first().text)
+        assertEquals("你好", decoder.decode("niha", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun plainInitialDoesNotPreferUmlaut() {
+        val decoder = PinyinDecoder(setOf("n", "h", "ni", "hao", "nv", "hai"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("女孩", "nv hai", "nvhai", 500_000),
+                LexRow("你好", "ni hao", "nihao", 300_000),
+            ),
+        )
+        assertEquals("你好", decoder.decode("nh", fuzzy = false).candidates.first().text)
+        assertEquals("女孩", decoder.decode("nvh", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun lowFrequencyNameBeatsCommonCharacters() {
+        val decoder = PinyinDecoder(setOf("te", "lang", "pu"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("特", "te", "te", 1_314_148),
+                LexRow("狼", "lang", "lang", 360_398),
+                LexRow("朗", "lang", "lang", 149_504),
+                LexRow("普", "pu", "pu", 317_637),
+                LexRow("特朗普", "te lang pu", "telangpu", 100),
+            ),
+        )
+        assertEquals("特朗普", decoder.decode("telangpu", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun nameBeatsAFrequentPartialWord() {
+        val decoder = PinyinDecoder(setOf("ma", "si", "ke", "zhang", "yi", "ming"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("吗", "ma", "ma", 5_000_000),
+                LexRow("死磕", "si ke", "sike", 80_000),
+                LexRow("马斯克", "ma si ke", "masike", 100),
+                LexRow("长", "zhang", "zhang", 2_000_000),
+                LexRow("一名", "yi ming", "yiming", 90_000),
+                LexRow("张一鸣", "zhang yi ming", "zhangyiming", 100),
+            ),
+        )
+        assertEquals("马斯克", decoder.decode("masike", fuzzy = false).candidates.first().text)
+        assertEquals("张一鸣", decoder.decode("zhangyiming", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun learnedCharacterDoesNotTakeOverLongerPhrases() {
+        val decoder = PinyinDecoder(setOf("wo", "men", "hao"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("我", "wo", "wo", 2_000_000),
+                LexRow("们", "men", "men", 800_000),
+                LexRow("我们", "wo men", "women", 500_000),
+                LexRow("好", "hao", "hao", 7_000_000),
+                LexRow("号", "hao", "hao", 500_000),
+            ),
+        )
+        decoder.learn("号", "hao")
+        val phrase = decoder.decode("womenhao", fuzzy = false)
+        assertEquals("我们好", phrase.candidates.first().text)
+        val syllable = decoder.decode("hao", fuzzy = false)
+        assertEquals("号", syllable.candidates.first().text)
+    }
+
+    @Test
+    fun prefixCandidateKeepsTheRemainingPinyin() {
+        val decoder = PinyinDecoder(setOf("wo", "men", "hao"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("我", "wo", "wo", 2_000_000),
+                LexRow("们", "men", "men", 800_000),
+                LexRow("我们", "wo men", "women", 500_000),
+                LexRow("好", "hao", "hao", 1_500_000),
+            ),
+        )
+        val result = decoder.decode("womenhao", fuzzy = false)
+        assertEquals("我们好", result.candidates.first().text)
+        assertEquals(8, result.candidates.first().consumed)
+        val prefix = result.candidates.first { it.text == "我们" }
+        assertEquals(5, prefix.consumed)
+        val engine = InputEngine(LatinDecoder())
+        val state = EngineState(raw = "wo'men'hao", candidates = result.candidates)
+        val picked = engine.reduce(state, EngineAct.Pick(result.candidates.indexOf(prefix)), EnterKind.Newline)
+        assertEquals("我们", (picked.cmds.first() as Cmd.Commit).text)
+        assertEquals("hao", picked.cmds.filterIsInstance<Cmd.Compose>().single().text)
+        assertEquals("hao", picked.state.raw)
+        val spaced = engine.reduce(state, EngineAct.Space, EnterKind.Newline)
+        assertEquals("我们好", (spaced.cmds.first() as Cmd.Commit).text)
+        assertTrue(spaced.state.raw.isEmpty())
+        assertTrue(spaced.cmds.none { it is Cmd.Compose })
+    }
+
+    @Test
+    fun homophoneListsAreNotCutAtTwelve() {
+        val decoder = PinyinDecoder(setOf("yi", "zhi"))
+        val chars = (0 until 20).map { index ->
+            LexRow(Character.toString(0x4E00 + index), "yi", "yi", 2_000 - index)
+        }
+        val phrases = (0 until 10).map { index ->
+            LexRow("词" + Character.toString(0x4E00 + index), "yi zhi", "yizhi", 2_000 - index)
+        }
+        decoder.lexicon = MemoryLexicon(chars + phrases)
+        val syllable = decoder.decode("yi", fuzzy = false)
+        assertEquals(20, syllable.candidates.size)
+        assertEquals("一", syllable.candidates.first().text)
+        val phrase = decoder.decode("yizhi", fuzzy = false)
+        assertEquals(10, phrase.candidates.count { it.text.startsWith("词") })
+        assertEquals("词一", phrase.candidates.first().text)
+    }
+
+    @Test
+    fun singleSyllableStaysAheadOfTheSplit() {
+        val decoder = PinyinDecoder(setOf("xi", "an", "xian"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("先", "xian", "xian", 20),
+                LexRow("西安", "xi an", "xian", 30),
+            ),
+        )
+        assertEquals("先", decoder.decode("xian", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun chineseEnterCommitsUnsegmentedPinyin() {
+        val engine = InputEngine(LatinDecoder())
+        val state = EngineState(
+            raw = "ni'hao",
+            preedit = "ni'hao",
+            candidates = listOf(dev.cheng.keyboard.model.Candidate("你好", "ni hao", 80)),
+        )
+        val step = engine.reduce(state, EngineAct.Enter, EnterKind.Send)
+        assertEquals(listOf("nihao"), step.cmds.filterIsInstance<Cmd.Commit>().map { it.text })
+        assertTrue(step.cmds.none { it is Cmd.EditorAction })
+        assertTrue(step.state.raw.isEmpty())
+        val idle = engine.reduce(EngineState(), EngineAct.Enter, EnterKind.Newline)
+        assertEquals("\n", (idle.cmds.single() as Cmd.Commit).text)
+    }
+
+    @Test
     fun separatorSplitsXian() {
         val decoder = PinyinDecoder(setOf("xi", "an", "xian", "a"))
         decoder.lexicon = MemoryLexicon(
