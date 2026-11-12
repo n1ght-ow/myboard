@@ -11,10 +11,12 @@ import dev.cheng.keyboard.engine.expandSyllable
 import dev.cheng.keyboard.engine.applyAskDraft
 import dev.cheng.keyboard.engine.applyCase
 import dev.cheng.keyboard.engine.previousWordUnits
+import dev.cheng.keyboard.engine.resolveSmartCommit
 import dev.cheng.keyboard.engine.segmentPinyin
 import dev.cheng.keyboard.engine.shouldAutoCap
 import dev.cheng.keyboard.engine.stripWrapped
 import dev.cheng.keyboard.ime.gesture.KeyGesture
+import dev.cheng.keyboard.ime.layout.nearbyLetters
 import dev.cheng.keyboard.ime.layout.placeKeys
 import dev.cheng.keyboard.model.Choice
 import dev.cheng.keyboard.model.EnterKind
@@ -32,6 +34,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.time.LocalDateTime
+import java.util.zip.GZIPInputStream
 
 class KeyboardLogicTest {
     private val syllables = setOf(
@@ -850,6 +855,190 @@ class KeyboardLogicTest {
         assertTrue(decoder.decode("nihso", fuzzy = false).candidates.any { it.text == "你好" })
         assertTrue(decoder.decode("nihsow", fuzzy = false).candidates.any { it.text == "你好我" })
         assertTrue(decoder.decode("nihsoz", fuzzy = false).candidates.any { it.text == "你好在" })
+    }
+
+    @Test
+    fun chineseLeftContextDisambiguatesHomophonesAndSupportsForget() {
+        val decoder = PinyinDecoder(setOf("gong", "shi", "de", "xiang", "mu"))
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("公示", "gong shi", "gongshi", 242_500),
+                LexRow("公式", "gong shi", "gongshi", 206_515),
+                LexRow("共识", "gong shi", "gongshi", 161_800),
+                LexRow("数学公式", "shu xue gong shi", "shuxuegongshi", 10_073),
+                LexRow("达成共识", "da cheng gong shi", "dachenggongshi", 34_460),
+                LexRow("的", "de", "de", 30_000_000),
+                LexRow("地", "de", "de", 2_000_000),
+                LexRow("得", "de", "de", 1_800_000),
+                LexRow("觉得", "jue de", "juede", 600_000),
+                LexRow("向目", "xiang mu", "xiangmu", 500_000),
+                LexRow("项目", "xiang mu", "xiangmu", 400_000),
+            ),
+        )
+
+        assertEquals("公示", decoder.decode("gongshi", fuzzy = false).candidates.first().text)
+        assertEquals("公式", decoder.decode("gongshi", fuzzy = false, context = "数学").candidates.first().text)
+        assertEquals("共识", decoder.decode("gongshi", fuzzy = false, context = "达成").candidates.first().text)
+        assertEquals("得", decoder.decode("de", fuzzy = false, context = "觉").candidates.first().text)
+        assertEquals("地", decoder.decode("de", fuzzy = false, context = "慢慢").candidates.first().text)
+
+        // User bigram + forget learned word
+        decoder.learn("项目", "xiang mu", prevContext = "核心")
+        assertTrue(decoder.associate("核心").any { it.text == "项目" })
+        assertEquals("项目", decoder.decode("xiangmu", fuzzy = false, context = "核心").candidates.first().text)
+        assertTrue(decoder.forget("项目"))
+        assertEquals("向目", decoder.decode("xiangmu", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun transpositionsPseudoSyllableTyposAndSpatialTouchHintsRecoverIntendedWords() {
+        val decoder = PinyinDecoder(
+            setOf("a", "e", "o", "m", "n", "wo", "men", "shen", "me", "ni", "ha", "hao", "ping"),
+        )
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("我", "wo", "wo", 2_000_000),
+                LexRow("鹅", "e", "e", 50_000),
+                LexRow("嗯", "en", "en", 400_000),
+                LexRow("我们", "wo men", "women", 900_000),
+                LexRow("深", "shen", "shen", 500_000),
+                LexRow("什么", "shen me", "shenme", 700_000),
+                LexRow("你", "ni", "ni", 1_800_000),
+                LexRow("哈", "ha", "ha", 200_000),
+                LexRow("平", "ping", "ping", 500_000),
+                LexRow("你好", "ni hao", "nihao", 850_000),
+            ),
+        )
+
+        assertEquals("我们", decoder.decode("woemn", fuzzy = false).candidates.first().text)
+        assertEquals("什么", decoder.decode("shenem", fuzzy = false).candidates.first().text)
+        assertEquals("你好", decoder.decode("nihoa", fuzzy = false).candidates.first().text)
+        assertEquals("你好", decoder.decode("nhiao", fuzzy = false).candidates.first().text)
+        assertEquals(
+            "你好",
+            decoder.decode("nihap", fuzzy = false, touchHints = listOf("", "", "", "", "o")).candidates.first().text,
+        )
+
+        val placed = placeKeys(KeyboardPage.Letters, Language.Chinese, 1000f, 48f, 6f, 10f, 4f)
+        val pKey = placed.keys.first { it.model.id == "l-p" }
+        val nearLeftEdgeOfP = nearbyLetters(placed.keys, pKey.x + 2f, pKey.y + pKey.h / 2f, pKey.model)
+        assertTrue('o' in nearLeftEdgeOfP)
+    }
+
+    @Test
+    fun quickDateTimeAndWeekdayCandidatesFollowLiteralWord() {
+        val decoder = PinyinDecoder(setOf("ri", "qi", "shi", "jian", "xing"))
+        decoder.nowProvider = { LocalDateTime.of(2026, 11, 12, 14, 35, 9) }
+        decoder.lexicon = MemoryLexicon(
+            listOf(
+                LexRow("日期", "ri qi", "riqi", 500_000),
+                LexRow("时间", "shi jian", "shijian", 600_000),
+                LexRow("星期", "xing qi", "xingqi", 450_000),
+            ),
+        )
+
+        val riqi = decoder.decode("riqi", fuzzy = false).candidates.map { it.text }
+        assertEquals("日期", riqi.first())
+        assertTrue("2026-11-12" in riqi.take(4))
+        assertTrue("2026年11月12日" in riqi.take(4))
+
+        val sj = decoder.decode("sj", fuzzy = false).candidates.map { it.text }
+        assertTrue("14:35" in sj.take(3))
+
+        val xq = decoder.decode("xq", fuzzy = false).candidates.map { it.text }
+        assertTrue("星期四" in xq.take(3))
+        assertTrue("周四" in xq.take(3))
+    }
+
+    @Test
+    fun englishContextPrefixBoostForgetAndUriEmailMode() {
+        val latin = LatinDecoder().apply {
+            load(sequenceOf("man" to 900_000, "morning" to 120_000, "good" to 1_000_000, "gmail" to 400_000))
+        }
+        assertEquals("man", latin.suggest("m").first().text)
+        assertEquals("morning", latin.suggest("m", prevWord = "good").first().text)
+
+        latin.learn("mycustomword")
+        assertEquals("mycustomword", latin.suggest("mycustom").first().text)
+        assertTrue(latin.forget("mycustomword"))
+        assertTrue(latin.suggest("mycustom").none { it.text == "mycustomword" })
+
+        // URI / Email mode suppresses auto-space and post-dot auto-capitalization
+        val engine = InputEngine(latin)
+        var state = EngineState(language = Language.English, uriOrEmail = true)
+        for (ch in "john") state = engine.reduce(state, EngineAct.Letter(ch, null, ""), EnterKind.Go).state
+        val dotStep = engine.reduce(state, EngineAct.Direct("."), EnterKind.Go)
+        assertEquals(ShiftState.Off, dotStep.state.shift)
+        assertEquals(listOf("john", "."), dotStep.cmds.filterIsInstance<Cmd.Commit>().map { it.text })
+
+        state = dotStep.state
+        for (ch in "gm") state = engine.reduce(state, EngineAct.Letter(ch, null, ""), EnterKind.Go).state
+        val picked = engine.reduce(state, EngineAct.Pick(0), EnterKind.Go)
+        assertEquals("gmail", (picked.cmds.first() as Cmd.Commit).text)
+        assertFalse(picked.state.autoSpace)
+    }
+
+    @Test
+    fun smartAlternatingQuotesPairedBracketsAndBackspaceAcceleration() {
+        assertEquals("“", resolveSmartCommit("", "“", composing = false).text)
+        assertEquals("”", resolveSmartCommit("他说“你好", "“", composing = false).text)
+        assertEquals("“", resolveSmartCommit("他说“你好”，又说", "“", composing = false).text)
+        assertEquals("’", resolveSmartCommit("‘单引号", "‘", composing = false).text)
+
+        val paired = resolveSmartCommit("", "《》", composing = false)
+        assertEquals("《》", paired.text)
+        assertEquals(1, paired.cursorOffsetBack)
+
+        val decimal = resolveSmartCommit("3。", "14", composing = false)
+        assertEquals(1, decimal.deleteBefore)
+        assertEquals(".14", decimal.text)
+
+        val gesture = KeyGesture(slopPx = 16f, caseSlopPx = 24f, swipePx = 36f)
+        val bksp = KeyModel("backspace", KeyKind.Backspace, "")
+        gesture.down(bksp, 50f, 50f, 0L)
+        var now = 350L
+        var sawWordDelete = false
+        repeat(45) {
+            val frame = gesture.alarm(now)
+            if (frame.actions.any { it == EngineAct.BackspaceWord }) sawWordDelete = true
+            now += 85L
+        }
+        assertTrue(sawWordDelete)
+    }
+
+    @Test
+    fun realBundledSyllablesAndEnglishLexiconDecodeAccurately() {
+        val dictDir = sequenceOf(
+            File("src/main/assets/dict"),
+            File("app/src/main/assets/dict"),
+        ).firstOrNull { it.isDirectory } ?: return
+
+        val realSyllables = File(dictDir, "syllables.txt")
+            .readLines()
+            .filter { it.isNotBlank() }
+            .toSet()
+        assertTrue(realSyllables.size >= 400)
+
+        val latin = LatinDecoder()
+        GZIPInputStream(File(dictDir, "english.tsv.gz").inputStream()).bufferedReader().use { reader ->
+            latin.load(
+                reader.lineSequence().mapNotNull { line ->
+                    val bits = line.split('\t')
+                    val freq = bits.getOrNull(1)?.toIntOrNull() ?: return@mapNotNull null
+                    bits[0] to freq
+                },
+            )
+        }
+        assertEquals("morning", latin.suggest("morn", prevWord = "good").first().text)
+        assertEquals("forward", latin.suggest("forw", prevWord = "looking").first().text)
+        assertEquals("receive", latin.suggest("recieve").first().text)
+        assertTrue(latin.suggest("hel").first().text in setOf("help", "hello"))
+        assertEquals("this", latin.suggest("thi").first().text)
+        assertEquals("because", latin.suggest("bec").first().text)
+        assertEquals("separate", latin.suggest("seperate").first().text)
+        assertEquals("definitely", latin.suggest("definately").first().text)
+        assertEquals("grammar", latin.suggest("grammer").first().text)
+        assertEquals("app", latin.suggest("app").first().text)
     }
 }
 

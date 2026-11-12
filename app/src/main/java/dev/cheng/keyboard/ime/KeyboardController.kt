@@ -1,10 +1,13 @@
 package dev.cheng.keyboard.ime
 
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.database.sqlite.SQLiteDatabase
+import android.os.Build
+import android.os.SystemClock
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import dev.cheng.keyboard.ai.ASK_PROMPT
@@ -28,7 +31,7 @@ import dev.cheng.keyboard.engine.InputEngine
 import dev.cheng.keyboard.engine.LatinDecoder
 import dev.cheng.keyboard.engine.PinyinDecoder
 import dev.cheng.keyboard.engine.applyAskDraft
-import dev.cheng.keyboard.engine.shouldAutoCap
+import dev.cheng.keyboard.engine.extractTrailingCjk
 import dev.cheng.keyboard.engine.stripWrapped
 import dev.cheng.keyboard.ime.gesture.HapticKind
 import dev.cheng.keyboard.ime.gesture.KeyGesture
@@ -45,11 +48,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
+import java.util.zip.GZIPInputStream
 
 class KeyboardController(
     private val context: Context,
@@ -72,6 +77,9 @@ class KeyboardController(
     private val gesture = KeyGesture(slopPx = 16f, caseSlopPx = 24f, swipePx = 36f)
     private val snapshot = androidx.compose.runtime.mutableStateOf(UiState())
     private var engineState = EngineState()
+    private var preferredLanguage = Language.Chinese
+    private var activeInfo: EditorInfo? = null
+    private var sawComposingSpan = false
     private var enter = dev.cheng.keyboard.model.EnterKind.Newline
     private var fuzzy = false
     private var askModel = MODEL_FLASH
@@ -79,13 +87,18 @@ class KeyboardController(
     @Volatile
     private var token = 0
     private var alarmJob: Job? = null
+    private var clipExpireJob: Job? = null
+    private var noteClearJob: Job? = null
     private var source: FieldSource? = null
     private var candidateRaw = ""
     private var aiToken = 0
+    private val clipboard = context.getSystemService(ClipboardManager::class.java)
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { onClipboardChanged() }
 
     val state: UiState get() = snapshot.value
 
     init {
+        runCatching { clipboard?.addPrimaryClipChangedListener(clipListener) }
         scope.launch {
             context.settingsStore.data.collectLatest { prefs ->
                 fuzzy = prefs[PrefKeys.fuzzy] == true
@@ -123,41 +136,123 @@ class KeyboardController(
 
     fun close() {
         alarmJob?.cancel()
+        clipExpireJob?.cancel()
+        noteClearJob?.cancel()
+        runCatching { clipboard?.removePrimaryClipChangedListener(clipListener) }
         client.cancel()
         db.close()
     }
 
     fun startInput(info: EditorInfo, restarting: Boolean) {
-        val password = isPasswordField(info)
-        val noLearn = info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING != 0
+        activeInfo = info
+        val traits = fieldTraitsOf(info)
         enter = enterKindOf(info)
         if (!restarting) {
-            val shift = if (
-                engineState.language == Language.English &&
-                !password &&
-                shouldAutoCap(connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty())
-            ) {
-                ShiftState.Once
+            val targetLanguage = if (traits.uriOrEmail) Language.English else preferredLanguage
+            val targetPage = if (traits.numeric) KeyboardPage.Number else KeyboardPage.Letters
+            val before = if (traits.password) "" else connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+            val shift = if (targetLanguage == Language.English) {
+                resolveAutoShift(info, before)
             } else {
                 ShiftState.Off
+            }
+            engineState = engineState.copy(
+                language = targetLanguage,
+                page = targetPage,
+                raw = "",
+                preedit = "",
+                candidates = emptyList(),
+                associating = false,
+                password = traits.password,
+                noLearn = traits.noLearn,
+                uriOrEmail = traits.uriOrEmail,
+                shift = shift,
+                partialText = "",
+                partialSyllables = "",
+                autoSpace = false,
+                lastEnglishWord = null,
+                undoAutocorrect = null,
+                verbatimFirst = false,
+                lastChineseContext = if (traits.password) "" else extractTrailingCjk(before),
+                touchHints = emptyList(),
+            )
+            bridge.reset()
+            sawComposingSpan = false
+            candidateRaw = ""
+        } else {
+            engineState = engineState.copy(
+                password = traits.password,
+                noLearn = traits.noLearn,
+                uriOrEmail = traits.uriOrEmail,
+            )
+        }
+        gesture.cancel()
+        update { it.copy(pressedId = null, popup = null, expanded = false, enter = enter) }
+        publish()
+    }
+
+    fun onUpdateSelection(
+        oldSelStart: Int,
+        oldSelEnd: Int,
+        newSelStart: Int,
+        newSelEnd: Int,
+        candidatesStart: Int,
+        candidatesEnd: Int,
+    ) {
+        if (state.overlay == Overlay.Ask || state.overlay == Overlay.NeedKey) return
+        if (candidatesStart >= 0 && candidatesEnd > candidatesStart) {
+            sawComposingSpan = true
+            return
+        }
+        val selectionMoved = newSelStart != oldSelStart || newSelEnd != oldSelEnd
+        if (engineState.raw.isNotEmpty() && sawComposingSpan && candidatesStart < 0 && candidatesEnd < 0 && selectionMoved) {
+            token++
+            sawComposingSpan = false
+            candidateRaw = ""
+            bridge.reset()
+            val before = if (engineState.password) "" else connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+            val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps) {
+                activeInfo?.let { resolveAutoShift(it, before) } ?: ShiftState.Off
+            } else {
+                engineState.shift
             }
             engineState = engineState.copy(
                 raw = "",
                 preedit = "",
                 candidates = emptyList(),
                 associating = false,
-                password = password,
-                noLearn = noLearn,
-                shift = shift,
+                partialText = "",
+                partialSyllables = "",
+                autoSpace = false,
+                undoAutocorrect = null,
+                verbatimFirst = false,
+                shift = nextShift,
+                lastChineseContext = if (engineState.password) "" else extractTrailingCjk(before),
+                touchHints = emptyList(),
             )
-            bridge.reset()
-            candidateRaw = ""
-        } else {
-            engineState = engineState.copy(password = password, noLearn = noLearn)
+            publish()
+            return
         }
-        gesture.cancel()
-        update { it.copy(pressedId = null, popup = null, expanded = false, enter = enter) }
-        publish()
+        if (engineState.raw.isEmpty() && selectionMoved && !engineState.password) {
+            val before = connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+            val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps) {
+                activeInfo?.let { resolveAutoShift(it, before) } ?: engineState.shift
+            } else {
+                engineState.shift
+            }
+            val nextZhCtx = extractTrailingCjk(before)
+            if (nextShift != engineState.shift || nextZhCtx != engineState.lastChineseContext || engineState.undoAutocorrect != null) {
+                engineState = engineState.copy(
+                    shift = nextShift,
+                    lastChineseContext = nextZhCtx,
+                    autoSpace = false,
+                    undoAutocorrect = null,
+                    associating = false,
+                    candidates = if (engineState.associating) emptyList() else engineState.candidates,
+                )
+                publish()
+            }
+        }
     }
 
     fun onHidden() {
@@ -185,8 +280,8 @@ class KeyboardController(
         }
     }
 
-    fun onDown(key: KeyModel, x: Float, y: Float, time: Long) {
-        val frame = gesture.down(key, x, y, time)
+    fun onDown(key: KeyModel, x: Float, y: Float, time: Long, touchNeighbors: String = "") {
+        val frame = gesture.down(key, x, y, time, touchNeighbors)
         applyFrame(frame)
         schedule(time)
     }
@@ -208,20 +303,71 @@ class KeyboardController(
 
     fun pick(index: Int) = dispatch(EngineAct.Pick(index))
 
+    fun forgetCandidate(index: Int) {
+        val item = state.engine.candidates.getOrNull(index) ?: return
+        val text = item.text
+        var removed = false
+        if (engineState.language == Language.English || text.all { it in 'a'..'z' || it in 'A'..'Z' || it == '\'' }) {
+            val word = text.lowercase()
+            removed = latin.forget(word)
+            scope.launch(db) { users.deleteEn(word) }
+            if (engineState.language == Language.English && engineState.raw.isNotEmpty()) {
+                engineState = engineState.copy(
+                    candidates = latin.suggest(
+                        engineState.raw.lowercase(),
+                        verbatimFirst = engineState.verbatimFirst,
+                        prevWord = engineState.lastEnglishWord,
+                        touchHints = engineState.touchHints,
+                    ),
+                )
+                publish()
+            }
+        } else {
+            removed = pinyin.forget(text)
+            scope.launch(db) { users.deleteZh(text) }
+            if (engineState.raw.isNotEmpty()) {
+                candidateRaw = ""
+                requestPinyin(engineState.raw)
+            } else if (engineState.associating) {
+                engineState = engineState.copy(candidates = engineState.candidates.filter { it.text != text })
+                publish()
+            }
+        }
+        if (removed && state.haptic) haptic(HapticKind.Delete)
+        if (removed) flashNote("已移除「$text」")
+    }
+
     fun toggleExpanded() = update { it.copy(expanded = !it.expanded) }
 
     fun toggleMenu() {
         if (state.menu) {
             update { it.copy(menu = false, clip = null) }
         } else {
-            update { it.copy(menu = true, clip = readClip(), overlay = Overlay.None) }
+            val current = readClip()
+            val merged = if (current != null) {
+                (listOf(current) + state.recentClips.filter { it != current }).take(6)
+            } else {
+                state.recentClips
+            }
+            update { it.copy(menu = true, clip = current, recentClips = merged, overlay = Overlay.None) }
         }
     }
 
     fun paste() {
         val text = state.clip ?: return
+        pasteText(text)
+    }
+
+    fun pasteText(text: String) {
+        if (text.isEmpty()) return
+        clipExpireJob?.cancel()
         dispatch(EngineAct.Direct(text))
-        update { it.copy(menu = false) }
+        update { it.copy(menu = false, freshClip = null) }
+    }
+
+    fun dismissFreshClip() {
+        clipExpireJob?.cancel()
+        update { it.copy(freshClip = null) }
     }
 
     fun pasteIntoDraft() {
@@ -271,6 +417,7 @@ class KeyboardController(
     fun dismiss() = hide()
 
     fun setLanguage(language: Language) {
+        preferredLanguage = language
         if (engineState.language != language) dispatch(EngineAct.Language)
     }
 
@@ -384,10 +531,22 @@ class KeyboardController(
             attached.isNullOrBlank() -> draft
             else -> "$draft\n\n当前文字：\n$attached"
         }
-        update { it.copy(busy = true, askAnswer = "", note = null) }
-        launchAi(key, askModel, ASK_PROMPT, user, 0.7, 4096, state.askThinking) { text ->
-            update { it.copy(busy = false, askAnswer = text, note = null) }
-        }
+        update { it.copy(busy = true, askAnswer = "", askReason = "", note = null) }
+        launchAi(
+            key = key,
+            model = askModel,
+            system = ASK_PROMPT,
+            user = user,
+            temperature = 0.7,
+            maxTokens = 4096,
+            thinking = state.askThinking,
+            onStream = { reason, answer ->
+                update { it.copy(askReason = reason, askAnswer = stripWrapped(answer)) }
+            },
+            onOk = { text ->
+                update { it.copy(busy = false, askAnswer = text, note = null) }
+            },
+        )
     }
 
     fun insertResult() {
@@ -468,9 +627,21 @@ class KeyboardController(
                 expanded = false,
             )
         }
-        launchAi(key, MODEL_FLASH, prompt, field.text, temperature, 2048, thinking = false) { text ->
-            update { it.copy(busy = false, resultText = text, note = null) }
-        }
+        launchAi(
+            key = key,
+            model = MODEL_FLASH,
+            system = prompt,
+            user = field.text,
+            temperature = temperature,
+            maxTokens = 2048,
+            thinking = false,
+            onStream = { _, content ->
+                if (content.isNotBlank()) update { it.copy(resultText = stripWrapped(content)) }
+            },
+            onOk = { text ->
+                update { it.copy(busy = false, resultText = text, note = null) }
+            },
+        )
     }
 
     private fun launchAi(
@@ -481,11 +652,21 @@ class KeyboardController(
         temperature: Double,
         maxTokens: Int,
         thinking: Boolean,
+        onStream: (String, String) -> Unit = { _, _ -> },
         onOk: (String) -> Unit,
     ) {
         val ticket = ++aiToken
         scope.launch(Dispatchers.IO) {
-            val result = client.complete(key, model, system, user, temperature, maxTokens, thinking)
+            var lastEmit = 0L
+            val result = client.stream(key, model, system, user, temperature, maxTokens, thinking) { reason, content ->
+                val now = SystemClock.uptimeMillis()
+                if (now - lastEmit >= 35L) {
+                    lastEmit = now
+                    scope.launch(Dispatchers.Main) {
+                        if (ticket == aiToken) onStream(reason, content)
+                    }
+                }
+            }
             withContext(Dispatchers.Main) {
                 if (ticket != aiToken) return@withContext
                 when (result) {
@@ -530,24 +711,45 @@ class KeyboardController(
         if (needsChineseNow(act)) refreshChinese()
         val step = engine.reduce(engineState, act, enter)
         engineState = step.state
+        if (act == EngineAct.Language && !engineState.uriOrEmail) {
+            preferredLanguage = engineState.language
+        }
         val asking = state.overlay == Overlay.Ask
         if (!asking) {
             step.cmds.filterIsInstance<Cmd.LearnZh>().forEach { cmd ->
                 val letters = cmd.syllables.replace("'", "").replace(" ", "")
-                val freq = pinyin.learn(cmd.text, cmd.syllables)
+                val freq = pinyin.learn(cmd.text, cmd.syllables, cmd.prevContext)
+                val bigrams = pinyin.bigramEntriesFor(cmd.prevContext, cmd.text)
                 if (freq > 0) {
                     val row = dev.cheng.keyboard.model.LexRow(cmd.text, cmd.syllables.replace("'", " "), letters, freq)
-                    scope.launch(db) { users.saveZh(row) }
+                    scope.launch(db) {
+                        users.saveZh(row)
+                        for ((prev, next, count) in bigrams) users.saveZhBigram(prev, next, count)
+                    }
+                }
+            }
+            step.cmds.filterIsInstance<Cmd.LearnZhBigram>().forEach { cmd ->
+                val updated = pinyin.learnBigram(cmd.prev, cmd.next)
+                if (updated.isNotEmpty()) {
+                    scope.launch(db) {
+                        for ((prev, next, count) in updated) users.saveZhBigram(prev, next, count)
+                    }
                 }
             }
             step.cmds.filterIsInstance<Cmd.LearnEn>().forEach { cmd ->
                 latin.learn(cmd.word, cmd.prevWord)
-                if (cmd.word.length >= 2) {
+                val prev = cmd.prevWord?.trim()?.lowercase().orEmpty()
+                val bCount = if (prev.isNotEmpty()) latin.bigramCount(prev, cmd.word) else 0
+                if (cmd.word.length >= 2 || bCount > 0) {
                     val freq = latin.userWords().firstOrNull { it.first == cmd.word }?.second ?: 20_000
-                    scope.launch(db) { users.saveEn(cmd.word, freq) }
+                    scope.launch(db) {
+                        if (cmd.word.length >= 2) users.saveEn(cmd.word, freq)
+                        if (bCount > 0) users.saveEnBigram(prev, cmd.word.lowercase(), bCount)
+                    }
                 }
             }
             bridge.apply(step.cmds)
+            if (engineState.raw.isEmpty()) sawComposingSpan = false
         } else {
             val draft = applyAskDraft(state.askDraft, step.cmds)
             update { it.copy(askDraft = draft) }
@@ -613,7 +815,9 @@ class KeyboardController(
         if (candidateRaw == engineState.raw && engineState.candidates.isNotEmpty()) return
         val raw = engineState.raw
         val useFuzzy = fuzzy
-        val decoded = runBlocking(db) { pinyin.decode(raw, useFuzzy) }
+        val ctx = engineState.lastChineseContext + engineState.partialText
+        val hints = engineState.touchHints
+        val decoded = runBlocking(db) { pinyin.decode(raw, useFuzzy, ctx, hints) }
         if (engineState.raw != raw) return
         candidateRaw = raw
         engineState = engineState.copy(preedit = decoded.preedit, candidates = decoded.candidates)
@@ -622,9 +826,11 @@ class KeyboardController(
     private fun requestPinyin(raw: String) {
         val current = ++token
         val useFuzzy = fuzzy
+        val ctx = engineState.lastChineseContext + engineState.partialText
+        val hints = engineState.touchHints
         scope.launch(db) {
             if (current != token) return@launch
-            val decoded = pinyin.decode(raw, useFuzzy)
+            val decoded = pinyin.decode(raw, useFuzzy, ctx, hints)
             if (current != token) return@launch
             withContext(Dispatchers.Main) {
                 if (current != token || engineState.raw != raw || engineState.language != Language.Chinese) return@withContext
@@ -659,9 +865,12 @@ class KeyboardController(
             fresh.lexicon = SqliteLexicon(sqlite)
         }
         fresh.loadUser(users.loadZh())
+        fresh.loadUserBigrams(users.loadZhBigrams())
         pinyin = fresh
         runCatching {
-            context.assets.open("dict/english.tsv").bufferedReader().use { reader ->
+            val stream = runCatching { context.assets.open("dict/english.tsv") }
+                .getOrElse { GZIPInputStream(context.assets.open("dict/english.tsv.gz")) }
+            stream.bufferedReader().use { reader ->
                 latin.load(reader.lineSequence().mapNotNull { line ->
                     val bits = line.split('\t')
                     val freq = bits.getOrNull(1)?.toIntOrNull() ?: return@mapNotNull null
@@ -670,12 +879,37 @@ class KeyboardController(
             }
         }
         latin.loadUser(users.loadEn())
+        latin.loadUserBigrams(users.loadEnBigrams())
     }
 
-    private fun readClip(): String? {
-        val clipboard = context.getSystemService(ClipboardManager::class.java) ?: return null
-        val clip = clipboard.primaryClip ?: return null
+    private fun onClipboardChanged() {
+        val text = readClip(skipSensitive = true) ?: return
+        clipExpireJob?.cancel()
+        val merged = (listOf(text) + state.recentClips.filter { it != text }).take(6)
+        update { it.copy(freshClip = text, recentClips = merged) }
+        clipExpireJob = scope.launch {
+            delay(45_000)
+            update { it.copy(freshClip = null) }
+        }
+    }
+
+    private fun flashNote(message: String) {
+        noteClearJob?.cancel()
+        update { it.copy(note = message) }
+        noteClearJob = scope.launch {
+            delay(1_800)
+            update { if (it.note == message) it.copy(note = null) else it }
+        }
+    }
+
+    private fun readClip(skipSensitive: Boolean = false): String? {
+        val manager = clipboard ?: return null
+        val clip = manager.primaryClip ?: return null
         if (clip.itemCount == 0) return null
+        if (skipSensitive && Build.VERSION.SDK_INT >= 33) {
+            val sensitive = clip.description?.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE, false) == true
+            if (sensitive) return null
+        }
         return clip.getItemAt(0).coerceToText(context)?.toString()?.takeIf { it.isNotBlank() }
     }
 

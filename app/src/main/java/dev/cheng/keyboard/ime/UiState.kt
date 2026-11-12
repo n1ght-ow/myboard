@@ -25,6 +25,8 @@ data class UiState(
     val popup: PopupPreview? = null,
     val menu: Boolean = false,
     val clip: String? = null,
+    val freshClip: String? = null,
+    val recentClips: List<String> = emptyList(),
     val expanded: Boolean = false,
     val overlay: Overlay = Overlay.None,
     val askDraft: String = "",

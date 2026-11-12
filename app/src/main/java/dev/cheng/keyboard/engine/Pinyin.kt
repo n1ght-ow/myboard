@@ -3,7 +3,11 @@ package dev.cheng.keyboard.engine
 import dev.cheng.keyboard.model.Candidate
 import dev.cheng.keyboard.model.LexRow
 import dev.cheng.keyboard.model.Lexicon
+import java.time.DayOfWeek
+import java.time.LocalDateTime
 import java.util.ArrayDeque
+import java.util.Locale
+import kotlin.math.ln
 
 data class Seg(val parts: List<String>, val partial: Boolean)
 
@@ -321,9 +325,17 @@ class PinyinDecoder(syllables: Set<String>) {
     @Volatile
     var latin: LatinDecoder? = null
 
-    private val user = mutableListOf<LexRow>()
+    var nowProvider: () -> LocalDateTime = { LocalDateTime.now() }
 
-    fun decode(raw: String, fuzzy: Boolean): Decode {
+    private val user = mutableListOf<LexRow>()
+    private val userBigrams = HashMap<String, MutableMap<String, Int>>()
+
+    fun decode(
+        raw: String,
+        fuzzy: Boolean,
+        context: String = "",
+        touchHints: List<String> = emptyList(),
+    ): Decode {
         val rawLettersOnly = raw.filter { it in 'a'..'z' || it in 'A'..'Z' }
         val text = raw.lowercase().filter { it in 'a'..'z' || it == '\'' }
         if (text.isEmpty()) return Decode("", emptyList())
@@ -394,9 +406,16 @@ class PinyinDecoder(syllables: Set<String>) {
 
         val hadDirectFullOrAbbrevChinese = body.isNotEmpty()
 
-        // Typo recovery when no direct syllable or whole-word abbreviation matched
-        if ((body.isEmpty() || (pinyin.isEmpty() && wholeAbbrev.isEmpty())) && letters.length in 2..18) {
-            val typoItems = book.typos(letters)
+        // Typo & transposition recovery when input is not a clean multi-letter syllable string or multi-initial abbreviation
+        val shouldTryTypos = when {
+            letters.length !in 2..18 -> false
+            body.isEmpty() -> true
+            pinyin.isEmpty() && wholeAbbrev.isEmpty() -> true
+            !solid && letters.length >= 3 && !book.hasMultiAbbrevInitials(letters, wholeAbbrev) -> true
+            else -> false
+        }
+        if (shouldTryTypos) {
+            val typoItems = book.typos(letters, touchHints)
             if (typoItems.isNotEmpty()) {
                 body = if (body.isEmpty()) typoItems else book.rank(body + typoItems)
             }
@@ -415,6 +434,11 @@ class PinyinDecoder(syllables: Set<String>) {
             body = book.rank(prefixCandidates)
         }
 
+        val cjkContext = extractTrailingCjk(context, maxChars = 4)
+        if (cjkContext.isNotEmpty() && body.size > 1) {
+            body = book.applyContext(body, cjkContext)
+        }
+
         val single = primary != null && !primary.partial && primary.parts.size == 1 && body.isNotEmpty()
         val anchorSeg = primary ?: fallbackPrefixSeg
         val chars = if (single) {
@@ -427,6 +451,16 @@ class PinyinDecoder(syllables: Set<String>) {
         }
 
         val items = (if (single) body.take(200) else (body.take(40) + chars).take(48)).toMutableList()
+
+        if ('\'' !in text) {
+            val quick = quickExpressions(letters)
+            if (quick.isNotEmpty()) {
+                val insertAt = minOf(1, items.size)
+                val deduped = quick.filter { expr -> items.none { it.text == expr } }
+                    .map { expr -> Scored(expr, "", 500_000, 80.0, items.firstOrNull()?.preedit ?: letters, false, letters.length) }
+                items.addAll(insertAt, deduped)
+            }
+        }
 
         // Inline English blending when LatinDecoder is attached (e.g., "wifi", "hello", "kotlin", "app")
         val en = latin
@@ -474,6 +508,19 @@ class PinyinDecoder(syllables: Set<String>) {
         val seen = LinkedHashSet<String>()
         val out = ArrayList<Candidate>(24)
 
+        val ctx = extractTrailingCjk(text, maxChars = 4)
+        for (len in minOf(4, ctx.length) downTo 1) {
+            val suffix = ctx.takeLast(len)
+            userBigrams[suffix]?.entries
+                ?.sortedByDescending { it.value }
+                ?.take(6)
+                ?.forEach { (nextText, count) ->
+                    if (nextText.isNotEmpty() && seen.add(nextText)) {
+                        out += Candidate(nextText, "", 1_000_000 + count * 1000)
+                    }
+                }
+        }
+
         user.asSequence()
             .filter { it.text.startsWith(text) && it.text.length > text.length }
             .sortedByDescending { it.freq }
@@ -500,7 +547,7 @@ class PinyinDecoder(syllables: Set<String>) {
         return out
     }
 
-    fun learn(text: String, syllables: String): Int {
+    fun learn(text: String, syllables: String, prevContext: String = ""): Int {
         val spelling = syllables.trim().replace("'", " ")
         val letters = spelling.replace(" ", "")
         if (text.isBlank() || letters.isBlank()) return 0
@@ -512,7 +559,58 @@ class PinyinDecoder(syllables: Set<String>) {
         }
         user.removeAll { it.text == text && it.letters == letters }
         user.add(0, LexRow(text, spelling, letters, nextFreq))
+        val ctx = extractTrailingCjk(prevContext, maxChars = 4)
+        if (ctx.isNotEmpty()) learnBigram(ctx, text)
         return nextFreq
+    }
+
+    fun learnBigram(prevContext: String, text: String): List<Triple<String, String, Int>> {
+        val ctx = extractTrailingCjk(prevContext, maxChars = 4)
+        if (ctx.isEmpty() || text.isBlank() || extractTrailingCjk(text, maxChars = 8) != text) return emptyList()
+        val keys = buildSet {
+            add(ctx)
+            if (ctx.length > 2) add(ctx.takeLast(2))
+        }
+        val updated = ArrayList<Triple<String, String, Int>>(keys.size)
+        for (k in keys) {
+            val bucket = userBigrams.getOrPut(k) { HashMap() }
+            val nextCount = (bucket[text] ?: 0) + 1
+            bucket[text] = nextCount
+            updated += Triple(k, text, nextCount)
+        }
+        return updated
+    }
+
+    fun bigramEntriesFor(prevContext: String, text: String): List<Triple<String, String, Int>> {
+        val ctx = extractTrailingCjk(prevContext, maxChars = 4)
+        if (ctx.isEmpty()) return emptyList()
+        val keys = buildSet {
+            add(ctx)
+            if (ctx.length > 2) add(ctx.takeLast(2))
+        }
+        return keys.mapNotNull { k ->
+            val count = userBigrams[k]?.get(text) ?: return@mapNotNull null
+            Triple(k, text, count)
+        }
+    }
+
+    fun loadUserBigrams(entries: List<Triple<String, String, Int>>) {
+        userBigrams.clear()
+        for ((prev, next, count) in entries) {
+            if (prev.isBlank() || next.isBlank() || count <= 0) continue
+            val bucket = userBigrams.getOrPut(prev) { HashMap() }
+            bucket[next] = maxOf(bucket[next] ?: 0, count)
+        }
+    }
+
+    fun forget(text: String): Boolean {
+        if (text.isBlank()) return false
+        val removedWord = user.removeAll { it.text == text }
+        var removedBigram = userBigrams.remove(text) != null
+        for (bucket in userBigrams.values) {
+            if (bucket.remove(text) != null) removedBigram = true
+        }
+        return removedWord || removedBigram
     }
 
     fun loadUser(rows: List<LexRow>) {
@@ -522,6 +620,41 @@ class PinyinDecoder(syllables: Set<String>) {
 
     fun clearUser() {
         user.clear()
+        userBigrams.clear()
+    }
+
+    private fun quickExpressions(letters: String): List<String> {
+        return when (letters) {
+            "rq", "riqi" -> {
+                val now = nowProvider()
+                listOf(
+                    String.format(Locale.ROOT, "%04d-%02d-%02d", now.year, now.monthValue, now.dayOfMonth),
+                    "${now.year}年${now.monthValue}月${now.dayOfMonth}日",
+                    String.format(Locale.ROOT, "%04d/%02d/%02d", now.year, now.monthValue, now.dayOfMonth),
+                )
+            }
+            "sj", "shijian" -> {
+                val now = nowProvider()
+                listOf(
+                    String.format(Locale.ROOT, "%02d:%02d", now.hour, now.minute),
+                    String.format(Locale.ROOT, "%02d:%02d:%02d", now.hour, now.minute, now.second),
+                )
+            }
+            "xq", "xingqi" -> {
+                val day = when (nowProvider().dayOfWeek) {
+                    DayOfWeek.MONDAY -> "一"
+                    DayOfWeek.TUESDAY -> "二"
+                    DayOfWeek.WEDNESDAY -> "三"
+                    DayOfWeek.THURSDAY -> "四"
+                    DayOfWeek.FRIDAY -> "五"
+                    DayOfWeek.SATURDAY -> "六"
+                    DayOfWeek.SUNDAY -> "日"
+                }
+                val zhou = if (day == "日") "天" else day
+                listOf("星期$day", "周$zhou")
+            }
+            else -> emptyList()
+        }
     }
 
     private data class Scored(
@@ -770,18 +903,103 @@ class PinyinDecoder(syllables: Set<String>) {
             return rank(items)
         }
 
-        fun typos(letters: String): List<Scored> {
+        fun hasMultiAbbrevInitials(letters: String, wholeAbbrev: List<Scored>): Boolean {
+            if (wholeAbbrev.isEmpty()) return false
+            return tokenPaths(letters).any { path ->
+                path.count { part -> part.length == 1 && part[0] !in "aeiouv" } >= 2
+            }
+        }
+
+        fun applyContext(items: List<Scored>, cjkContext: String): List<Scored> {
+            val maxConsumed = items.maxOfOrNull { it.consumed } ?: return items
+            val suffixLengths = (1..minOf(3, cjkContext.length)).toList()
+            val checkWindow = items.take(24)
+            val compoundQueries = ArrayList<String>(checkWindow.size * suffixLengths.size)
+            for (cand in checkWindow) {
+                if (cand.consumed < maxConsumed || cand.text.length !in 1..4) continue
+                for (len in suffixLengths) {
+                    compoundQueries += cjkContext.takeLast(len) + cand.text
+                }
+            }
+            val compoundFreqs = if (compoundQueries.isEmpty()) emptyMap() else lexicon.phraseFreqs(compoundQueries)
+            val reduplicatedAdverb = cjkContext.length >= 2 && cjkContext.last() == cjkContext[cjkContext.length - 2]
+
+            val rescored = items.mapIndexed { idx, item ->
+                if (idx >= 24 || item.consumed < maxConsumed) return@mapIndexed item
+                var bonus = 0.0
+                for (len in minOf(4, cjkContext.length) downTo 1) {
+                    val count = userBigrams[cjkContext.takeLast(len)]?.get(item.text) ?: 0
+                    if (count > 0) {
+                        val uBonus = (if (len >= 2) 48.0 else 28.0) + 12.0 * ln((count + 1).toDouble())
+                        if (uBonus > bonus) bonus = uBonus
+                    }
+                }
+                if (item.text.length in 1..4) {
+                    for (len in suffixLengths) {
+                        val freq = compoundFreqs[cjkContext.takeLast(len) + item.text] ?: 0
+                        if (freq >= 100) {
+                            val cBonus = if (len >= 2) {
+                                3.2 * ln(freq.toDouble())
+                            } else if (freq >= 500) {
+                                minOf(16.0, 1.35 * ln(freq.toDouble()))
+                            } else {
+                                0.0
+                            }
+                            if (cBonus > bonus) bonus = cBonus
+                        }
+                    }
+                }
+                if (reduplicatedAdverb && item.text == "地" && item.syllables == "de") {
+                    bonus = maxOf(bonus, 18.0)
+                }
+                if (bonus > 0.0) item.copy(score = item.score + bonus) else item
+            }
+            return rank(rescored)
+        }
+
+        fun typos(letters: String, touchHints: List<String> = emptyList()): List<Scored> {
             val items = ArrayList<Scored>()
-            for ((seg, cost) in correctedSegments(letters)) {
+            for ((seg, cost, spatialHit) in correctedSegments(letters, touchHints)) {
+                val directPenalty = when {
+                    spatialHit && cost == 1 -> 12.0
+                    cost == 1 -> 18.0
+                    else -> 36.0 * cost
+                }
                 val directRows = spell(seg.parts, boostUser = true).take(2)
                 if (directRows.isNotEmpty()) {
                     for (row in directRows) {
-                        items += scored(row, wordScore(row.text, row.freq) - 42.0 * cost, letters, true, letters.length)
+                        items += scored(row, wordScore(row.text, row.freq) - directPenalty, letters, true, letters.length)
                     }
                 } else if (seg.parts.size >= 2) {
                     for (piece in cover(seg.parts).take(1)) {
                         if (piece.text.isNotEmpty()) {
-                            items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 44.0 * cost, letters, true, letters.length)
+                            items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 40.0 * cost, letters, true, letters.length)
+                        }
+                    }
+                }
+            }
+            // Cross-syllable adjacent transposition (e.g. "nhiao" -> "nihao", "wmoen" -> "women", "zohngguo" -> "zhongguo")
+            if (letters.length in 3..14) {
+                for (idx in 0 until letters.length - 1) {
+                    if (letters[idx] == letters[idx + 1]) continue
+                    val chars = letters.toCharArray()
+                    val tmp = chars[idx]
+                    chars[idx] = chars[idx + 1]
+                    chars[idx + 1] = tmp
+                    val swapped = String(chars)
+                    val seg = segmentChunk(swapped, trie, allowPartial = false)
+                        .firstOrNull { !it.partial && it.parts.size >= 2 && it.parts.all { p -> p.length >= 2 } }
+                        ?: continue
+                    val direct = spell(seg.parts, boostUser = true).take(2)
+                    if (direct.isNotEmpty()) {
+                        for (row in direct) {
+                            items += scored(row, wordScore(row.text, row.freq) - 18.0, letters, true, letters.length)
+                        }
+                    } else {
+                        for (piece in cover(seg.parts).take(1)) {
+                            if (piece.text.isNotEmpty()) {
+                                items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 38.0, letters, true, letters.length)
+                            }
                         }
                     }
                 }
@@ -793,7 +1011,7 @@ class PinyinDecoder(syllables: Set<String>) {
                     val tailText = letters.takeLast(tailLen)
                     val tailChars = charsOf(tailText)
                     if (tailChars.isEmpty()) continue
-                    for ((seg, cost) in correctedSegments(headText).filter { it.second == 1 }.take(2)) {
+                    for ((seg, cost, _) in correctedSegments(headText, touchHints.take(headText.length)).filter { it.second == 1 }.take(2)) {
                         val headPieces = spell(seg.parts, boostUser = true).take(1).map {
                             Piece(it.text, it.syllables, it.freq, wordScore(it.text, it.freq))
                         }.ifEmpty { cover(seg.parts).take(1) }
@@ -1140,7 +1358,7 @@ class PinyinDecoder(syllables: Set<String>) {
 
     private fun wordScore(text: String, freq: Int): Double {
         val count = text.length.coerceAtLeast(1)
-        return count * count * kotlin.math.ln(freq.coerceAtLeast(1).toDouble())
+        return count * count * ln(freq.coerceAtLeast(1).toDouble())
     }
 
     private companion object {
@@ -1163,13 +1381,13 @@ class PinyinDecoder(syllables: Set<String>) {
         )
     }
 
-    private fun correctedSegments(text: String): List<Pair<Seg, Int>> {
+    private fun correctedSegments(text: String, touchHints: List<String> = emptyList()): List<Triple<Seg, Int, Boolean>> {
         val paths = Array(text.length + 1) { ArrayList<Node>(4) }
-        paths[0].add(Node(emptyList(), 0, 0))
+        paths[0].add(Node(emptyList(), 0, 0, false))
         for (start in 0 until text.length) {
             val from = paths[start]
             if (from.isEmpty()) continue
-            for (edge in syllableEdges(text, start)) {
+            for (edge in syllableEdges(text, start, touchHints)) {
                 val dest = paths[edge.end]
                 for (node in from) {
                     val cost = node.cost + edge.cost
@@ -1177,7 +1395,8 @@ class PinyinDecoder(syllables: Set<String>) {
                     dest += Node(
                         node.parts + edge.syllable,
                         cost,
-                        node.score + edge.syllable.length * edge.syllable.length - edge.cost * 5,
+                        node.score + edge.syllable.length * edge.syllable.length - edge.cost * 5 + (if (edge.spatial) 2 else 0),
+                        node.spatial || edge.spatial,
                     )
                 }
                 prune(dest)
@@ -1185,14 +1404,14 @@ class PinyinDecoder(syllables: Set<String>) {
         }
         return paths[text.length]
             .filter { it.cost > 0 && it.parts.isNotEmpty() }
-            .map { Seg(it.parts, partial = false) to it.cost }
+            .map { Triple(Seg(it.parts, partial = false), it.cost, it.spatial) }
             .distinctBy { it.first.parts to it.second }
             .take(8)
     }
 
-    private data class Edge(val syllable: String, val end: Int, val cost: Int)
+    private data class Edge(val syllable: String, val end: Int, val cost: Int, val spatial: Boolean = false)
 
-    private fun syllableEdges(text: String, start: Int): List<Edge> {
+    private fun syllableEdges(text: String, start: Int, touchHints: List<String>): List<Edge> {
         val exact = trie.canonicalEndings(text, start).map { (end, canonical) ->
             Edge(canonical, end, 0)
         }
@@ -1200,21 +1419,22 @@ class PinyinDecoder(syllables: Set<String>) {
         val remain = text.length - start
         for (syllable in syllableList) {
             if (syllable.length < 2 || syllable.length > remain + 1) continue
-            val edge = typoEdge(text, start, syllable) ?: continue
+            val edge = typoEdge(text, start, syllable, touchHints) ?: continue
             typos += edge
         }
-        typos.sortWith(compareBy<Edge> { it.cost }.thenByDescending { it.syllable.length })
+        typos.sortWith(compareBy<Edge> { it.cost }.thenByDescending { it.spatial }.thenByDescending { it.syllable.length })
         return exact + typos.take(6)
     }
 
-    private fun typoEdge(text: String, start: Int, syllable: String): Edge? {
+    private fun typoEdge(text: String, start: Int, syllable: String, touchHints: List<String>): Edge? {
         val remain = text.length - start
         var best: Edge? = null
         for (take in intArrayOf(syllable.length, syllable.length - 1, syllable.length + 1)) {
             if (take < 1 || take > remain) continue
-            val cost = editCost(text.substring(start, start + take), syllable) ?: continue
+            val sub = text.substring(start, start + take)
+            val (cost, spatial) = editCost(sub, syllable, touchHints, start) ?: continue
             if (cost != 1) continue
-            val edge = Edge(syllable, start + take, cost)
+            val edge = Edge(syllable, start + take, cost, spatial)
             if (best == null || take > best.end - start) best = edge
         }
         return best
@@ -1239,29 +1459,36 @@ class PinyinDecoder(syllables: Set<String>) {
         nodes.addAll(kept)
     }
 
-    private data class Node(val parts: List<String>, val cost: Int, val score: Int)
+    private data class Node(val parts: List<String>, val cost: Int, val score: Int, val spatial: Boolean)
 }
 
-private fun editCost(typed: String, target: String): Int? {
-    if (typed == target) return 0
+private fun editCost(
+    typed: String,
+    target: String,
+    touchHints: List<String> = emptyList(),
+    offset: Int = 0,
+): Pair<Int, Boolean>? {
+    if (typed == target) return 0 to false
     val gap = typed.length - target.length
     if (gap > 1 || gap < -1) return null
     if (gap == 0) {
-        var index = -1
+        var diff = -1
         for (i in typed.indices) {
             if (typed[i] == target[i]) continue
-            if (index >= 0) {
-                val swapped = index == i - 1 && typed[i] == target[index] && typed[index] == target[i]
-                if (!swapped) return null
+            if (diff < 0) {
+                diff = i
+            } else if (diff == i - 1 && typed[i] == target[diff] && typed[diff] == target[i]) {
                 for (cursor in i + 1 until typed.length) {
                     if (typed[cursor] != target[cursor]) return null
                 }
-                return 1
+                return 1 to false
+            } else {
+                return null
             }
-            if (!adjacentKey(typed[i], target[i])) return null
-            index = i
         }
-        return if (index >= 0) 1 else null
+        if (diff < 0) return 0 to false
+        val spatialHit = target[diff] in touchHints.getOrNull(offset + diff).orEmpty()
+        return if (spatialHit || adjacentKey(typed[diff], target[diff])) 1 to spatialHit else null
     }
     val longer = if (gap > 0) typed else target
     val shorter = if (gap > 0) target else typed
@@ -1281,8 +1508,8 @@ private fun editCost(typed: String, target: String): Int? {
     }
     if (j != shorter.length) return null
     val leftover = longer.length - i
-    if (!skipped && leftover == 1) return 1
-    if (skipped && leftover == 0) return 1
+    if (!skipped && leftover == 1) return 1 to false
+    if (skipped && leftover == 0) return 1 to false
     return null
 }
 

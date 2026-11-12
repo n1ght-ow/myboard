@@ -24,6 +24,9 @@ data class EngineState(
     val lastEnglishWord: String? = null,
     val undoAutocorrect: Pair<String, Int>? = null,
     val verbatimFirst: Boolean = false,
+    val lastChineseContext: String = "",
+    val touchHints: List<String> = emptyList(),
+    val uriOrEmail: Boolean = false,
 )
 
 sealed interface Cmd {
@@ -35,12 +38,13 @@ sealed interface Cmd {
     data object DeleteWord : Cmd
     data class MoveCursor(val delta: Int) : Cmd
     data class EditorAction(val kind: EnterKind) : Cmd
-    data class LearnZh(val text: String, val syllables: String) : Cmd
+    data class LearnZh(val text: String, val syllables: String, val prevContext: String = "") : Cmd
+    data class LearnZhBigram(val prev: String, val next: String) : Cmd
     data class LearnEn(val word: String, val prevWord: String? = null) : Cmd
 }
 
 sealed interface EngineAct {
-    data class Letter(val ch: Char, val force: Choice?, val symbol: String) : EngineAct
+    data class Letter(val ch: Char, val force: Choice?, val symbol: String, val neighbors: String = "") : EngineAct
     data class Direct(val text: String) : EngineAct
     data object Space : EngineAct
     data object Backspace : EngineAct
@@ -122,6 +126,7 @@ class InputEngine(private val latin: LatinDecoder) {
                         candidates = emptyList(),
                         autoSpace = false,
                         undoAutocorrect = null,
+                        touchHints = state.touchHints + act.neighbors,
                     ),
                     listOf(Cmd.Compose(raw)),
                     pending = Pending.Pinyin,
@@ -133,29 +138,37 @@ class InputEngine(private val latin: LatinDecoder) {
     private fun englishLetter(state: EngineState, base: Char, act: EngineAct.Letter): EngineStep {
         return when (act.force) {
             Choice.Symbol -> commitEnglishSymbolOrPunctuation(state, act.symbol)
-            Choice.Upper -> appendEnglish(state, base.uppercaseChar(), consumeShift = false)
-            Choice.Lower -> appendEnglish(state, base, consumeShift = false)
+            Choice.Upper -> appendEnglish(state, base.uppercaseChar(), consumeShift = false, neighbors = act.neighbors)
+            Choice.Lower -> appendEnglish(state, base, consumeShift = false, neighbors = act.neighbors)
             null -> appendEnglish(
                 state,
                 if (state.shift == ShiftState.Off) base else base.uppercaseChar(),
                 consumeShift = state.shift == ShiftState.Once,
+                neighbors = act.neighbors,
             )
         }
     }
 
-    private fun appendEnglish(state: EngineState, ch: Char, consumeShift: Boolean): EngineStep {
+    private fun appendEnglish(state: EngineState, ch: Char, consumeShift: Boolean, neighbors: String = ""): EngineStep {
         val raw = state.raw + ch
+        val nextHints = state.touchHints + neighbors
         val keepVerbatim = state.verbatimFirst && state.raw.isNotEmpty()
         return EngineStep(
             state.copy(
                 raw = raw,
                 preedit = raw,
-                candidates = latin.suggest(raw.lowercase(), verbatimFirst = keepVerbatim),
+                candidates = latin.suggest(
+                    raw.lowercase(),
+                    verbatimFirst = keepVerbatim,
+                    prevWord = state.lastEnglishWord,
+                    touchHints = nextHints,
+                ),
                 associating = false,
                 shift = if (consumeShift) ShiftState.Off else state.shift,
                 autoSpace = false,
                 undoAutocorrect = null,
                 verbatimFirst = keepVerbatim,
+                touchHints = nextHints,
             ),
             listOf(Cmd.Compose(raw)),
         )
@@ -167,6 +180,7 @@ class InputEngine(private val latin: LatinDecoder) {
             return commitEnglishSymbolOrPunctuation(state, text)
         }
         val pending = takePending(state)
+        val updatedContext = extractTrailingCjk(pending.first.lastChineseContext + text)
         return EngineStep(
             pending.first.copy(
                 associating = false,
@@ -175,12 +189,35 @@ class InputEngine(private val latin: LatinDecoder) {
                 partialSyllables = "",
                 autoSpace = false,
                 undoAutocorrect = null,
+                lastChineseContext = updatedContext,
+                touchHints = emptyList(),
             ),
             pending.second + Cmd.Commit(text),
         )
     }
 
     private fun commitEnglishSymbolOrPunctuation(state: EngineState, text: String): EngineStep {
+        if (state.uriOrEmail) {
+            val cmds = mutableListOf<Cmd>()
+            if (state.raw.isNotEmpty()) cmds += Cmd.Commit(state.raw)
+            cmds += Cmd.Commit(text)
+            val keepCaps = if (state.shift == ShiftState.Caps) ShiftState.Caps else ShiftState.Off
+            return EngineStep(
+                state.copy(
+                    raw = "",
+                    preedit = "",
+                    shift = keepCaps,
+                    associating = false,
+                    candidates = emptyList(),
+                    autoSpace = false,
+                    undoAutocorrect = null,
+                    verbatimFirst = false,
+                    lastEnglishWord = null,
+                    touchHints = emptyList(),
+                ),
+                cmds,
+            )
+        }
         if (state.raw.isEmpty() && state.autoSpace && text in englishAttachPunctuation) {
             val nextShift = shiftAfter(state.shift, text)
             return EngineStep(
@@ -192,6 +229,7 @@ class InputEngine(private val latin: LatinDecoder) {
                     undoAutocorrect = null,
                     verbatimFirst = false,
                     lastEnglishWord = if (text in sentenceEndings) null else state.lastEnglishWord,
+                    touchHints = emptyList(),
                 ),
                 listOf(Cmd.DeleteOne, Cmd.Commit("$text ")),
             )
@@ -207,6 +245,7 @@ class InputEngine(private val latin: LatinDecoder) {
                 undoAutocorrect = null,
                 verbatimFirst = false,
                 lastEnglishWord = if (text in sentenceEndings) null else state.lastEnglishWord,
+                touchHints = emptyList(),
             ),
             pending.second + Cmd.Commit(text),
         )
@@ -226,6 +265,8 @@ class InputEngine(private val latin: LatinDecoder) {
                             associating = true,
                             partialText = "",
                             partialSyllables = "",
+                            lastChineseContext = "",
+                            touchHints = emptyList(),
                         ),
                         listOf(Cmd.Commit(state.raw)),
                         pending = Pending.Associate,
@@ -236,20 +277,28 @@ class InputEngine(private val latin: LatinDecoder) {
             }
             if (state.associating && state.candidates.isNotEmpty()) {
                 val text = state.candidates.first().text
+                val cmds = mutableListOf<Cmd>(Cmd.Commit(text))
+                if (learnable(state) && state.lastChineseContext.isNotEmpty()) {
+                    cmds += Cmd.LearnZhBigram(state.lastChineseContext, text)
+                }
+                val nextCtx = extractTrailingCjk(state.lastChineseContext + text)
                 return EngineStep(
-                    state.copy(candidates = emptyList(), associating = true),
-                    listOf(Cmd.Commit(text)),
+                    state.copy(candidates = emptyList(), associating = true, lastChineseContext = nextCtx),
+                    cmds,
                     pending = Pending.Associate,
                     associateFrom = text,
                 )
             }
-            return EngineStep(state.copy(partialText = "", partialSyllables = ""), listOf(Cmd.Commit(" ")))
+            return EngineStep(
+                state.copy(partialText = "", partialSyllables = "", lastChineseContext = "", touchHints = emptyList()),
+                listOf(Cmd.Commit(" ")),
+            )
         }
 
         // English Spacebar handling
         if (state.raw.isEmpty()) {
             // Double-space after an auto-spaced word inserts ". " and arms auto-capitalization
-            if (state.autoSpace) {
+            if (state.autoSpace && !state.uriOrEmail) {
                 val nextShift = if (state.shift == ShiftState.Caps) ShiftState.Caps else ShiftState.Once
                 return EngineStep(
                     state.copy(
@@ -273,6 +322,8 @@ class InputEngine(private val latin: LatinDecoder) {
 
         val chosen = if (state.verbatimFirst) {
             applyCase(state.raw, state.raw)
+        } else if (state.uriOrEmail) {
+            state.raw
         } else {
             state.candidates.firstOrNull()?.let { applyCase(it.text, state.raw) } ?: applyCase(state.raw, state.raw)
         }
@@ -280,8 +331,8 @@ class InputEngine(private val latin: LatinDecoder) {
         val cmds = mutableListOf<Cmd>(Cmd.Commit(committed))
         if (learnable(state)) cmds += Cmd.LearnEn(chosen.lowercase(), state.lastEnglishWord)
         val shift = if (state.shift == ShiftState.Caps) ShiftState.Caps else ShiftState.Off
-        val nextPredictions = latin.predictNext(chosen.lowercase())
-        val undo = if (!state.verbatimFirst && chosen != state.raw) {
+        val nextPredictions = if (state.uriOrEmail) emptyList() else latin.predictNext(chosen.lowercase())
+        val undo = if (!state.verbatimFirst && !state.uriOrEmail && chosen != state.raw) {
             state.raw to committed.length
         } else {
             null
@@ -293,10 +344,11 @@ class InputEngine(private val latin: LatinDecoder) {
                 candidates = nextPredictions,
                 associating = nextPredictions.isNotEmpty(),
                 shift = shift,
-                autoSpace = true,
+                autoSpace = !state.uriOrEmail,
                 lastEnglishWord = chosen.lowercase(),
                 undoAutocorrect = undo,
                 verbatimFirst = false,
+                touchHints = emptyList(),
             ),
             cmds,
         )
@@ -317,6 +369,7 @@ class InputEngine(private val latin: LatinDecoder) {
                         autoSpace = false,
                         undoAutocorrect = null,
                         verbatimFirst = true,
+                        touchHints = emptyList(),
                     ),
                     listOf(Cmd.DeleteCount(committedLen), Cmd.Compose(originalRaw)),
                 )
@@ -331,10 +384,13 @@ class InputEngine(private val latin: LatinDecoder) {
                     autoSpace = false,
                     undoAutocorrect = null,
                     verbatimFirst = false,
+                    lastChineseContext = state.lastChineseContext.dropLast(1),
+                    touchHints = emptyList(),
                 ),
                 listOf(Cmd.DeleteOne),
             )
         }
+        val droppedChar = state.raw.last()
         val raw = state.raw.dropLast(1)
         if (raw.isEmpty()) {
             return EngineStep(
@@ -348,19 +404,27 @@ class InputEngine(private val latin: LatinDecoder) {
                     autoSpace = false,
                     undoAutocorrect = null,
                     verbatimFirst = false,
+                    touchHints = emptyList(),
                 ),
                 listOf(Cmd.ClearCompose),
             )
         }
+        val nextHints = if (droppedChar == '\'') state.touchHints else state.touchHints.dropLast(1)
         if (state.language == Language.English) {
             return EngineStep(
                 state.copy(
                     raw = raw,
                     preedit = raw,
-                    candidates = latin.suggest(raw.lowercase(), verbatimFirst = state.verbatimFirst),
+                    candidates = latin.suggest(
+                        raw.lowercase(),
+                        verbatimFirst = state.verbatimFirst,
+                        prevWord = state.lastEnglishWord,
+                        touchHints = nextHints,
+                    ),
                     associating = false,
                     autoSpace = false,
                     undoAutocorrect = null,
+                    touchHints = nextHints,
                 ),
                 listOf(Cmd.Compose(raw)),
             )
@@ -373,6 +437,7 @@ class InputEngine(private val latin: LatinDecoder) {
                 associating = false,
                 partialText = "",
                 partialSyllables = "",
+                touchHints = nextHints,
             ),
             listOf(Cmd.Compose(raw)),
             pending = Pending.Pinyin,
@@ -392,6 +457,7 @@ class InputEngine(private val latin: LatinDecoder) {
                     autoSpace = false,
                     undoAutocorrect = null,
                     verbatimFirst = false,
+                touchHints = emptyList(),
                 ),
                 listOf(Cmd.ClearCompose),
             )
@@ -405,6 +471,8 @@ class InputEngine(private val latin: LatinDecoder) {
                 autoSpace = false,
                 undoAutocorrect = null,
                 verbatimFirst = false,
+            lastChineseContext = "",
+            touchHints = emptyList(),
             ),
             listOf(Cmd.DeleteWord),
         )
@@ -422,6 +490,8 @@ class InputEngine(private val latin: LatinDecoder) {
                 autoSpace = false,
                 undoAutocorrect = null,
                 verbatimFirst = false,
+            lastChineseContext = "",
+            touchHints = emptyList(),
             ),
             listOf(Cmd.MoveCursor(delta)),
         )
@@ -447,6 +517,8 @@ class InputEngine(private val latin: LatinDecoder) {
                     associating = false,
                     partialText = "",
                     partialSyllables = "",
+                    lastChineseContext = "",
+                    touchHints = emptyList(),
                 ),
                 listOf(Cmd.Commit(spelling)),
             )
@@ -477,6 +549,8 @@ class InputEngine(private val latin: LatinDecoder) {
                 lastEnglishWord = null,
                 undoAutocorrect = null,
                 verbatimFirst = false,
+                lastChineseContext = "",
+                touchHints = emptyList(),
             ),
             cmds,
         )
@@ -494,7 +568,7 @@ class InputEngine(private val latin: LatinDecoder) {
                             language = Language.English,
                             raw = letters,
                             preedit = letters,
-                            candidates = latin.suggest(letters.lowercase()),
+                            candidates = latin.suggest(letters.lowercase(), touchHints = state.touchHints),
                             associating = false,
                             shift = ShiftState.Off,
                             page = KeyboardPage.Letters,
@@ -540,6 +614,7 @@ class InputEngine(private val latin: LatinDecoder) {
                             autoSpace = false,
                             undoAutocorrect = null,
                             verbatimFirst = false,
+                            touchHints = emptyList(),
                         ),
                         listOf(Cmd.Commit(letters)),
                     )
@@ -561,6 +636,7 @@ class InputEngine(private val latin: LatinDecoder) {
                 autoSpace = false,
                 undoAutocorrect = null,
                 verbatimFirst = false,
+                touchHints = emptyList(),
             ),
             cmds,
         )
@@ -576,10 +652,11 @@ class InputEngine(private val latin: LatinDecoder) {
                 state.raw.ifEmpty { item.text }
             }
             val word = applyCase(item.text, typedRef)
-            val cmds = mutableListOf<Cmd>(Cmd.Commit("$word "))
+            val committed = if (state.uriOrEmail) word else "$word "
+            val cmds = mutableListOf<Cmd>(Cmd.Commit(committed))
             if (learnable(state)) cmds += Cmd.LearnEn(word.lowercase(), state.lastEnglishWord)
             val shift = if (state.shift == ShiftState.Caps) ShiftState.Caps else ShiftState.Off
-            val nextPredictions = latin.predictNext(word.lowercase())
+            val nextPredictions = if (state.uriOrEmail) emptyList() else latin.predictNext(word.lowercase())
             return EngineStep(
                 state.copy(
                     raw = "",
@@ -587,10 +664,11 @@ class InputEngine(private val latin: LatinDecoder) {
                     candidates = nextPredictions,
                     associating = nextPredictions.isNotEmpty(),
                     shift = shift,
-                    autoSpace = true,
+                    autoSpace = !state.uriOrEmail,
                     lastEnglishWord = word.lowercase(),
                     undoAutocorrect = null,
                     verbatimFirst = false,
+                    touchHints = emptyList(),
                 ),
                 cmds,
             )
@@ -604,6 +682,7 @@ class InputEngine(private val latin: LatinDecoder) {
         if (rest.isNotEmpty()) {
             val nextPartialText = if (item.syllables.isNotBlank()) state.partialText + item.text else ""
             val nextPartialSyl = if (item.syllables.isNotBlank()) joinSpace(state.partialSyllables, item.syllables) else ""
+            val remainLetters = rest.count { it in 'a'..'z' || it in 'A'..'Z' }
             cmds += Cmd.Compose(rest)
             return EngineStep(
                 state.copy(
@@ -613,6 +692,7 @@ class InputEngine(private val latin: LatinDecoder) {
                     associating = false,
                     partialText = nextPartialText,
                     partialSyllables = nextPartialSyl,
+                    touchHints = state.touchHints.takeLast(remainLetters),
                 ),
                 cmds,
                 pending = Pending.Pinyin,
@@ -624,15 +704,18 @@ class InputEngine(private val latin: LatinDecoder) {
                 val composedText = state.partialText + item.text
                 val composedSyl = joinSpace(state.partialSyllables, item.syllables)
                 if (composedText.length in 2..8) {
-                    cmds += Cmd.LearnZh(composedText, composedSyl)
+                    cmds += Cmd.LearnZh(composedText, composedSyl, prevContext = state.lastChineseContext)
                 }
             } else if (item.syllables.isNotBlank()) {
-                cmds += Cmd.LearnZh(item.text, item.syllables)
+                cmds += Cmd.LearnZh(item.text, item.syllables, prevContext = state.lastChineseContext)
             } else if (item.text.all { it in 'a'..'z' || it in 'A'..'Z' || it == '\'' }) {
                 cmds += Cmd.LearnEn(item.text.lowercase())
             }
+        } else if (state.associating && learnable(state) && state.lastChineseContext.isNotEmpty()) {
+            cmds += Cmd.LearnZhBigram(state.lastChineseContext, item.text)
         }
 
+        val nextContext = extractTrailingCjk(state.lastChineseContext + state.partialText + item.text)
         return EngineStep(
             state.copy(
                 raw = "",
@@ -641,6 +724,8 @@ class InputEngine(private val latin: LatinDecoder) {
                 associating = true,
                 partialText = "",
                 partialSyllables = "",
+                lastChineseContext = nextContext,
+                touchHints = emptyList(),
             ),
             cmds,
             pending = Pending.Associate,
@@ -663,6 +748,7 @@ class InputEngine(private val latin: LatinDecoder) {
 
     private fun confirmThen(state: EngineState, extra: String): EngineStep {
         val pending = takePending(state)
+        val updatedContext = extractTrailingCjk(pending.first.lastChineseContext + extra)
         return EngineStep(
             pending.first.copy(
                 associating = false,
@@ -671,6 +757,8 @@ class InputEngine(private val latin: LatinDecoder) {
                 raw = "",
                 partialText = "",
                 partialSyllables = "",
+                lastChineseContext = updatedContext,
+                touchHints = emptyList(),
             ),
             pending.second + Cmd.Commit(extra),
         )
@@ -684,11 +772,16 @@ class InputEngine(private val latin: LatinDecoder) {
             val cmds = mutableListOf<Cmd>(Cmd.Commit(text))
             if (chosen != null && learnable(state) && chosen.syllables.isNotBlank()) {
                 if (state.partialText.isNotEmpty() && (state.partialText.length + chosen.text.length) in 2..8) {
-                    cmds += Cmd.LearnZh(state.partialText + chosen.text, joinSpace(state.partialSyllables, chosen.syllables))
+                    cmds += Cmd.LearnZh(
+                        state.partialText + chosen.text,
+                        joinSpace(state.partialSyllables, chosen.syllables),
+                        prevContext = state.lastChineseContext,
+                    )
                 } else {
-                    cmds += Cmd.LearnZh(chosen.text, chosen.syllables)
+                    cmds += Cmd.LearnZh(chosen.text, chosen.syllables, prevContext = state.lastChineseContext)
                 }
             }
+            val nextContext = extractTrailingCjk(state.lastChineseContext + state.partialText + text)
             return state.copy(
                 raw = "",
                 preedit = "",
@@ -696,6 +789,8 @@ class InputEngine(private val latin: LatinDecoder) {
                 associating = false,
                 partialText = "",
                 partialSyllables = "",
+                lastChineseContext = nextContext,
+                touchHints = emptyList(),
             ) to cmds
         }
         // English pending before punctuation: resolve contractions & standalone "i" -> "I" while preserving initials like "H."
@@ -706,7 +801,7 @@ class InputEngine(private val latin: LatinDecoder) {
             top != null && top.contains('\'') && top.replace("'", "") == lowerRaw -> applyCase(top, state.raw)
             else -> state.raw
         }
-        return state.copy(raw = "", preedit = "", candidates = emptyList()) to listOf(Cmd.Commit(resolved))
+        return state.copy(raw = "", preedit = "", candidates = emptyList(), touchHints = emptyList()) to listOf(Cmd.Commit(resolved))
     }
 
     private fun separate(state: EngineState): EngineStep {

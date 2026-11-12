@@ -73,6 +73,18 @@ class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwne
         moveTo(Lifecycle.State.RESUMED)
     }
 
+    override fun onUpdateSelection(
+        oldSelStart: Int,
+        oldSelEnd: Int,
+        newSelStart: Int,
+        newSelEnd: Int,
+        candidatesStart: Int,
+        candidatesEnd: Int,
+    ) {
+        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        controller?.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+    }
+
     override fun onWindowShown() {
         super.onWindowShown()
         moveTo(Lifecycle.State.RESUMED)

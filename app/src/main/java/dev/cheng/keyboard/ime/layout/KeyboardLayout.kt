@@ -87,6 +87,26 @@ fun hitKey(keys: List<PlacedKey>, x: Float, y: Float): PlacedKey? {
     return best
 }
 
+fun nearbyLetters(keys: List<PlacedKey>, x: Float, y: Float, primary: KeyModel): String {
+    if (primary.kind != KeyKind.Letter) return ""
+    val primaryPlaced = keys.firstOrNull { it.model.id == primary.id } ?: return ""
+    val radius = maxOf(primaryPlaced.w, primaryPlaced.h) * 1.35f
+    val hits = ArrayList<Pair<Char, Float>>(4)
+    for (candidate in keys) {
+        if (candidate.model.kind != KeyKind.Letter || candidate.model.id == primary.id) continue
+        val ch = candidate.model.label.firstOrNull()?.lowercaseChar() ?: continue
+        val dx = x - (candidate.x + candidate.w / 2f)
+        val dy = y - (candidate.y + candidate.h / 2f)
+        val dist = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+        if (dist <= radius) hits += ch to dist
+    }
+    if (hits.isEmpty()) return ""
+    hits.sortBy { it.second }
+    return buildString(minOf(3, hits.size)) {
+        for (i in 0 until minOf(3, hits.size)) append(hits[i].first)
+    }
+}
+
 private fun letterRows(language: Language): List<KeyRow> {
     fun letters(text: String) = text.map { ch ->
         val label = ch.toString()

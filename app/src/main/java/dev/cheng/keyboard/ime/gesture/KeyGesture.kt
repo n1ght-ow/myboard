@@ -44,9 +44,11 @@ class KeyGesture(
     private var spaceSliding = false
     private var spaceAnchorX = 0f
     private var repeating = false
+    private var repeatCount = 0
     private var lastRepeat = 0L
+    private var downNeighbors = ""
 
-    fun down(target: KeyModel, x: Float, y: Float, time: Long): GestureFrame {
+    fun down(target: KeyModel, x: Float, y: Float, time: Long, touchNeighbors: String = ""): GestureFrame {
         tracking = true
         key = target
         downX = x
@@ -60,7 +62,9 @@ class KeyGesture(
         spaceSliding = false
         spaceAnchorX = x
         repeating = false
+        repeatCount = 0
         lastRepeat = time
+        downNeighbors = touchNeighbors
         val actions = if (target.kind == KeyKind.Backspace) listOf(EngineAct.Backspace) else emptyList()
         return GestureFrame(
             pressedId = target.id,
@@ -170,6 +174,8 @@ class KeyGesture(
         armed = false
         flickChoice = null
         spaceSliding = false
+        repeatCount = 0
+        downNeighbors = ""
         return GestureFrame(null, null, actions, null)
     }
 
@@ -180,6 +186,8 @@ class KeyGesture(
         flickChoice = null
         spaceSliding = false
         cancelled = false
+        repeatCount = 0
+        downNeighbors = ""
         return idle()
     }
 
@@ -193,8 +201,10 @@ class KeyGesture(
         }
         if (current.kind == KeyKind.Backspace && !swiped && time >= nextRepeatAt()) {
             repeating = true
+            repeatCount++
             lastRepeat = time
-            return GestureFrame(current.id, null, listOf(EngineAct.Backspace), HapticKind.Delete)
+            val act = if (repeatCount > 40) EngineAct.BackspaceWord else EngineAct.Backspace
+            return GestureFrame(current.id, null, listOf(act), HapticKind.Delete)
         }
         return frame()
     }
@@ -207,7 +217,15 @@ class KeyGesture(
         return null
     }
 
-    private fun nextRepeatAt(): Long = if (!repeating) downAt + longMs else lastRepeat + repeatMs
+    private fun nextRepeatAt(): Long {
+        if (!repeating) return downAt + longMs
+        val interval = when {
+            repeatCount >= 40 -> 80L
+            repeatCount >= 15 -> 25L
+            else -> repeatMs
+        }
+        return lastRepeat + interval
+    }
 
     private fun frame(haptic: HapticKind? = null): GestureFrame {
         val current = key
@@ -232,10 +250,10 @@ class KeyGesture(
     )
 
     private fun longPress(current: KeyModel, selected: Choice) =
-        EngineAct.Letter(current.label.first(), selected, current.hint.orEmpty())
+        EngineAct.Letter(current.label.first(), selected, current.hint.orEmpty(), downNeighbors)
 
     private fun tap(current: KeyModel): EngineAct? = when (current.kind) {
-        KeyKind.Letter -> EngineAct.Letter(current.label.first(), null, current.hint.orEmpty())
+        KeyKind.Letter -> EngineAct.Letter(current.label.first(), null, current.hint.orEmpty(), downNeighbors)
         KeyKind.Char -> EngineAct.Direct(current.insert ?: current.label)
         KeyKind.Shift -> EngineAct.Shift
         KeyKind.Enter -> EngineAct.Enter

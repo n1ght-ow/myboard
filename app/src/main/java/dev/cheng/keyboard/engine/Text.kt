@@ -2,6 +2,61 @@ package dev.cheng.keyboard.engine
 
 import dev.cheng.keyboard.model.ShiftState
 
+data class SmartCommit(
+    val deleteBefore: Int = 0,
+    val text: String,
+    val cursorOffsetBack: Int = 0,
+)
+
+private val pairedSymbols = setOf(
+    "（）", "《》", "【】", "「」", "『』", "“”", "‘’", "()", "[]", "{}",
+)
+
+fun resolveSmartCommit(before: String, text: String, composing: Boolean): SmartCommit {
+    if (!composing && text.isNotEmpty() && text[0] in '0'..'9') {
+        if (before.length >= 2 && before[before.length - 2] in '0'..'9') {
+            when (before.last()) {
+                '。' -> return SmartCommit(deleteBefore = 1, text = ".$text")
+                '：' -> return SmartCommit(deleteBefore = 1, text = ":$text")
+            }
+        }
+    }
+    if (!composing) {
+        if (text == "“") {
+            val line = before.substringAfterLast('\n')
+            if (line.lastIndexOf('“') > line.lastIndexOf('”')) {
+                return SmartCommit(text = "”")
+            }
+        } else if (text == "‘") {
+            val line = before.substringAfterLast('\n')
+            if (line.lastIndexOf('‘') > line.lastIndexOf('’')) {
+                return SmartCommit(text = "’")
+            }
+        } else if (text in pairedSymbols && text.length == 2) {
+            return SmartCommit(text = text, cursorOffsetBack = 1)
+        }
+    }
+    return SmartCommit(text = text)
+}
+
+fun extractTrailingCjk(text: String, maxChars: Int = 4): String {
+    if (text.isEmpty() || maxChars <= 0) return ""
+    val buf = StringBuilder()
+    var idx = text.length - 1
+    while (idx >= 0 && buf.length < maxChars) {
+        val ch = text[idx]
+        if (isCjkChar(ch)) {
+            buf.append(ch)
+            idx--
+        } else {
+            break
+        }
+    }
+    return buf.reverse().toString()
+}
+
+fun isCjkChar(ch: Char): Boolean = ch.code in 0x4E00..0x9FFF || ch.code in 0x3400..0x4DBF
+
 fun applyCase(suggestion: String, typed: String): String {
     if (suggestion.equals("i", ignoreCase = true)) return "I"
     if (suggestion.length >= 3 && suggestion.startsWith("i'", ignoreCase = true)) {

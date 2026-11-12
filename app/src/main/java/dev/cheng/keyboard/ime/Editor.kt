@@ -6,8 +6,56 @@ import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import dev.cheng.keyboard.engine.Cmd
 import dev.cheng.keyboard.engine.previousWordUnits
+import dev.cheng.keyboard.engine.resolveSmartCommit
+import dev.cheng.keyboard.engine.shouldAutoCap
 import dev.cheng.keyboard.model.EnterKind
+import dev.cheng.keyboard.model.ShiftState
 import kotlin.math.abs
+
+data class FieldTraits(
+    val password: Boolean,
+    val noLearn: Boolean,
+    val numeric: Boolean,
+    val uriOrEmail: Boolean,
+)
+
+fun fieldTraitsOf(info: EditorInfo): FieldTraits {
+    val password = isPasswordField(info)
+    val noLearn = info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING != 0
+    val inputClass = info.inputType and EditorInfo.TYPE_MASK_CLASS
+    val variation = info.inputType and EditorInfo.TYPE_MASK_VARIATION
+    val numeric = !password && (
+        inputClass == EditorInfo.TYPE_CLASS_NUMBER ||
+            inputClass == EditorInfo.TYPE_CLASS_PHONE ||
+            inputClass == EditorInfo.TYPE_CLASS_DATETIME
+        )
+    val uriOrEmail = !password && inputClass == EditorInfo.TYPE_CLASS_TEXT && (
+        variation == EditorInfo.TYPE_TEXT_VARIATION_URI ||
+            variation == EditorInfo.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
+            variation == EditorInfo.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
+        )
+    return FieldTraits(
+        password = password,
+        noLearn = noLearn,
+        numeric = numeric,
+        uriOrEmail = uriOrEmail,
+    )
+}
+
+fun resolveAutoShift(info: EditorInfo, before: String): ShiftState {
+    val traits = fieldTraitsOf(info)
+    if (traits.password || traits.numeric || traits.uriOrEmail) return ShiftState.Off
+    val flags = info.inputType
+    if (flags and EditorInfo.TYPE_TEXT_FLAG_CAP_CHARACTERS != 0) return ShiftState.Caps
+    if (flags and EditorInfo.TYPE_TEXT_FLAG_CAP_WORDS != 0) {
+        return if (before.isEmpty() || before.last().isWhitespace()) ShiftState.Once else ShiftState.Off
+    }
+    val variation = flags and EditorInfo.TYPE_MASK_VARIATION
+    if (variation == EditorInfo.TYPE_TEXT_VARIATION_FILTER || variation == EditorInfo.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD) {
+        return ShiftState.Off
+    }
+    return if (shouldAutoCap(before)) ShiftState.Once else ShiftState.Off
+}
 
 fun isPasswordField(info: EditorInfo): Boolean {
     val variation = info.inputType and EditorInfo.TYPE_MASK_VARIATION
@@ -114,7 +162,7 @@ class EditorBridge(private val connection: () -> InputConnection?) {
                 Cmd.DeleteWord -> deleteWord(input)
                 is Cmd.MoveCursor -> moveCursor(input, cmd.delta)
                 is Cmd.EditorAction -> input.performEditorAction(cmd.kind.imeAction())
-                is Cmd.LearnZh, is Cmd.LearnEn -> Unit
+                is Cmd.LearnZh, is Cmd.LearnZhBigram, is Cmd.LearnEn -> Unit
             }
         }
     }
@@ -124,25 +172,21 @@ class EditorBridge(private val connection: () -> InputConnection?) {
     }
 
     private fun commitSmart(input: InputConnection, text: String) {
-        // Convert <digit>。<digit> -> <digit>.<digit> and <digit>：<digit> -> <digit>:<digit> automatically
-        if (!composing && text.isNotEmpty() && text[0] in '0'..'9') {
-            val before = input.getTextBeforeCursor(2, 0)?.toString().orEmpty()
-            if (before.length == 2 && before[0] in '0'..'9') {
-                when (before[1]) {
-                    '。' -> {
-                        input.deleteSurroundingText(1, 0)
-                        input.commitText(".$text", 1)
-                        return
-                    }
-                    '：' -> {
-                        input.deleteSurroundingText(1, 0)
-                        input.commitText(":$text", 1)
-                        return
-                    }
-                }
-            }
+        val needContext = !composing && (
+            (text.isNotEmpty() && text[0] in '0'..'9') ||
+                text == "“" ||
+                text == "‘" ||
+                text.length == 2
+            )
+        val before = if (needContext) input.getTextBeforeCursor(120, 0)?.toString().orEmpty() else ""
+        val smart = resolveSmartCommit(before, text, composing)
+        if (smart.deleteBefore > 0) {
+            input.deleteSurroundingText(smart.deleteBefore, 0)
         }
-        input.commitText(text, 1)
+        input.commitText(smart.text, 1)
+        if (smart.cursorOffsetBack > 0) {
+            moveCursor(input, -smart.cursorOffsetBack)
+        }
     }
 
     private fun moveCursor(input: InputConnection, delta: Int) {

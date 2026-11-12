@@ -1,8 +1,10 @@
 package dev.cheng.keyboard.ime.ui
 
 import android.os.SystemClock
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
@@ -60,8 +62,10 @@ import dev.cheng.keyboard.ime.UiState
 import dev.cheng.keyboard.ime.gesture.PopupPreview
 import dev.cheng.keyboard.ime.layout.PlacedKey
 import dev.cheng.keyboard.ime.layout.hitKey
+import dev.cheng.keyboard.ime.layout.nearbyLetters
 import dev.cheng.keyboard.ime.layout.placeKeys
 import dev.cheng.keyboard.ime.layout.popupBox
+import dev.cheng.keyboard.model.Candidate
 import dev.cheng.keyboard.model.Choice
 import dev.cheng.keyboard.model.EnterKind
 import dev.cheng.keyboard.model.KeyKind
@@ -205,18 +209,7 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 state.engine.candidates.forEachIndexed { index, candidate ->
-                    val shown = if (state.engine.language == Language.English && !state.engine.associating) {
-                        applyCase(candidate.text, state.engine.raw)
-                    } else if (state.engine.language == Language.English && state.engine.associating) {
-                        val ref = if (state.engine.shift != ShiftState.Off) {
-                            candidate.text.replaceFirstChar { it.uppercaseChar() }
-                        } else {
-                            candidate.text
-                        }
-                        applyCase(candidate.text, ref)
-                    } else {
-                        candidate.text
-                    }
+                    val shown = displayCandidateText(state, candidate)
                     Text(
                         shown,
                         color = palette.label,
@@ -225,7 +218,10 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
                             .background(if (index == 0 && !state.engine.associating) palette.pressed else Color.Transparent)
-                            .clickable { controller.pick(index) }
+                            .candidateTap(
+                                onClick = { controller.pick(index) },
+                                onLongClick = { controller.forgetCandidate(index) },
+                            )
                             .padding(horizontal = 8.dp, vertical = 2.dp),
                     )
                 }
@@ -245,15 +241,66 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
+private fun Modifier.candidateTap(onClick: () -> Unit, onLongClick: () -> Unit): Modifier =
+    this.combinedClickable(onClick = onClick, onLongClick = onLongClick)
+
+private fun displayCandidateText(state: UiState, candidate: Candidate): String {
+    return if (state.engine.language == Language.English && !state.engine.associating) {
+        applyCase(candidate.text, state.engine.raw)
+    } else if (state.engine.language == Language.English && state.engine.associating) {
+        val ref = if (state.engine.shift != ShiftState.Off) {
+            candidate.text.replaceFirstChar { it.uppercaseChar() }
+        } else {
+            candidate.text
+        }
+        applyCase(candidate.text, ref)
+    } else {
+        candidate.text
+    }
+}
+
 @Composable
 private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardController) {
     val enabled = !state.engine.password
+    val freshClip = state.freshClip?.takeIf { enabled }
     Row(
         Modifier.fillMaxWidth().height(ToolbarHeight).padding(horizontal = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         ToolButton(palette, onClick = controller::toggleMenu) { GridIcon(palette.icon, Modifier.size(22.dp)) }
-        Box(Modifier.weight(1f))
+        Box(
+            Modifier.weight(1f).padding(horizontal = 4.dp),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            val note = state.note?.takeIf { state.overlay == Overlay.None }
+            if (note != null) {
+                Text(note, color = palette.accent, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            } else if (freshClip != null) {
+                Row(
+                    Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(palette.sheet)
+                        .padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "粘贴 ${freshClip.replace('\n', ' ').take(14)}",
+                        color = palette.label,
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false).clickable { controller.pasteText(freshClip) },
+                    )
+                    Text(
+                        " ×",
+                        color = palette.subtle,
+                        fontSize = 14.sp,
+                        modifier = Modifier.clickable(onClick = controller::dismissFreshClip).padding(start = 4.dp),
+                    )
+                }
+            }
+        }
         Row(
             Modifier
                 .clip(RoundedCornerShape(14.dp))
@@ -293,14 +340,28 @@ private fun ToolButton(
 @Composable
 private fun MenuPanel(state: UiState, palette: Palette, controller: KeyboardController) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-        val clip = state.clip
-        if (clip != null) {
-            Text(
-                "粘贴  ${clip.take(24)}",
-                color = palette.label,
-                fontSize = 15.sp,
-                modifier = Modifier.clickable(onClick = controller::paste).padding(vertical = 6.dp),
-            )
+        val clips = if (state.recentClips.isNotEmpty()) state.recentClips else listOfNotNull(state.clip)
+        if (clips.isNotEmpty() && !state.engine.password) {
+            Text("最近剪贴板", color = palette.subtle, fontSize = 12.sp)
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                clips.forEach { item ->
+                    Text(
+                        item.replace('\n', ' ').take(20),
+                        color = palette.label,
+                        fontSize = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(palette.key)
+                            .clickable { controller.pasteText(item) }
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    )
+                }
+            }
         }
         Text("键盘高度", color = palette.subtle, fontSize = 12.sp)
         Slider(
@@ -380,9 +441,11 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
                 .pointerInput(Unit) {
                     awaitEachGesture {
                         val down = awaitFirstDown()
-                        val hit = hitKey(placementState.value.keys, down.position.x, down.position.y)
+                        val keysNow = placementState.value.keys
+                        val hit = hitKey(keysNow, down.position.x, down.position.y)
                         if (hit != null) {
-                            controller.onDown(hit.model, down.position.x, down.position.y, SystemClock.uptimeMillis())
+                            val neighbors = nearbyLetters(keysNow, down.position.x, down.position.y, hit.model)
+                            controller.onDown(hit.model, down.position.x, down.position.y, SystemClock.uptimeMillis(), neighbors)
                         }
                         while (true) {
                             val event = awaitPointerEvent()
@@ -543,7 +606,7 @@ private fun PopupKeys(
 
 @Composable
 private fun CandidateGrid(state: UiState, palette: Palette, controller: KeyboardController, keyHeight: Dp) {
-    val rows = state.engine.candidates.withIndex().chunked(4)
+    val rows = packCandidateRows(state)
     Column(
         Modifier
             .fillMaxWidth()
@@ -553,34 +616,64 @@ private fun CandidateGrid(state: UiState, palette: Palette, controller: Keyboard
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         rows.forEach { row ->
+            val usedSpan = row.sumOf { it.span }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                row.forEach { (index, candidate) ->
-                    val shown = if (state.engine.language == Language.English && !state.engine.associating) {
-                        applyCase(candidate.text, state.engine.raw)
-                    } else {
-                        candidate.text
-                    }
+                row.forEach { cell ->
                     Text(
-                        shown,
+                        cell.shown,
                         color = palette.label,
                         fontSize = 16.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         textAlign = TextAlign.Center,
                         modifier = Modifier
-                            .weight(1f)
+                            .weight(cell.span.toFloat())
                             .clip(RoundedCornerShape(8.dp))
-                            .background(if (index == 0 && !state.engine.associating) palette.pressed else palette.key)
-                            .clickable { controller.pick(index) }
+                            .background(if (cell.index == 0 && !state.engine.associating) palette.pressed else palette.key)
+                            .candidateTap(
+                                onClick = { controller.pick(cell.index) },
+                                onLongClick = { controller.forgetCandidate(cell.index) },
+                            )
                             .padding(horizontal = 4.dp, vertical = 12.dp),
                     )
                 }
-                repeat((4 - row.size).coerceAtLeast(0)) {
-                    Box(Modifier.weight(1f))
+                if (usedSpan < 4) {
+                    Box(Modifier.weight((4 - usedSpan).toFloat()))
                 }
             }
         }
     }
+}
+
+private data class PackedCandidate(val index: Int, val shown: String, val span: Int)
+
+private fun packCandidateRows(state: UiState): List<List<PackedCandidate>> {
+    val rows = ArrayList<List<PackedCandidate>>()
+    var current = ArrayList<PackedCandidate>(4)
+    var currentSpan = 0
+    state.engine.candidates.forEachIndexed { index, candidate ->
+        val shown = displayCandidateText(state, candidate)
+        val visualWeight = shown.sumOf { ch -> if (ch.code > 127) 2 else 1 }
+        val span = when {
+            visualWeight >= 15 -> 4
+            visualWeight >= 9 -> 2
+            else -> 1
+        }
+        if (currentSpan + span > 4 && current.isNotEmpty()) {
+            rows += current
+            current = ArrayList(4)
+            currentSpan = 0
+        }
+        current += PackedCandidate(index, shown, span)
+        currentSpan += span
+        if (currentSpan == 4) {
+            rows += current
+            current = ArrayList(4)
+            currentSpan = 0
+        }
+    }
+    if (current.isNotEmpty()) rows += current
+    return rows
 }
 
 @Composable

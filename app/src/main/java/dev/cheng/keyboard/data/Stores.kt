@@ -130,6 +130,24 @@ class SqliteLexicon(private val db: SQLiteDatabase) : Lexicon {
         )
     }
 
+    override fun phraseFreqs(texts: Collection<String>): Map<String, Int> {
+        val distinct = texts.filter { it.isNotEmpty() }.distinct()
+        if (distinct.isEmpty()) return emptyMap()
+        val out = HashMap<String, Int>(distinct.size)
+        for (chunk in distinct.chunked(64)) {
+            val placeholders = chunk.joinToString(",") { "?" }
+            db.rawQuery(
+                "SELECT text, MAX(freq) FROM entry WHERE text IN ($placeholders) GROUP BY text",
+                chunk.toTypedArray(),
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    out[cursor.getString(0)] = cursor.getInt(1)
+                }
+            }
+        }
+        return out
+    }
+
     private fun query(sql: String, args: Array<String>): List<LexRow> {
         val out = ArrayList<LexRow>()
         db.rawQuery(sql, args).use { cursor ->
@@ -152,6 +170,8 @@ class UserStore(context: Context) {
     init {
         db.execSQL("CREATE TABLE IF NOT EXISTS zh (text TEXT, syllables TEXT, letters TEXT, freq INTEGER, PRIMARY KEY(text, letters))")
         db.execSQL("CREATE TABLE IF NOT EXISTS en (word TEXT PRIMARY KEY, freq INTEGER)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS zh_bigram (prev TEXT, next TEXT, count INTEGER, PRIMARY KEY(prev, next))")
+        db.execSQL("CREATE TABLE IF NOT EXISTS en_bigram (prev TEXT, next TEXT, count INTEGER, PRIMARY KEY(prev, next))")
     }
 
     fun loadZh(): List<LexRow> {
@@ -171,6 +191,28 @@ class UserStore(context: Context) {
         )
     }
 
+    fun deleteZh(text: String) {
+        db.execSQL("DELETE FROM zh WHERE text = ?", arrayOf<Any>(text))
+        db.execSQL("DELETE FROM zh_bigram WHERE prev = ? OR next = ?", arrayOf<Any>(text, text))
+    }
+
+    fun loadZhBigrams(): List<Triple<String, String, Int>> {
+        val out = ArrayList<Triple<String, String, Int>>()
+        db.rawQuery("SELECT prev, next, count FROM zh_bigram", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                out += Triple(cursor.getString(0), cursor.getString(1), cursor.getInt(2))
+            }
+        }
+        return out
+    }
+
+    fun saveZhBigram(prev: String, next: String, count: Int) {
+        db.execSQL(
+            "INSERT OR REPLACE INTO zh_bigram (prev, next, count) VALUES (?, ?, ?)",
+            arrayOf<Any>(prev, next, count),
+        )
+    }
+
     fun loadEn(): List<Pair<String, Int>> {
         val out = ArrayList<Pair<String, Int>>()
         db.rawQuery("SELECT word, freq FROM en", null).use { cursor ->
@@ -183,9 +225,33 @@ class UserStore(context: Context) {
         db.execSQL("INSERT OR REPLACE INTO en (word, freq) VALUES (?, ?)", arrayOf<Any>(word, freq))
     }
 
+    fun deleteEn(word: String) {
+        db.execSQL("DELETE FROM en WHERE word = ?", arrayOf<Any>(word))
+        db.execSQL("DELETE FROM en_bigram WHERE prev = ? OR next = ?", arrayOf<Any>(word, word))
+    }
+
+    fun loadEnBigrams(): List<Triple<String, String, Int>> {
+        val out = ArrayList<Triple<String, String, Int>>()
+        db.rawQuery("SELECT prev, next, count FROM en_bigram", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                out += Triple(cursor.getString(0), cursor.getString(1), cursor.getInt(2))
+            }
+        }
+        return out
+    }
+
+    fun saveEnBigram(prev: String, next: String, count: Int) {
+        db.execSQL(
+            "INSERT OR REPLACE INTO en_bigram (prev, next, count) VALUES (?, ?, ?)",
+            arrayOf<Any>(prev, next, count),
+        )
+    }
+
     fun clear() {
         db.execSQL("DELETE FROM zh")
         db.execSQL("DELETE FROM en")
+        db.execSQL("DELETE FROM zh_bigram")
+        db.execSQL("DELETE FROM en_bigram")
     }
 }
 
@@ -221,6 +287,8 @@ private fun prefixEnd(prefix: String): String {
 
 private fun textPrefixEnd(prefix: String): String {
     val chars = prefix.toCharArray()
+    if (chars.isEmpty()) return "\uFFFF"
+    if (chars[chars.lastIndex] == '\uFFFF') return "$prefix\uFFFF"
     chars[chars.lastIndex] = chars[chars.lastIndex] + 1
     return String(chars)
 }

@@ -8,6 +8,7 @@ class LatinDecoder {
     private class Node {
         val next = arrayOfNulls<Node>(27)
         var freq = 0
+        var baseFreq = 0
         var best = 0
         var word: String? = null
     }
@@ -26,8 +27,11 @@ class LatinDecoder {
 
     fun load(words: Sequence<Pair<String, Int>>) {
         val built = Node()
-        for ((word, freq) in words) insert(built, word, freq)
-        for ((word, freq) in extra) insert(built, word, freq)
+        for ((word, freq) in words) {
+            if (word.length == 1 && word != "a" && word != "i") continue
+            insert(built, word, freq, isBase = true)
+        }
+        for ((word, freq) in extra) insert(built, word, freq, isBase = false)
         root = built
         published++
     }
@@ -40,15 +44,30 @@ class LatinDecoder {
         return directContractions[cleaned]?.let { 500_000 } ?: 0
     }
 
-    fun suggest(raw: String, verbatimFirst: Boolean = false): List<Candidate> {
+    fun suggest(
+        raw: String,
+        verbatimFirst: Boolean = false,
+        prevWord: String? = null,
+        touchHints: List<String> = emptyList(),
+    ): List<Candidate> {
         published
         val prefix = raw.lowercase()
         if (prefix.isEmpty() || prefix.any { it !in 'a'..'z' && it != '\'' }) return emptyList()
+        val followers = prevWord?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }?.let { bigrams[it] }
+        fun contextBonus(word: String): Double {
+            val count = followers?.get(word) ?: 0
+            return if (count <= 0) 0.0 else minOf(8.5, 1.65 * ln((count + 1).toDouble()))
+        }
         if (prefix == "i") {
             val base = collectPrefixCompletions(prefix, walk(prefix))
             val out = ArrayList<Candidate>(20)
             out += Candidate("i", "i", 2_000_000)
-            for ((word, freq) in base) {
+            val sortedBase = if (followers != null) {
+                base.sortedByDescending { (w, f) -> ln(f.coerceAtLeast(1).toDouble()) + contextBonus(w) }
+            } else {
+                base
+            }
+            for ((word, freq) in sortedBase) {
                 if (word != "i") out += Candidate(word, word, freq)
             }
             return out.take(20)
@@ -68,17 +87,32 @@ class LatinDecoder {
 
         val start = walk(prefix)
         val exactWord = start?.takeIf { it.word != null && it.freq > 0 }
+        val completions = collectPrefixCompletions(prefix, start)
+        val bestCompletionFreq = completions.asSequence()
+            .filter { it.first != prefix }
+            .maxOfOrNull { it.second } ?: 0
+        val largeCorpus = root.best >= 1_000_000
+        val minCredibleFreq = if (largeCorpus) 500 else 1
+        val credibleExact = exactWord != null && (
+            prefix in extra ||
+                exactWord.freq >= 5_000 ||
+                (exactWord.freq >= minCredibleFreq && bestCompletionFreq < exactWord.freq.toLong() * 40L)
+            )
         if (exactWord != null) {
             val word = exactWord.word!!
-            val boost = if (word in directContractions) -12.0 else 30.0
-            offer(word, exactWord.freq, ln(exactWord.freq.coerceAtLeast(1).toDouble()) + boost)
+            val boost = when {
+                word in directContractions -> -12.0
+                credibleExact -> 30.0
+                largeCorpus && exactWord.freq < 300 -> -4.0
+                else -> 0.0
+            }
+            offer(word, exactWord.freq, ln(exactWord.freq.coerceAtLeast(1).toDouble()) + boost + contextBonus(word))
         }
 
-        val completions = collectPrefixCompletions(prefix, start)
         for ((word, freq) in completions) {
             if (word == prefix) continue
             val extraLen = (word.length - prefix.length).coerceAtLeast(0)
-            val rankScore = ln(freq.coerceAtLeast(1).toDouble()) - extraLen * 0.55
+            val rankScore = ln(freq.coerceAtLeast(1).toDouble()) - extraLen * 0.55 + contextBonus(word)
             offer(word, freq, rankScore)
         }
 
@@ -87,10 +121,10 @@ class LatinDecoder {
             offer(contraction, 600_000, anchorScore - 0.25)
         }
 
-        val strongPrefixMatch = exactWord != null || completions.any { it.second >= 500 }
+        val strongPrefixMatch = credibleExact || completions.any { it.first != prefix && it.second >= 500 }
         if (prefix.length >= 2 && (!strongPrefixMatch || completions.size < 3)) {
-            for (hit in fuzzyMatches(prefix)) {
-                val baseScore = ln(hit.freq.coerceAtLeast(1).toDouble()) - hit.cost * 3.2
+            for (hit in fuzzyMatches(prefix, touchHints)) {
+                val baseScore = ln(hit.freq.coerceAtLeast(1).toDouble()) - hit.cost * 3.2 + contextBonus(hit.word)
                 val adjusted = if (strongPrefixMatch) baseScore - 8.0 else baseScore
                 offer(hit.word, hit.freq, adjusted)
             }
@@ -136,7 +170,7 @@ class LatinDecoder {
             val base = walk(cleaned)?.freq ?: 0
             val freq = maxOf(base, extra[cleaned] ?: 0) + 20_000
             extra[cleaned] = freq
-            insert(root, cleaned, freq)
+            insert(root, cleaned, freq, isBase = false)
         }
         val prev = previousWord?.trim()?.lowercase().orEmpty()
         if (prev.isNotEmpty() && cleaned.isNotEmpty() && prev.all { it in 'a'..'z' || it == '\'' }) {
@@ -145,10 +179,39 @@ class LatinDecoder {
         }
     }
 
+    fun bigramCount(previousWord: String, word: String): Int =
+        bigrams[previousWord.trim().lowercase()]?.get(word.trim().lowercase()) ?: 0
+
+    fun loadUserBigrams(entries: List<Triple<String, String, Int>>) {
+        for ((prev, next, count) in entries) {
+            if (prev.isBlank() || next.isBlank() || count <= 0) continue
+            val bucket = bigrams.getOrPut(prev.lowercase()) { HashMap() }
+            bucket[next.lowercase()] = maxOf(bucket[next.lowercase()] ?: 0, count)
+        }
+    }
+
+    fun forget(word: String): Boolean {
+        val cleaned = word.trim().lowercase()
+        if (cleaned.isEmpty()) return false
+        val removedExtra = extra.remove(cleaned) != null
+        var removedBigram = false
+        if (bigrams.remove(cleaned) != null) removedBigram = true
+        for (bucket in bigrams.values) {
+            if (bucket.remove(cleaned) != null) removedBigram = true
+        }
+        val node = walk(cleaned)
+        if (node != null && removedExtra) {
+            node.freq = node.baseFreq
+            if (node.baseFreq == 0) node.word = null
+            published++
+        }
+        return removedExtra || removedBigram
+    }
+
     fun loadUser(words: List<Pair<String, Int>>) {
         extra.clear()
         extra.putAll(words)
-        for ((word, freq) in words) insert(root, word, freq)
+        for ((word, freq) in words) insert(root, word, freq, isBase = false)
     }
 
     fun clearUser() {
@@ -181,7 +244,7 @@ class LatinDecoder {
 
     private data class FuzzyHit(val word: String, val freq: Int, val cost: Double)
 
-    private fun fuzzyMatches(typed: String): List<FuzzyHit> {
+    private fun fuzzyMatches(typed: String, touchHints: List<String> = emptyList()): List<FuzzyHit> {
         val maxCost = if (typed.length <= 4) 1.85 else 2.9
         val hits = HashMap<String, FuzzyHit>()
         var visits = 0
@@ -223,12 +286,15 @@ class LatinDecoder {
             }
 
             // Substitution (QWERTY adjacent key preferred; general substitution only on longer words)
+            val spatial = touchHints.getOrNull(pos).orEmpty()
             for (idx in 0 until 26) {
                 val child = node.next[idx] ?: continue
                 val candidateChar = 'a' + idx
                 if (candidateChar == ch) continue
                 val subCost = when {
+                    candidateChar in spatial -> 0.78
                     isQwertyNeighbor(ch, candidateChar) -> 1.25
+                    pos >= 2 && ch in "aeiou" && candidateChar in "aeiou" -> 1.35
                     typed.length >= 4 && pos > 0 -> 2.15
                     else -> continue
                 }
@@ -265,7 +331,7 @@ class LatinDecoder {
             .take(8)
     }
 
-    private fun insert(root: Node, word: String, freq: Int) {
+    private fun insert(root: Node, word: String, freq: Int, isBase: Boolean) {
         val stack = ArrayList<Node>()
         var node = root
         stack += node
@@ -274,6 +340,9 @@ class LatinDecoder {
             val child = node.next[index] ?: Node().also { node.next[index] = it }
             node = child
             stack += node
+        }
+        if (isBase && freq > node.baseFreq) {
+            node.baseFreq = freq
         }
         if (freq >= node.freq) {
             node.freq = freq
