@@ -64,6 +64,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import dev.cheng.keyboard.ai.PolishTone
+import dev.cheng.keyboard.data.MAX_RECENT_CLIPS
 import dev.cheng.keyboard.engine.applyCase
 import dev.cheng.keyboard.ime.KeyboardController
 import dev.cheng.keyboard.ime.Overlay
@@ -462,7 +463,8 @@ private fun MenuPanel(state: UiState, palette: Palette, controller: KeyboardCont
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        val clips = if (state.recentClips.isNotEmpty()) state.recentClips else listOfNotNull(state.clip)
+        val clips = (if (state.recentClips.isNotEmpty()) state.recentClips else listOfNotNull(state.clip))
+            .take(MAX_RECENT_CLIPS)
         if (clips.isNotEmpty() && !state.engine.password) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -477,13 +479,15 @@ private fun MenuPanel(state: UiState, palette: Palette, controller: KeyboardCont
             ) {
                 clips.forEach { item ->
                     val chipShape = RoundedCornerShape(10.dp)
+                    val preview = item.replace(Regex("\\s+"), " ").trim().take(80)
                     Text(
-                        item.replace('\n', ' ').take(20),
+                        preview,
                         color = palette.label,
                         fontSize = 13.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier
+                            .widthIn(max = 176.dp)
                             .clip(chipShape)
                             .background(palette.key)
                             .border(0.6.dp, palette.keyBorder, chipShape)
@@ -761,6 +765,8 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
     val shiftActive = key.model.kind == KeyKind.Shift &&
         !separating &&
         state.engine.shift != ShiftState.Off
+    val onNumberPage = state.engine.page == KeyboardPage.Number
+    val isPrimaryDigit = onNumberPage && key.model.id.startsWith("num-")
     val isFunction = when (key.model.kind) {
         KeyKind.Shift,
         KeyKind.Backspace,
@@ -769,6 +775,8 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
         KeyKind.PageNumber,
         KeyKind.PageSymbols,
         KeyKind.PageMore -> true
+        KeyKind.Char -> onNumberPage && !isPrimaryDigit
+        KeyKind.Space -> onNumberPage
         else -> false
     }
     val fill = when {
@@ -835,17 +843,23 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
                 EnterIcon(palette.onAccent, Modifier.size(21.dp), kind = effectiveEnter)
             }
             KeyKind.Space -> {
+                val spaceLabel = when {
+                    onNumberPage -> "空格"
+                    state.engine.language == Language.Chinese -> "中文"
+                    else -> "English"
+                }
                 Text(
-                    if (state.engine.language == Language.Chinese) "中文" else "English",
+                    spaceLabel,
                     color = palette.subtle,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
+                    maxLines = 1,
                 )
                 Box(
                     Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 4.dp)
-                        .width(26.dp)
+                        .width(if (onNumberPage) 16.dp else 26.dp)
                         .height(2.dp)
                         .clip(CircleShape)
                         .background(palette.divider),
@@ -855,7 +869,11 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
             else -> Text(
                 key.model.label,
                 color = if (key.model.accent) palette.onAccent else palette.label,
-                fontSize = if (key.model.label.length > 1) 13.sp else 19.sp,
+                fontSize = when {
+                    isPrimaryDigit -> 22.sp
+                    key.model.label.length > 1 -> 13.sp
+                    else -> 19.sp
+                },
                 fontWeight = FontWeight.Medium,
                 maxLines = 1,
                 softWrap = false,

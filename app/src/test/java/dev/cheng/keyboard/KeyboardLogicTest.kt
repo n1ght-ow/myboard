@@ -7,6 +7,11 @@ import dev.cheng.keyboard.ai.buildPolishUserPrompt
 import dev.cheng.keyboard.ai.hostSceneOf
 import dev.cheng.keyboard.ai.parsePolishStream
 import dev.cheng.keyboard.ai.parseSseLine
+import dev.cheng.keyboard.data.MAX_RECENT_CLIPS
+import dev.cheng.keyboard.data.decodeRecentClips
+import dev.cheng.keyboard.data.encodeRecentClips
+import dev.cheng.keyboard.data.mergeRecentClipLists
+import dev.cheng.keyboard.data.mergeRecentClips
 import dev.cheng.keyboard.engine.Cmd
 import dev.cheng.keyboard.engine.EngineAct
 import dev.cheng.keyboard.engine.EngineState
@@ -22,8 +27,10 @@ import dev.cheng.keyboard.engine.segmentPinyin
 import dev.cheng.keyboard.engine.shouldAutoCap
 import dev.cheng.keyboard.engine.stripWrapped
 import dev.cheng.keyboard.ime.gesture.KeyGesture
+import dev.cheng.keyboard.ime.layout.hitKey
 import dev.cheng.keyboard.ime.layout.nearbyLetters
 import dev.cheng.keyboard.ime.layout.placeKeys
+import dev.cheng.keyboard.ime.symbol.symbolCategories
 import dev.cheng.keyboard.model.Choice
 import dev.cheng.keyboard.model.EnterKind
 import dev.cheng.keyboard.model.KeyKind
@@ -1465,6 +1472,85 @@ class KeyboardLogicTest {
             assertFalse(verifyDownloadedFile(htmlFile, unknownSizeRelease))
         } finally {
             tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recentClipboardHistoryKeepsFiveItemsAndRoundTrips() {
+        assertEquals(5, MAX_RECENT_CLIPS)
+        var clips = emptyList<String>()
+        for (index in 1..7) {
+            clips = mergeRecentClips("条目-$index", clips)
+        }
+        assertEquals(listOf("条目-7", "条目-6", "条目-5", "条目-4", "条目-3"), clips)
+
+        val promoted = mergeRecentClips("条目-4", clips)
+        assertEquals(listOf("条目-4", "条目-7", "条目-6", "条目-5", "条目-3"), promoted)
+        assertEquals(promoted, mergeRecentClips("   ", promoted))
+
+        val multiline = "第一行\n\"第二行\""
+        val mergedWithStored = mergeRecentClipLists(listOf(multiline), promoted)
+        assertEquals(listOf(multiline, "条目-4", "条目-7", "条目-6", "条目-5"), mergedWithStored)
+
+        val encoded = encodeRecentClips(mergedWithStored)
+        assertEquals(mergedWithStored, decodeRecentClips(encoded))
+        assertEquals(emptyList<String>(), decodeRecentClips("not-json"))
+    }
+
+    @Test
+    fun bottomLeftCornerTogglesBetweenLettersAndNineKeyNumberPage() {
+        val letters = placeKeys(KeyboardPage.Letters, Language.Chinese, 1080f, 132f, 18f, 30f, 12f)
+        val numbers = placeKeys(KeyboardPage.Number, Language.Chinese, 1080f, 132f, 18f, 30f, 12f)
+        assertEquals(letters.height, numbers.height, 0.01f)
+
+        val toNumber = letters.keys.first { it.model.id == "to-number" }
+        val letterSymbols = letters.keys.first { it.model.id == "to-symbols" }
+        assertEquals("123", toNumber.model.label)
+        assertEquals(KeyKind.PageNumber, toNumber.model.kind)
+        assertTrue("123 must be placed to the left of 符号 on Letters page", toNumber.x < letterSymbols.x)
+
+        val toLetters = numbers.keys.first { it.model.id == "to-letters" }
+        val numberSymbols = numbers.keys.first { it.model.id == "to-symbols" }
+        assertEquals("ABC", toLetters.model.label)
+        assertEquals(KeyKind.PageLetters, toLetters.model.kind)
+        assertEquals(toNumber.x, toLetters.x, 0.01f)
+        assertEquals(toNumber.y, toLetters.y, 0.01f)
+        assertTrue(numberSymbols.x > toLetters.x)
+
+        // Tapping the same bottom-left spot switches cleanly between 123 and ABC
+        val tapX = toNumber.x + toNumber.w * 0.5f
+        val tapY = toNumber.y + toNumber.h * 0.5f
+        assertEquals("to-number", hitKey(letters.keys, tapX, tapY)?.model?.id)
+        assertEquals("to-letters", hitKey(numbers.keys, tapX, tapY)?.model?.id)
+
+        // Center 9-key + 0 grid alignment
+        val digits = (0..9).associateWith { d -> numbers.keys.first { it.model.id == "num-$d" } }
+        assertEquals(digits.getValue(1).x, digits.getValue(4).x, 0.01f)
+        assertEquals(digits.getValue(4).x, digits.getValue(7).x, 0.01f)
+        assertEquals(digits.getValue(2).x, digits.getValue(5).x, 0.01f)
+        assertEquals(digits.getValue(5).x, digits.getValue(8).x, 0.01f)
+        assertEquals(digits.getValue(8).x, digits.getValue(0).x, 0.01f)
+        assertEquals(digits.getValue(3).x, digits.getValue(6).x, 0.01f)
+        assertEquals(digits.getValue(6).x, digits.getValue(9).x, 0.01f)
+
+        // Flanking common punctuation on left and right sides
+        val leftLabelsZh = numbers.keys.filter { it.x < digits.getValue(1).x && it.model.kind == KeyKind.Char }.map { it.model.label }
+        val rightLabelsZh = numbers.keys.filter { it.x > digits.getValue(3).x && it.model.kind == KeyKind.Char }.map { it.model.label }
+        assertEquals(listOf("，", "。", "？", "！", "、", "@"), leftLabelsZh)
+        assertEquals(listOf("+", "-", "/", ":", "%"), rightLabelsZh)
+
+        val numbersEn = placeKeys(KeyboardPage.Number, Language.English, 1080f, 132f, 18f, 30f, 12f)
+        val leftLabelsEn = numbersEn.keys.filter { it.x < digits.getValue(1).x && it.model.kind == KeyKind.Char }.map { it.model.label }
+        assertEquals(listOf("?", "!", "(", ")", "@", "#"), leftLabelsEn)
+    }
+
+    @Test
+    fun symbolCatalogHasOrderedCategoriesWithoutDuplicates() {
+        assertEquals(12, symbolCategories.size)
+        assertEquals("常用", symbolCategories.first().name)
+        for (category in symbolCategories) {
+            assertTrue(category.symbols.isNotEmpty())
+            assertEquals("Duplicate symbol in ${category.name}", category.symbols.distinct(), category.symbols)
         }
     }
 }

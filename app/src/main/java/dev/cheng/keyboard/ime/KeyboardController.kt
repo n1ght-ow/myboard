@@ -25,7 +25,11 @@ import dev.cheng.keyboard.data.PrefKeys
 import dev.cheng.keyboard.data.Secrets
 import dev.cheng.keyboard.data.SqliteLexicon
 import dev.cheng.keyboard.data.UserStore
+import dev.cheng.keyboard.data.decodeRecentClips
+import dev.cheng.keyboard.data.encodeRecentClips
 import dev.cheng.keyboard.data.installLexicon
+import dev.cheng.keyboard.data.mergeRecentClipLists
+import dev.cheng.keyboard.data.mergeRecentClips
 import dev.cheng.keyboard.data.settingsStore
 import dev.cheng.keyboard.data.themeMode
 import dev.cheng.keyboard.engine.Cmd
@@ -134,12 +138,14 @@ class KeyboardController(
                         prefs[PrefKeys.calibDy] ?: 0f,
                     )
                 }
+                val storedClips = decodeRecentClips(prefs[PrefKeys.recentClips])
                 update {
                     it.copy(
                         theme = prefs.themeMode(),
                         heightScale = (prefs[PrefKeys.height] ?: 1f).coerceIn(0.8f, 1.25f),
                         haptic = prefs[PrefKeys.haptic] != false,
                         fuzzy = fuzzy,
+                        recentClips = mergeRecentClipLists(it.recentClips, storedClips),
                     )
                 }
                 if (engineState.raw.isNotEmpty() && engineState.language == Language.Chinese) requestPinyin(engineState.raw)
@@ -240,6 +246,13 @@ class KeyboardController(
         gesture.cancel()
         tapClearJob?.cancel()
         lastPolishUndo = null
+        val syncedClips = if (traits.password) {
+            state.recentClips
+        } else {
+            mergeRecentClips(readClip(skipSensitive = true), state.recentClips).also { merged ->
+                if (merged != state.recentClips) saveRecentClips(merged)
+            }
+        }
         update {
             it.copy(
                 pressedId = null,
@@ -248,6 +261,7 @@ class KeyboardController(
                 expanded = false,
                 enter = enter,
                 canUndoPolish = false,
+                recentClips = syncedClips,
             )
         }
         publish()
@@ -450,12 +464,9 @@ class KeyboardController(
         if (state.menu) {
             update { it.copy(menu = false, clip = null) }
         } else {
-            val current = readClip()
-            val merged = if (current != null) {
-                (listOf(current) + state.recentClips.filter { it != current }).take(6)
-            } else {
-                state.recentClips
-            }
+            val current = if (engineState.password) null else readClip(skipSensitive = true)
+            val merged = mergeRecentClips(current, state.recentClips)
+            if (merged != state.recentClips) saveRecentClips(merged)
             update { it.copy(menu = true, clip = current, recentClips = merged, overlay = Overlay.None) }
         }
     }
@@ -518,7 +529,14 @@ class KeyboardController(
     }
 
     fun openSettings() {
-        context.startActivity(Intent(context, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        update { it.copy(menu = false) }
+        context.startActivity(
+            Intent(context, SettingsActivity::class.java).addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP,
+            ),
+        )
     }
 
     fun dismiss() = hide()
@@ -528,20 +546,40 @@ class KeyboardController(
         if (engineState.language != language) dispatch(EngineAct.Language)
     }
 
-    fun closeSymbols() = dispatch(EngineAct.Page(KeyboardPage.Letters))
-
-    fun selectSymbolCategory(index: Int) = update { it.copy(symbolIndex = index, symbolRecent = false) }
-
-    fun cycleSymbolGroups() {
-        val count = dev.cheng.keyboard.ime.symbol.symbolPages.size
-        update { it.copy(symbolGroup = (it.symbolGroup + 1) % count, symbolIndex = 0, symbolRecent = false) }
+    fun closeSymbols() {
+        if (state.haptic) haptic(HapticKind.Down)
+        dispatch(EngineAct.Page(KeyboardPage.Letters))
     }
 
-    fun toggleSymbolLock() = update { it.copy(symbolLocked = !it.symbolLocked) }
+    fun openNumberPage() {
+        if (state.haptic) haptic(HapticKind.Down)
+        dispatch(EngineAct.Page(KeyboardPage.Number))
+    }
 
-    fun toggleSymbolRecent() = update { it.copy(symbolRecent = !it.symbolRecent) }
+    fun selectSymbolCategory(index: Int) {
+        val safe = index.coerceIn(0, dev.cheng.keyboard.ime.symbol.symbolCategories.lastIndex)
+        update { it.copy(symbolIndex = safe, symbolRecent = false) }
+    }
+
+    fun selectRecentSymbols() = update { it.copy(symbolRecent = true) }
+
+    fun toggleSymbolLock() {
+        if (state.haptic) haptic(HapticKind.Down)
+        update { it.copy(symbolLocked = !it.symbolLocked) }
+    }
+
+    fun spaceFromSymbols() {
+        if (state.haptic) haptic(HapticKind.Down)
+        dispatch(EngineAct.Space)
+    }
+
+    fun backspaceFromSymbols() {
+        if (state.haptic) haptic(HapticKind.Delete)
+        dispatch(EngineAct.Backspace)
+    }
 
     fun insertSymbol(text: String) {
+        if (state.haptic) haptic(HapticKind.Down)
         val locked = state.symbolLocked
         val recent = (listOf(text) + state.recentSymbols.filter { it != text }).take(40)
         update { it.copy(recentSymbols = recent) }
@@ -1205,11 +1243,21 @@ class KeyboardController(
     private fun onClipboardChanged() {
         val text = readClip(skipSensitive = true) ?: return
         clipExpireJob?.cancel()
-        val merged = (listOf(text) + state.recentClips.filter { it != text }).take(6)
+        val merged = mergeRecentClips(text, state.recentClips)
+        saveRecentClips(merged)
         update { it.copy(freshClip = text, recentClips = merged) }
         clipExpireJob = scope.launch {
             delay(45_000)
             update { it.copy(freshClip = null) }
+        }
+    }
+
+    private fun saveRecentClips(clips: List<String>) {
+        val encoded = encodeRecentClips(clips)
+        scope.launch {
+            context.settingsStore.edit { prefs ->
+                prefs[PrefKeys.recentClips] = encoded
+            }
         }
     }
 

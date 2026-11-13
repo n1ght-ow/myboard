@@ -14,7 +14,11 @@ import androidx.security.crypto.MasterKey
 import dev.cheng.keyboard.model.LexRow
 import dev.cheng.keyboard.model.Lexicon
 import dev.cheng.keyboard.model.ThemeMode
+import org.json.JSONArray
 import java.io.File
+
+const val MAX_RECENT_CLIPS = 5
+private const val MAX_CLIP_CHARS = 4096
 
 val Context.settingsStore by preferencesDataStore(name = "keyboard")
 
@@ -29,6 +33,57 @@ object PrefKeys {
     val calibRight = floatPreferencesKey("calib_right")
     val calibDy = floatPreferencesKey("calib_dy")
     val calibEpoch = longPreferencesKey("calib_epoch")
+    val recentClips = stringPreferencesKey("recent_clips")
+}
+
+fun mergeRecentClips(
+    current: String?,
+    existing: List<String>,
+    limit: Int = MAX_RECENT_CLIPS,
+): List<String> {
+    val normalized = current?.takeIf { it.isNotBlank() }?.take(MAX_CLIP_CHARS)
+    val cleaned = existing.mapNotNull { item -> item.takeIf { it.isNotBlank() }?.take(MAX_CLIP_CHARS) }
+    val combined = if (normalized != null) {
+        listOf(normalized) + cleaned.filter { it != normalized }
+    } else {
+        cleaned.distinct()
+    }
+    return combined.take(limit.coerceAtLeast(0))
+}
+
+fun mergeRecentClipLists(
+    primary: List<String>,
+    secondary: List<String>,
+    limit: Int = MAX_RECENT_CLIPS,
+): List<String> {
+    val out = ArrayList<String>(limit.coerceAtLeast(0))
+    for (item in primary.asSequence() + secondary.asSequence()) {
+        val normalized = item.takeIf { it.isNotBlank() }?.take(MAX_CLIP_CHARS) ?: continue
+        if (normalized !in out) {
+            out += normalized
+            if (out.size >= limit) break
+        }
+    }
+    return out
+}
+
+fun encodeRecentClips(clips: List<String>, limit: Int = MAX_RECENT_CLIPS): String {
+    val array = JSONArray()
+    mergeRecentClips(null, clips, limit).forEach { array.put(it) }
+    return array.toString()
+}
+
+fun decodeRecentClips(raw: String?, limit: Int = MAX_RECENT_CLIPS): List<String> {
+    if (raw.isNullOrBlank()) return emptyList()
+    return runCatching {
+        val array = JSONArray(raw)
+        val items = ArrayList<String>(minOf(array.length(), limit.coerceAtLeast(0)))
+        for (index in 0 until array.length()) {
+            val value = array.optString(index, "")
+            if (value.isNotBlank()) items += value
+        }
+        mergeRecentClips(null, items, limit)
+    }.getOrDefault(emptyList())
 }
 
 fun Preferences.themeMode(): ThemeMode =
