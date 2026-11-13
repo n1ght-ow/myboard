@@ -2,6 +2,7 @@ package dev.cheng.keyboard.settings
 
 import android.content.Context
 import android.content.Intent
+import android.database.sqlite.SQLiteDatabase
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -80,7 +81,9 @@ import dev.cheng.keyboard.ai.MODEL_FLASH
 import dev.cheng.keyboard.ai.MODEL_PRO
 import dev.cheng.keyboard.data.PrefKeys
 import dev.cheng.keyboard.data.Secrets
+import dev.cheng.keyboard.data.SqliteLexicon
 import dev.cheng.keyboard.data.UserStore
+import dev.cheng.keyboard.data.installLexicon
 import dev.cheng.keyboard.data.settingsStore
 import dev.cheng.keyboard.data.themeMode
 import dev.cheng.keyboard.engine.PinyinDecoder
@@ -93,10 +96,12 @@ import dev.cheng.keyboard.ime.ui.PolishIcon
 import dev.cheng.keyboard.ime.ui.SettingsIcon
 import dev.cheng.keyboard.ime.ui.TrashIcon
 import dev.cheng.keyboard.model.ThemeMode
+import dev.cheng.keyboard.update.InstallCoordinator
 import dev.cheng.keyboard.update.UpdateClient
 import dev.cheng.keyboard.update.UpdateDownload
 import dev.cheng.keyboard.update.UpdatePhase
 import dev.cheng.keyboard.update.checkForUpdate
+import dev.cheng.keyboard.update.findDownloadedNewerApk
 import dev.cheng.keyboard.update.installedVersionCode
 import dev.cheng.keyboard.update.installedVersionName
 import dev.cheng.keyboard.update.markDownloaded
@@ -107,6 +112,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 
 private data class SettingsColors(
     val bg: Color,
@@ -188,6 +194,16 @@ class SettingsActivity : ComponentActivity() {
         setContent { SettingsRoot(focusTick.intValue) }
     }
 
+    override fun onStart() {
+        super.onStart()
+        InstallCoordinator.attachActivity(this)
+    }
+
+    override fun onStop() {
+        InstallCoordinator.detachActivity(this)
+        super.onStop()
+    }
+
     override fun onResume() {
         super.onResume()
         focusTick.intValue++
@@ -256,7 +272,7 @@ private fun SettingsRoot(refreshTick: Int) {
                     ) {
                         SetupCard(context, imeStatus, colors)
                         TryFieldCard(colors)
-                        LexiconAndUpdateSection(context, secrets, version, colors, scope)
+                        LexiconAndUpdateSection(context, version, refreshTick, colors, scope)
                     }
                     Column(
                         Modifier.weight(1f),
@@ -274,7 +290,7 @@ private fun SettingsRoot(refreshTick: Int) {
                     AppearanceAndInputSection(context, current, scope, colors)
                     AiConfigCard(context, current, scope, secrets, key, colors)
                 }
-                LexiconAndUpdateSection(context, secrets, version, colors, scope)
+                LexiconAndUpdateSection(context, version, refreshTick, colors, scope)
                 FooterNotice(colors)
             }
         }
@@ -750,8 +766,8 @@ private fun AiConfigCard(
 @Composable
 private fun LexiconAndUpdateSection(
     context: Context,
-    secrets: Secrets,
     version: String,
+    refreshTick: Int,
     colors: SettingsColors,
     scope: CoroutineScope,
 ) {
@@ -802,7 +818,7 @@ private fun LexiconAndUpdateSection(
         }
 
         CardDivider(colors)
-        UpdateSection(context, secrets, version, colors)
+        UpdateSection(context, version, refreshTick, colors)
     }
 }
 
@@ -818,19 +834,23 @@ private fun EngineProbeNote(context: Context, colors: SettingsColors) {
 @Composable
 private fun UpdateSection(
     context: Context,
-    secrets: Secrets,
     version: String,
+    refreshTick: Int,
     colors: SettingsColors,
 ) {
-    val client = remember { UpdateClient() }
+    val client = remember(context) { UpdateClient(context) }
+    val versionCode = remember { installedVersionCode(context) }
     val ticket = remember { intArrayOf(0) }
     val main = remember { Handler(Looper.getMainLooper()) }
     val scope = rememberCoroutineScope()
     var phase by remember { mutableStateOf<UpdatePhase>(UpdatePhase.Idle) }
-    var showToken by remember { mutableStateOf(secrets.githubToken().isNullOrBlank()) }
-    var draft by remember { mutableStateOf("") }
     DisposableEffect(client) {
+        val listener: (UpdatePhase) -> Unit = { next -> phase = next }
+        InstallCoordinator.statusListener = listener
         onDispose {
+            if (InstallCoordinator.statusListener === listener) {
+                InstallCoordinator.statusListener = null
+            }
             client.cancel()
             main.removeCallbacksAndMessages(null)
         }
@@ -846,25 +866,34 @@ private fun UpdateSection(
         scope.launch { block(current) }
     }
 
-    fun check(token: String) {
+    fun check() {
         run { current ->
             publish(current, UpdatePhase.Checking)
             val next = withContext(Dispatchers.IO) {
-                markDownloaded(context, checkForUpdate(client, version, token))
-            }
-            if (ticket[0] == current && (next is UpdatePhase.UpToDate || next is UpdatePhase.Available)) {
-                showToken = false
+                val checked = markDownloaded(context, checkForUpdate(client, version, versionCode))
+                if (checked is UpdatePhase.Failed) {
+                    val cached = findDownloadedNewerApk(context)
+                    if (cached != null) {
+                        UpdatePhase.Ready(cached.first, "已缓存新版本 v${cached.second} 安装包，可直接安装。")
+                    } else {
+                        checked
+                    }
+                } else {
+                    checked
+                }
             }
             publish(current, next)
         }
     }
 
     LaunchedEffect(Unit) {
-        val token = secrets.githubToken().orEmpty()
-        if (token.isNotEmpty()) check(token)
+        check()
     }
-    LaunchedEffect(phase) {
-        if (phase is UpdatePhase.Failed && (phase as UpdatePhase.Failed).askToken) showToken = true
+    LaunchedEffect(refreshTick) {
+        val current = phase
+        if (current is UpdatePhase.NeedsPermission && context.packageManager.canRequestPackageInstalls()) {
+            phase = prepareInstall(context, current.file)
+        }
     }
 
     Row(
@@ -887,17 +916,22 @@ private fun UpdateSection(
         }
         if (phase is UpdatePhase.UpToDate) {
             StatusBadge("已是最新", bg = colors.successSoft, fg = colors.success)
-        } else if (phase is UpdatePhase.Available) {
+        } else if (phase is UpdatePhase.Available || phase is UpdatePhase.Ready || phase is UpdatePhase.NeedsPermission) {
             StatusBadge("有新版本", bg = colors.accentSoft, fg = colors.accent)
         }
     }
 
     when (val current = phase) {
         UpdatePhase.Idle -> Unit
-        UpdatePhase.Checking -> StatusNote("正在连接 GitHub 检查新版本…", colors.subtle)
+        UpdatePhase.Checking -> StatusNote("正在通过官方与加速通道检查新版本…", colors.subtle)
         UpdatePhase.UpToDate -> StatusNote("当前已是最新正式版本。", colors.subtle)
         is UpdatePhase.Available -> {
             val noteShape = RoundedCornerShape(12.dp)
+            val sizeLabel = if (current.release.size > 0L) {
+                String.format(Locale.ROOT, " · %.1f MB", current.release.size / (1024.0 * 1024.0))
+            } else {
+                ""
+            }
             Column(
                 Modifier
                     .padding(top = 10.dp)
@@ -908,7 +942,7 @@ private fun UpdateSection(
                     .padding(12.dp),
             ) {
                 Text(
-                    "新版本 v${current.release.version} 可供安装",
+                    "新版本 v${current.release.version} 可供安装$sizeLabel",
                     color = colors.text,
                     fontSize = 14.5.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -925,9 +959,10 @@ private fun UpdateSection(
             }
         }
         is UpdatePhase.Downloading -> {
+            val routeHint = if (current.routeLabel.isNotBlank()) "（${current.routeLabel}）" else ""
             Column(Modifier.padding(top = 10.dp).fillMaxWidth()) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("正在下载更新包…", color = colors.text, fontSize = 13.5.sp)
+                    Text("正在下载更新包$routeHint…", color = colors.text, fontSize = 13.5.sp)
                     Spacer(Modifier.weight(1f))
                     Text("${current.percent}%", color = colors.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 }
@@ -949,47 +984,9 @@ private fun UpdateSection(
                 }
             }
         }
-        is UpdatePhase.NeedsPermission -> StatusNote("请允许 N1ghtKey 安装未知应用权限，随后点击继续安装。", colors.text)
-        is UpdatePhase.Ready -> StatusNote("若系统安装界面未自动弹出，可再次点击安装。", colors.subtle)
+        is UpdatePhase.NeedsPermission -> StatusNote("请允许 N1ghtKey 安装未知应用权限，返回后将自动继续安装。", colors.text)
+        is UpdatePhase.Ready -> StatusNote(current.message, colors.subtle)
         is UpdatePhase.Failed -> StatusNote(current.message, colors.danger)
-    }
-
-    if (showToken) {
-        Text(
-            "私有仓库需要一个能读取 N1ghtKey 的 GitHub 令牌，只保存在这台设备上。",
-            color = colors.subtle,
-            fontSize = 12.5.sp,
-            lineHeight = 18.sp,
-            modifier = Modifier.padding(top = 10.dp),
-        )
-        val tokenShape = RoundedCornerShape(12.dp)
-        BasicTextField(
-            value = draft,
-            onValueChange = { draft = it },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            textStyle = TextStyle(color = colors.text, fontSize = 15.sp),
-            cursorBrush = SolidColor(colors.accent),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp)
-                .clip(tokenShape)
-                .background(colors.field)
-                .border(0.8.dp, colors.fieldBorder, tokenShape)
-                .padding(horizontal = 12.dp, vertical = 11.dp),
-            decorationBox = { inner ->
-                Box(Modifier.fillMaxWidth()) {
-                    if (draft.isEmpty()) {
-                        Text(
-                            if (secrets.githubToken().isNullOrBlank()) "输入 GitHub 访问令牌" else "已保存令牌，输入新令牌可替换",
-                            color = colors.subtle,
-                            fontSize = 14.5.sp,
-                        )
-                    }
-                    inner()
-                }
-            },
-        )
     }
 
     Spacer(Modifier.height(10.dp))
@@ -998,14 +995,20 @@ private fun UpdateSection(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         when (val current = phase) {
-            UpdatePhase.Checking, is UpdatePhase.Downloading -> Unit
+            UpdatePhase.Checking -> Unit
+            is UpdatePhase.Downloading -> {
+                SmallChipButton("取消下载", colors) {
+                    ticket[0]++
+                    client.cancel()
+                    phase = UpdatePhase.Idle
+                }
+            }
             is UpdatePhase.Available -> {
                 ActionButton(
                     label = if (current.downloaded) "立即安装" else "下载并安装",
                     primary = true,
                     colors = colors,
                 ) {
-                    val token = secrets.githubToken().orEmpty()
                     if (current.downloaded) {
                         phase = prepareInstall(context, updateApk(context, current.release.version))
                     } else {
@@ -1014,20 +1017,20 @@ private fun UpdateSection(
                             publish(ticketId, UpdatePhase.Downloading(0))
                             val file = updateApk(context, release.version)
                             val result = withContext(Dispatchers.IO) {
-                                client.download(token, release, file) { percent ->
-                                    main.post { publish(ticketId, UpdatePhase.Downloading(percent)) }
+                                client.download(release, file) { percent, routeLabel ->
+                                    main.post { publish(ticketId, UpdatePhase.Downloading(percent, routeLabel)) }
                                 }
                             }
                             if (ticket[0] != ticketId) return@run
                             val next = when (result) {
                                 is UpdateDownload.Ok -> prepareInstall(context, result.file)
-                                UpdateDownload.Unauthorized -> UpdatePhase.Failed("令牌无效。", askToken = true)
-                                is UpdateDownload.Failed -> UpdatePhase.Failed(result.message, askToken = false)
+                                is UpdateDownload.Failed -> UpdatePhase.Failed(result.message)
                             }
                             publish(ticketId, next)
                         }
                     }
                 }
+                SmallChipButton("重新检查", colors) { check() }
             }
             is UpdatePhase.NeedsPermission -> {
                 ActionButton("去允许权限", primary = true, colors = colors) { openInstallPermission(context) }
@@ -1036,37 +1039,19 @@ private fun UpdateSection(
                 }
             }
             is UpdatePhase.Ready -> {
-                ActionButton("安装", primary = true, colors = colors) {
+                ActionButton("立即安装", primary = true, colors = colors) {
                     phase = prepareInstall(context, current.file)
                 }
+                SmallChipButton("重新检查", colors) { check() }
             }
             else -> {
-                val primaryTokenSave = showToken && draft.isNotBlank()
                 ActionButton(
-                    label = if (primaryTokenSave) "保存并检查" else "检查更新",
-                    primary = primaryTokenSave,
+                    label = "检查更新",
+                    primary = phase is UpdatePhase.Failed,
                     colors = colors,
                 ) {
-                    if (draft.isNotBlank()) {
-                        secrets.setGithubToken(draft)
-                        draft = ""
-                    }
-                    val token = secrets.githubToken().orEmpty()
-                    if (token.isBlank()) {
-                        showToken = true
-                        phase = UpdatePhase.Failed("先填写 GitHub 令牌。", askToken = true)
-                    } else {
-                        check(token)
-                    }
+                    check()
                 }
-            }
-        }
-        if (!showToken && !secrets.githubToken().isNullOrBlank()) {
-            SmallChipButton("更换令牌", colors) { showToken = true }
-        } else if (showToken && !secrets.githubToken().isNullOrBlank()) {
-            SmallChipButton("取消", colors) {
-                draft = ""
-                showToken = false
             }
         }
     }
@@ -1306,6 +1291,22 @@ private fun engineProbe(context: Context): String {
     if (syllables.isEmpty()) return "$build · 音节表读取失败"
     val decoder = PinyinDecoder(syllables)
     val samples = listOf("shang", "jian", "nian", "maofan")
-    val probe = samples.joinToString(" ") { input -> "$input→" + decoder.decode(input, fuzzy = false).preedit }
+    val lexFile = installLexicon(context)
+    val probe = if (lexFile != null && lexFile.isFile) {
+        runCatching {
+            SQLiteDatabase.openDatabase(lexFile.path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+                decoder.lexicon = SqliteLexicon(db)
+                samples.joinToString(" ") { input ->
+                    val decoded = decoder.decode(input, fuzzy = false)
+                    val top = decoded.candidates.firstOrNull()?.text.orEmpty()
+                    if (top.isNotEmpty()) "$input→$top(${decoded.preedit})" else "$input→${decoded.preedit}"
+                }
+            }
+        }.getOrElse {
+            samples.joinToString(" ") { input -> "$input→" + decoder.decode(input, fuzzy = false).preedit }
+        }
+    } else {
+        samples.joinToString(" ") { input -> "$input→" + decoder.decode(input, fuzzy = false).preedit }
+    }
     return "$build · 音节 ${syllables.size} · $probe"
 }

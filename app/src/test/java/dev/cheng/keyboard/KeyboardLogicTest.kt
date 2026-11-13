@@ -34,15 +34,24 @@ import dev.cheng.keyboard.model.LexRow
 import dev.cheng.keyboard.model.MemoryLexicon
 import dev.cheng.keyboard.model.ShiftState
 import dev.cheng.keyboard.engine.SylTrie
+import dev.cheng.keyboard.update.RemoteRelease
+import dev.cheng.keyboard.update.isNewerRelease
 import dev.cheng.keyboard.update.isNewerVersion
 import dev.cheng.keyboard.update.parseLatestRelease
+import dev.cheng.keyboard.update.parseLatestRedirectTag
+import dev.cheng.keyboard.update.sha256Hex
+import dev.cheng.keyboard.update.verifyDownloadedFile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.nio.file.Files
 import java.time.LocalDateTime
 import java.util.zip.GZIPInputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 class KeyboardLogicTest {
     private val syllables = setOf(
@@ -1211,6 +1220,252 @@ class KeyboardLogicTest {
     fun polishToneAutoUsesAutoLabel() {
         assertEquals("自动判断", PolishTone.Auto.promptLabel)
         assertEquals("老师", PolishTone.Teacher.promptLabel)
+    }
+
+    @Test
+    fun entireSyllableInventoryResistsParasiticCodaAndVowelSplits() {
+        val dictDir = sequenceOf(
+            File("src/main/assets/dict"),
+            File("app/src/main/assets/dict"),
+        ).firstOrNull { it.isDirectory } ?: return
+        val realSyllables = File(dictDir, "syllables.txt")
+            .readLines()
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+        val fullSyllables = realSyllables.filter { it.length >= 2 || it in setOf("a", "e", "o") }
+        assertEquals(414, fullSyllables.size)
+
+        val rows = ArrayList<LexRow>(fullSyllables.size + 64)
+        // Give every real syllable a normal 1-character entry
+        for ((idx, syl) in fullSyllables.withIndex()) {
+            val ch = (0x4E00 + idx).toChar().toString()
+            rows += LexRow(ch, syl, syl, 250_000)
+        }
+        // Add real-world adversarial multi-syllable traps that previously caused shan'g / jia'n / ni'a'n / mao'fa'n
+        rows += listOf(
+            LexRow("啊", "a", "a", 5_366_043),
+            LexRow("哦", "o", "o", 3_563_330),
+            LexRow("饿", "e", "e", 606_677),
+            LexRow("你", "ni", "ni", 22_000_000),
+            LexRow("那", "na", "na", 12_000_000),
+            LexRow("个", "ge", "ge", 15_000_000),
+            LexRow("吗", "ma", "ma", 8_000_000),
+            LexRow("上", "shang", "shang", 5_075_000),
+            LexRow("闪光", "shan guang", "shanguang", 107_815),
+            LexRow("山谷", "shan gu", "shangu", 82_365),
+            LexRow("见", "jian", "jian", 4_030_000),
+            LexRow("佳能", "jia neng", "jianeng", 133_305),
+            LexRow("加你", "jia ni", "jiani", 8_595),
+            LexRow("年", "nian", "nian", 3_520_000),
+            LexRow("你安", "ni an", "nian", 150_000),
+            LexRow("你啊", "ni a", "nia", 120_000),
+            LexRow("边", "bian", "bian", 3_200_000),
+            LexRow("比啊", "bi a", "bia", 110_000),
+            LexRow("猫", "mao", "mao", 600_000),
+            LexRow("毛发", "mao fa", "maofa", 180_000),
+            LexRow("冒犯", "mao fan", "maofan", 22_700),
+            LexRow("看", "kan", "kan", 15_000_000),
+            LexRow("写", "xie", "xie", 5_000_000),
+            LexRow("看戏", "kan xi", "kanxi", 500_000),
+            LexRow("过", "guo", "guo", 10_000_000),
+            LexRow("毛骨", "mao gu", "maogu", 80_000),
+            LexRow("上面", "shang mian", "shangmian", 650_000),
+            LexRow("仙女", "xian nv", "xiannv", 220_000),
+            LexRow("穷", "qiong", "qiong", 900_000),
+            LexRow("窘", "jiong", "jiong", 400_000),
+            LexRow("熊", "xiong", "xiong", 1_100_000),
+            LexRow("为什么", "wei shen me", "weishenme", 500_907),
+            LexRow("为什么要", "wei shen me yao", "weishenmeyao", 180_815),
+            LexRow("你会", "ni hui", "nihui", 449_705),
+            LexRow("您还没有", "nin hai mei you", "ninhaimeiyou", 410_090),
+            LexRow("西安", "xi an", "xian", 300_000),
+        )
+        // Inject generic coda-stealing opened phrases for every syllable whose prefix is also a syllable (e.g. ban/bang, fan/fang, xian/xiang)
+        for (syl in fullSyllables) {
+            if (syl.length >= 3) {
+                val stem = syl.dropLast(1)
+                val tail = syl.last()
+                if (stem in realSyllables) {
+                    val ext = when (tail) {
+                        'g' -> "guang"
+                        'n' -> "neng"
+                        'o' -> "ou"
+                        'e' -> "en"
+                        'a' -> "an"
+                        else -> null
+                    }
+                    if (ext != null && ext in realSyllables) {
+                        rows += LexRow("假词", "$stem $ext", stem + ext, 140_000)
+                    }
+                }
+            }
+        }
+
+        val decoder = PinyinDecoder(realSyllables)
+        decoder.lexicon = MemoryLexicon(rows)
+
+        // 1. Every single valid syllable in Mandarin stays 1 syllable with zero apostrophes
+        for (syl in fullSyllables) {
+            val res = decoder.decode(syl, fuzzy = false)
+            assertFalse("Unexpected split in preedit for '$syl': ${res.preedit}", '\'' in res.preedit)
+            assertTrue("Missing candidates for '$syl'", res.candidates.isNotEmpty())
+            val topSyl = res.candidates.first().syllables
+            assertFalse(
+                "Expected 1-syllable top candidate for '$syl', got '${res.candidates.first().text}' ($topSyl)",
+                ' ' in topSyl,
+            )
+        }
+
+        // 2. Canonical bug reports + sibling multi-syllable cases check BOTH preedit AND #1 candidate
+        val shang = decoder.decode("shang", fuzzy = false)
+        assertEquals("shang", shang.preedit)
+        assertEquals("上", shang.candidates.first().text)
+
+        val jian = decoder.decode("jian", fuzzy = false)
+        assertEquals("jian", jian.preedit)
+        assertEquals("见", jian.candidates.first().text)
+
+        val nian = decoder.decode("nian", fuzzy = false)
+        assertEquals("nian", nian.preedit)
+        assertEquals("年", nian.candidates.first().text)
+
+        val maofan = decoder.decode("maofan", fuzzy = false)
+        assertEquals("mao'fan", maofan.preedit)
+        assertEquals("冒犯", maofan.candidates.first().text)
+
+        val kanxie = decoder.decode("kanxie", fuzzy = false)
+        assertEquals("kan'xie", kanxie.preedit)
+        assertEquals("看写", kanxie.candidates.first().text)
+
+        val maoguo = decoder.decode("maoguo", fuzzy = false)
+        assertEquals("mao'guo", maoguo.preedit)
+        assertEquals("猫过", maoguo.candidates.first().text)
+
+        // 3. Mid-typing incomplete syllable prefixes never shatter into trailing 'a'/'o' splits
+        for (incomplete in listOf("nia", "bia", "pia", "mia", "tia", "dua", "tua", "nua", "lua", "zua", "cua", "sua", "jua", "qua", "xua", "yua", "jio", "qio", "xio")) {
+            val mid = decoder.decode(incomplete, fuzzy = false)
+            assertEquals("Unexpected split while mid-typing '$incomplete'", incomplete, mid.preedit)
+        }
+        val maonia = decoder.decode("maonia", fuzzy = false)
+        assertEquals("mao'nia", maonia.preedit)
+        assertEquals("猫年", maonia.candidates.first().text)
+
+        val maobia = decoder.decode("maobia", fuzzy = false)
+        assertEquals("mao'bia", maobia.preedit)
+        assertEquals("猫边", maobia.candidates.first().text)
+
+        assertEquals("shang'm", decoder.decode("shangm", fuzzy = false).preedit)
+        assertEquals("上面", decoder.decode("shangm", fuzzy = false).candidates.first().text)
+        assertEquals("xian'n", decoder.decode("xiann", fuzzy = false).preedit)
+        assertEquals("仙女", decoder.decode("xiann", fuzzy = false).candidates.first().text)
+
+        // 4. Exact-length abbreviations outrank unrequested longer phrases
+        assertEquals("为什么", decoder.decode("wsm", fuzzy = false).candidates.first().text)
+        assertEquals("你会", decoder.decode("nh", fuzzy = false).candidates.first().text)
+
+        // 5. Explicit user apostrophe is always preserved
+        assertEquals("xi'an", decoder.decode("xi'an", fuzzy = false).preedit)
+        assertEquals("西安", decoder.decode("xi'an", fuzzy = false).candidates.first().text)
+        assertEquals("ni'a", decoder.decode("ni'a", fuzzy = false).preedit)
+    }
+
+    @Test
+    fun updateMetadataFormatsRedirectMirrorsAndApkVerification() {
+        // 1. GitHub Releases API JSON with browser_download_url and sha256 digest
+        val ghApiJson = """
+            {
+              "tag_name": "v0.1.11",
+              "body": "修复拼音切分与内置多源自动更新",
+              "assets": [
+                {
+                  "name": "myboard-0.1.11.apk",
+                  "content_type": "application/vnd.android.package-archive",
+                  "size": 53633512,
+                  "digest": "sha256:1697f8fca157ae0f9a2fa14bed51c5354b112ff5ed2e1a12544b0745fd513f49",
+                  "browser_download_url": "https://github.com/n1ght-ow/myboard/releases/download/v0.1.11/myboard-0.1.11.apk",
+                  "url": "https://api.github.com/repos/n1ght-ow/myboard/releases/assets/123"
+                }
+              ]
+            }
+        """.trimIndent()
+        val parsedGh = parseLatestRelease(ghApiJson)
+        assertNotNull(parsedGh)
+        assertEquals("0.1.11", parsedGh!!.version)
+        assertEquals("https://github.com/n1ght-ow/myboard/releases/download/v0.1.11/myboard-0.1.11.apk", parsedGh.assetUrl)
+        assertEquals(53633512L, parsedGh.size)
+        assertEquals("1697f8fca157ae0f9a2fa14bed51c5354b112ff5ed2e1a12544b0745fd513f49", parsedGh.sha256)
+
+        // 2. Lightweight update.json manifest
+        val manifestJson = """
+            {
+              "version": "0.1.12",
+              "versionCode": 15,
+              "apkUrl": "https://github.com/n1ght-ow/myboard/releases/download/v0.1.12/myboard-0.1.12.apk",
+              "size": 54000000,
+              "sha256": "sha256:abcdef0123456789",
+              "notes": "直连与代理双通"
+            }
+        """.trimIndent()
+        val parsedManifest = parseLatestRelease(manifestJson)
+        assertNotNull(parsedManifest)
+        assertEquals("0.1.12", parsedManifest!!.version)
+        assertEquals(15, parsedManifest.versionCode)
+        assertEquals("abcdef0123456789", parsedManifest.sha256)
+
+        // 3. jsDelivr GitHub package versions JSON
+        val jsDelivrJson = """{"tags":{},"versions":["0.1.8","0.1.10","0.1.9"]}"""
+        val parsedCdn = parseLatestRelease(jsDelivrJson)
+        assertNotNull(parsedCdn)
+        assertEquals("0.1.10", parsedCdn!!.version)
+        assertEquals("https://github.com/n1ght-ow/myboard/releases/download/v0.1.10/myboard-0.1.10.apk", parsedCdn.assetUrl)
+
+        // 4. Redirect tag parsing for both GitHub direct and domestic mirror Location headers
+        val directTag = parseLatestRedirectTag("https://github.com/n1ght-ow/myboard/releases/tag/v0.1.10")
+        val mirrorTag = parseLatestRedirectTag("/https://github.com/n1ght-ow/myboard/releases/tag/v0.1.10?foo=1")
+        assertEquals("0.1.10", directTag?.version)
+        assertEquals("0.1.10", mirrorTag?.version)
+        assertEquals("https://github.com/n1ght-ow/myboard/releases/download/v0.1.10/myboard-0.1.10.apk", mirrorTag?.assetUrl)
+
+        // 5. Version & versionCode comparison
+        assertTrue(isNewerVersion("0.1.10", "0.1.9"))
+        assertTrue(isNewerRelease(RemoteRelease("0.1.10", "", "https://example.com/a.apk", 0L, versionCode = 14), "0.1.10", 13))
+        assertFalse(isNewerRelease(RemoteRelease("0.1.10", "", "https://example.com/a.apk", 0L, versionCode = 13), "0.1.10", 13))
+
+        // 6. APK ZIP header + EOCD + size + SHA-256 verification (rejects truncated/HTML payloads)
+        val tempDir = Files.createTempDirectory("n1ghtkey-upd-test").toFile()
+        try {
+            val validApk = File(tempDir, "valid.apk")
+            var rng = 0x13579BDF
+            val payload = ByteArray(4096) {
+                rng = rng * 1103515245 + 12345
+                (rng ushr 16).toByte()
+            }
+            ZipOutputStream(validApk.outputStream()).use { zos ->
+                zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
+                zos.write(payload)
+                zos.closeEntry()
+            }
+            val digest = sha256Hex(validApk)
+            val strictRelease = RemoteRelease("0.1.11", "", "https://example.com/a.apk", validApk.length(), sha256 = digest)
+            val unknownSizeRelease = RemoteRelease("0.1.11", "", "https://example.com/a.apk", 0L)
+            assertTrue(verifyDownloadedFile(validApk, strictRelease))
+            assertTrue(verifyDownloadedFile(validApk, unknownSizeRelease))
+            assertFalse(verifyDownloadedFile(validApk, strictRelease.copy(sha256 = "0000")))
+
+            // Truncated ZIP (starts with PK\x03\x04 and >1KB, but cut off before EOCD) MUST fail even when size=0 & sha256=""
+            val truncatedApk = File(tempDir, "truncated.apk")
+            truncatedApk.writeBytes(validApk.readBytes().copyOf(validApk.length().toInt() - 18))
+            assertTrue(truncatedApk.length() > 1024L)
+            assertFalse(verifyDownloadedFile(truncatedApk, unknownSizeRelease))
+
+            // HTML mirror error page disguised as .apk MUST fail
+            val htmlFile = File(tempDir, "error.apk")
+            htmlFile.writeText("<!DOCTYPE html><html><body>Rate limit exceeded" + " ".repeat(2048) + "</body></html>")
+            assertFalse(verifyDownloadedFile(htmlFile, unknownSizeRelease))
+        } finally {
+            tempDir.deleteRecursively()
+        }
     }
 }
 
