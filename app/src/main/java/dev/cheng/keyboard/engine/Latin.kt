@@ -41,9 +41,19 @@ class LatinDecoder {
 
     fun load(words: Sequence<Pair<String, Int>>) {
         val built = Node()
+        var loadedCount = 0
         for ((word, freq) in words) {
             if (word.length == 1 && word != "a" && word != "i") continue
             insert(built, word, freq, isBase = true)
+            loadedCount++
+        }
+        if (loadedCount >= 1_000) {
+            for ((word, floorFreq) in defaultTechWords) {
+                val existing = walkFrom(built, word)?.baseFreq ?: 0
+                if (existing < floorFreq) {
+                    insert(built, word, floorFreq, isBase = true)
+                }
+            }
         }
         for ((word, freq) in extra) insert(built, word, freq, isBase = false)
         root = built
@@ -137,10 +147,20 @@ class LatinDecoder {
         }
 
         val strongPrefixMatch = credibleExact || completions.any { it.first != prefix && it.second >= 500 }
-        if (prefix.length >= 2 && (!strongPrefixMatch || completions.size < 3)) {
+        val hasBorderTap = touchSamples.any { sample ->
+            sample != null && sample.alternatives.any { it.penalty <= 0.35f }
+        }
+        if (prefix.length >= 2 && (!strongPrefixMatch || completions.size < 3 || hasBorderTap)) {
             for (hit in fuzzyMatches(prefix, touchHints, touchSamples)) {
                 val baseScore = ln(hit.freq.coerceAtLeast(1).toDouble()) - hit.cost * 3.2 + contextBonus(hit.word)
-                val adjusted = if (strongPrefixMatch) baseScore - 8.0 else baseScore
+                val adjusted = when {
+                    !strongPrefixMatch -> baseScore
+                    hit.cost <= 0.60 && credibleExact && hit.freq.toLong() > (exactWord?.freq ?: 0).toLong() * 8L ->
+                        baseScore + 28.5
+                    hit.cost <= 0.60 && !credibleExact -> baseScore - 1.2
+                    hit.cost <= 0.60 -> baseScore - 2.0
+                    else -> baseScore - 8.0
+                }
                 offer(hit.word, hit.freq, adjusted)
             }
         }
@@ -311,12 +331,13 @@ class LatinDecoder {
         touchHints: List<String> = emptyList(),
         touchSamples: List<TouchSample?> = emptyList(),
     ): List<FuzzyHit> {
-        val maxCost = if (typed.length <= 4) 1.85 else 2.9
+        val fullMaxCost = if (typed.length <= 4) 1.85 else 2.9
+        val minBranchBest = if (root.best >= 1_000_000) 100 else 1
         val hits = HashMap<String, FuzzyHit>()
         var visits = 0
 
-        fun dfs(node: Node, pos: Int, cost: Double) {
-            if (cost > maxCost || visits > 1800) return
+        fun dfs(node: Node, pos: Int, cost: Double, lastChar: Char, maxCost: Double, maxVisits: Int) {
+            if (cost > maxCost || visits > maxVisits) return
             visits++
             if (pos == typed.length) {
                 val w = node.word
@@ -327,8 +348,10 @@ class LatinDecoder {
                 if (cost + 1.45 <= maxCost) {
                     for (idx in node.next.indices) {
                         val child = node.next[idx] ?: continue
+                        if (child.best < minBranchBest) continue
                         val addCost = if (idx == 26) 0.6 else 1.45
-                        dfs(child, pos, cost + addCost)
+                        val nextChar = if (idx == 26) '\'' else 'a' + idx
+                        dfs(child, pos, cost + addCost, nextChar, maxCost, maxVisits)
                     }
                 }
                 return
@@ -337,7 +360,7 @@ class LatinDecoder {
             val ch = typed[pos]
             val exactIdx = indexOf(ch)
             if (exactIdx != null) {
-                node.next[exactIdx]?.let { dfs(it, pos + 1, cost) }
+                node.next[exactIdx]?.let { dfs(it, pos + 1, cost, ch, maxCost, maxVisits) }
             }
 
             // Adjacent character transposition (e.g. "teh" -> "the", "recieve" -> "receive")
@@ -346,7 +369,7 @@ class LatinDecoder {
                 val secondIdx = indexOf(typed[pos])
                 if (firstIdx != null && secondIdx != null) {
                     node.next[firstIdx]?.next?.get(secondIdx)?.let { transposed ->
-                        dfs(transposed, pos + 2, cost + 1.05)
+                        dfs(transposed, pos + 2, cost + 1.05, typed[pos], maxCost, maxVisits)
                     }
                 }
             }
@@ -356,6 +379,7 @@ class LatinDecoder {
             val sample = touchSamples.getOrNull(pos)
             for (idx in 0 until 26) {
                 val child = node.next[idx] ?: continue
+                if (child.best < minBranchBest) continue
                 val candidateChar = 'a' + idx
                 if (candidateChar == ch) continue
                 val spatialCost = spatialSubstitutionCost(candidateChar, sample, candidateChar in spatial)?.toDouble()
@@ -367,33 +391,47 @@ class LatinDecoder {
                     else -> continue
                 }
                 if (cost + subCost <= maxCost) {
-                    dfs(child, pos + 1, cost + subCost)
+                    dfs(child, pos + 1, cost + subCost, candidateChar, maxCost, maxVisits)
                 }
             }
 
             // Omitted apostrophe inside word (e.g. user omitted ' in contraction)
             node.next[26]?.let { apoChild ->
-                if (cost + 0.55 <= maxCost) dfs(apoChild, pos, cost + 0.55)
+                if (cost + 0.55 <= maxCost) dfs(apoChild, pos, cost + 0.55, '\'', maxCost, maxVisits)
             }
 
             // Missing character in typed input (insertion into target word, e.g. "thnks" -> "thanks")
-            if (typed.length >= 3 && cost + 1.65 <= maxCost) {
+            if (typed.length >= 3 && cost + 1.10 <= maxCost) {
                 for (idx in 0 until 26) {
                     val child = node.next[idx] ?: continue
-                    dfs(child, pos, cost + 1.65)
+                    if (child.best < minBranchBest) continue
+                    val insChar = 'a' + idx
+                    val insCost = if (insChar == lastChar) 1.10 else 1.65
+                    if (cost + insCost <= maxCost) {
+                        dfs(child, pos, cost + insCost, insChar, maxCost, maxVisits)
+                    }
                 }
             }
 
             // Extra character in typed input (deletion from typed input, e.g. "helllo" -> "hello")
-            if (typed.length >= 3 && cost + 1.55 <= maxCost) {
-                val dupBonus = if (pos > 0 && typed[pos] == typed[pos - 1]) 1.15 else 1.55
+            if (typed.length >= 3 && cost + 1.15 <= maxCost) {
+                val dupBonus = when {
+                    pos > 0 && typed[pos] == typed[pos - 1] -> 1.15
+                    pos == 0 -> 1.75
+                    else -> 1.55
+                }
                 if (cost + dupBonus <= maxCost) {
-                    dfs(node, pos + 1, cost + dupBonus)
+                    dfs(node, pos + 1, cost + dupBonus, lastChar, maxCost, maxVisits)
                 }
             }
         }
 
-        dfs(root, 0, 0.0)
+        val firstPassMax = minOf(fullMaxCost, 1.75)
+        dfs(root, 0, 0.0, '\u0000', firstPassMax, 2500)
+        if (fullMaxCost > firstPassMax && hits.values.none { it.cost <= 1.35 && it.freq >= 5_000 }) {
+            visits = 0
+            dfs(root, 0, 0.0, '\u0000', fullMaxCost, 4500)
+        }
         return hits.values
             .sortedByDescending { ln(it.freq.coerceAtLeast(1).toDouble()) - it.cost * 3.2 }
             .take(8)
@@ -425,8 +463,10 @@ class LatinDecoder {
         published++
     }
 
-    private fun walk(prefix: String): Node? {
-        var node = root
+    private fun walk(prefix: String): Node? = walkFrom(root, prefix)
+
+    private fun walkFrom(startNode: Node, prefix: String): Node? {
+        var node = startNode
         for (ch in prefix) {
             node = node.next[indexOf(ch) ?: return null] ?: return null
         }
@@ -516,6 +556,62 @@ class LatinDecoder {
             "shell" to "she'll",
             "hell" to "he'll",
             "its" to "it's",
+        )
+
+        val defaultTechWords = listOf(
+            "api" to 8_000,
+            "apk" to 8_000,
+            "bug" to 12_000,
+            "sdk" to 6_000,
+            "ide" to 5_000,
+            "cli" to 5_000,
+            "gui" to 5_000,
+            "pdf" to 12_000,
+            "ppt" to 12_000,
+            "docx" to 6_000,
+            "xlsx" to 6_000,
+            "csv" to 6_000,
+            "usb" to 8_000,
+            "cpu" to 8_000,
+            "gpu" to 8_000,
+            "npu" to 5_000,
+            "ssd" to 6_000,
+            "ios" to 10_000,
+            "macos" to 6_000,
+            "linux" to 8_000,
+            "ubuntu" to 5_000,
+            "android" to 12_000,
+            "kotlin" to 10_000,
+            "golang" to 6_000,
+            "flutter" to 6_000,
+            "html" to 8_000,
+            "css" to 8_000,
+            "json" to 10_000,
+            "yaml" to 6_000,
+            "xml" to 8_000,
+            "sql" to 8_000,
+            "http" to 10_000,
+            "https" to 12_000,
+            "url" to 10_000,
+            "dns" to 6_000,
+            "ssh" to 6_000,
+            "vpn" to 10_000,
+            "wifi" to 15_000,
+            "wlan" to 6_000,
+            "nfc" to 6_000,
+            "git" to 10_000,
+            "github" to 12_000,
+            "gitlab" to 6_000,
+            "docker" to 8_000,
+            "redis" to 6_000,
+            "mysql" to 6_000,
+            "sqlite" to 6_000,
+            "chatgpt" to 10_000,
+            "deepseek" to 10_000,
+            "openai" to 8_000,
+            "vscode" to 8_000,
+            "adb" to 6_000,
+            "ota" to 6_000,
         )
 
         fun isQwertyNeighbor(left: Char, right: Char): Boolean {

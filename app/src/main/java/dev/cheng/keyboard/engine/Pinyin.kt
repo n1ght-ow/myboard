@@ -12,7 +12,10 @@ import kotlin.math.ln
 
 data class Seg(val parts: List<String>, val partial: Boolean)
 
-class SylTrie(words: Collection<String>) {
+class SylTrie(
+    words: Collection<String>,
+    extraAliases: List<Pair<String, String>> = emptyList(),
+) {
     private class Node {
         val next = arrayOfNulls<Node>(26)
         var canonical: String? = null
@@ -25,6 +28,11 @@ class SylTrie(words: Collection<String>) {
         cleaned.forEach { insert(it, it) }
         for ((alias, target) in buildSyllableAliases(cleaned)) {
             insert(alias, target)
+        }
+        for ((alias, target) in extraAliases) {
+            if (alias !in cleaned && target in cleaned) {
+                insert(alias, target)
+            }
         }
     }
 
@@ -378,10 +386,41 @@ private fun swapFinals(syllable: String): List<String> {
     return out
 }
 
+private fun expandSyllableWithCost(input: String): List<Pair<String, Int>> {
+    val bestCost = LinkedHashMap<String, Int>()
+    val queue = ArrayDeque<Pair<String, Int>>()
+    bestCost[input] = 0
+    queue.add(input to 0)
+    while (queue.isNotEmpty() && bestCost.size < 16) {
+        val (current, dist) = queue.removeFirst()
+        if (dist >= 2) continue
+        for (next in swapInitials(current) + swapFinals(current)) {
+            if (next !in bestCost && bestCost.size < 16) {
+                bestCost[next] = dist + 1
+                queue.add(next to (dist + 1))
+            }
+        }
+    }
+    return bestCost.entries.map { it.key to it.value }
+}
+
 data class Decode(val preedit: String, val candidates: List<Candidate>)
 
 class PinyinDecoder(syllables: Set<String>) {
     private val trie = SylTrie(syllables)
+    private val fuzzyTrie by lazy {
+        SylTrie(
+            syllables,
+            extraAliases = listOf(
+                "tin" to "ting",
+                "din" to "ding",
+                "len" to "leng",
+                "suang" to "shuang",
+                "zuang" to "zhuang",
+                "cuang" to "chuang",
+            ),
+        )
+    }
     private val syllableList = syllables.filter { syllable -> syllable.isNotEmpty() && syllable.all { it in 'a'..'z' } }
 
     @Volatile
@@ -408,18 +447,20 @@ class PinyinDecoder(syllables: Set<String>) {
         val letters = text.filter { it in 'a'..'z' }
         if (letters.isEmpty()) return Decode("'", emptyList())
 
-        val segs = segmentPinyin(text, trie)
+        val activeTrie = if (fuzzy) fuzzyTrie else trie
+        val segs = segmentPinyin(text, activeTrie)
         val full = segs.filter { !it.partial }
         val keepWritten = '\'' in text
-        val minFullSyllables = full
-            .filter { keepWritten || !shattersIncompleteTail(it.parts, trie) }
-            .minOfOrNull { it.parts.size } ?: Int.MAX_VALUE
-        val book = Book(minFullSyllables = minFullSyllables, fullLength = letters.length, keepWritten = keepWritten)
         // Keep partial segments both when last token is incomplete AND when last token is a 1-letter extensible syllable
         val open = segs.filter { seg ->
             seg.partial && seg.parts.isNotEmpty() &&
-                (!trie.isWord(seg.parts.last()) || (seg.parts.last().length == 1 && trie.hasExtension(seg.parts.last())))
+                (!activeTrie.isWord(seg.parts.last()) || (seg.parts.last().length == 1 && activeTrie.hasExtension(seg.parts.last())))
         }
+        val minFullSyllables = full
+            .filter { keepWritten || !shattersIncompleteTail(it.parts, activeTrie) }
+            .minOfOrNull { it.parts.size }
+            ?: if (open.isEmpty()) letters.length.coerceAtLeast(1) else Int.MAX_VALUE
+        val book = Book(minFullSyllables = minFullSyllables, fullLength = letters.length, keepWritten = keepWritten)
 
         val chosen = ArrayList<Seg>(6)
         for (seg in full) {
@@ -452,7 +493,10 @@ class PinyinDecoder(syllables: Set<String>) {
         val rankedPinyin = book.rank(pinyin)
 
         val primarySeg = chosen.getOrNull(primaryIndex)
-        val solid = primarySeg?.parts?.all { it.length >= 2 } == true && rankedPinyin.isNotEmpty()
+        val solid = primarySeg != null &&
+            !primarySeg.partial &&
+            primarySeg.parts.all { it.length >= 2 } &&
+            rankedPinyin.isNotEmpty()
         val wholeAbbrev = if (solid || letters.length !in 2..64) {
             emptyList()
         } else {
@@ -486,10 +530,26 @@ class PinyinDecoder(syllables: Set<String>) {
         val hadDirectFullOrAbbrevChinese = body.isNotEmpty()
 
         // Typo & transposition recovery when input is not a clean multi-letter syllable string or multi-initial abbreviation
+        val startsWithSyllable = trie.canonicalEndings(letters, 0).any { it.first >= 2 }
+        val hasStrongExactAbbrev = wholeAbbrev.any { !it.opened && it.freq >= 200_000 }
+        val cleanMidTyping = !solid &&
+            body.isNotEmpty() &&
+            open.any { seg ->
+                seg.parts.last().length >= 3 &&
+                    seg.parts.all { it.length >= 2 && it !in shengmu } &&
+                    !activeTrie.isWord(seg.parts.last())
+            }
+        val weakSolidComposition = solid &&
+            letters.length >= 4 &&
+            rankedPinyin.none { it.consumed == letters.length && !it.opened && it.pieces == 1 } &&
+            (rankedPinyin.firstOrNull()?.freq ?: 0) <= 80_000
         val shouldTryTypos = when {
-            letters.length !in 2..18 -> false
+            letters.length !in 2..22 -> false
+            cleanMidTyping -> false
             body.isEmpty() -> true
             pinyin.isEmpty() && wholeAbbrev.isEmpty() -> true
+            weakSolidComposition -> true
+            !solid && letters.length >= 4 && pinyin.isEmpty() && startsWithSyllable && !hasStrongExactAbbrev -> true
             !solid && letters.length >= 3 && !book.hasMultiAbbrevInitials(letters, wholeAbbrev) -> true
             else -> false
         }
@@ -514,7 +574,7 @@ class PinyinDecoder(syllables: Set<String>) {
         }
 
         if (touchSamples.isNotEmpty() && letters.length >= 2) {
-            val soft = book.softFirstLetter(letters, touchSamples)
+            val soft = book.softTouchVariants(letters, touchSamples)
             if (soft.isNotEmpty()) body = if (body.isEmpty()) soft else book.rank(body + soft)
         }
 
@@ -551,11 +611,44 @@ class PinyinDecoder(syllables: Set<String>) {
         if (en != null && '\'' !in text && letters.length >= 2) {
             val typedCased = rawLettersOnly.ifEmpty { letters }
             val exactEnFreq = en.exactFreq(letters)
-            if (!hadDirectFullOrAbbrevChinese && (exactEnFreq > 0 || (full.isEmpty() && open.isEmpty()))) {
+            val topZh = body.firstOrNull()
+            val invertedInitialFull = topZh != null &&
+                !solid &&
+                topZh.preedit.indexOf('\'') == 1 &&
+                topZh.preedit.substringAfter('\'').let { tail -> tail.length >= 2 && trie.isWord(tail) }
+            val credibleEnOverAbbrev = !solid &&
+                letters.length >= 3 &&
+                exactEnFreq >= 12_000 &&
+                !trie.hasPrefix(letters, 0) &&
+                (topZh?.freq ?: 0) < 800_000
+            val strongZhPrefix = trie.hasPrefix(letters, 0) &&
+                topZh != null &&
+                !topZh.typo &&
+                topZh.freq >= 500_000 &&
+                exactEnFreq < 20_000
+            val strongZh = solid || strongZhPrefix || (
+                topZh != null &&
+                    !credibleEnOverAbbrev &&
+                    !topZh.typo &&
+                    !topZh.opened &&
+                    topZh.pieces == 1 &&
+                    !invertedInitialFull &&
+                    topZh.freq >= 12_000
+                )
+            if (!strongZh && exactEnFreq > 0) {
+                val enSource = en.suggest(letters).filter { it.freq >= 50 || it.text.equals(letters, ignoreCase = true) }.take(2)
+                val enItems = enSource.map { cand ->
+                    val cased = applyCase(cand.text, typedCased)
+                    Scored(cased, "", cand.freq, 200.0, typedCased, false, letters.length)
+                }.filter { cand -> items.none { it.text.equals(cand.text, ignoreCase = true) } }
+                if (enItems.isNotEmpty()) {
+                    items.addAll(0, enItems)
+                }
+            } else if (!hadDirectFullOrAbbrevChinese && (exactEnFreq > 0 || (full.isEmpty() && open.isEmpty()))) {
                 val enSource = if (exactEnFreq > 0) {
                     en.suggest(letters).take(3)
                 } else {
-                    en.suggest(letters).filter { it.text.startsWith(letters) }.take(2)
+                    en.suggest(letters).filter { it.freq >= 50 && it.text.startsWith(letters) }.take(2)
                 }
                 val enItems = enSource.map { cand ->
                     val cased = applyCase(cand.text, typedCased)
@@ -564,10 +657,11 @@ class PinyinDecoder(syllables: Set<String>) {
                 if (enItems.isNotEmpty()) {
                     items.addAll(0, enItems)
                 }
-            } else if (letters.length >= 3 && exactEnFreq > 0) {
+            } else if (letters.length >= 2 && (exactEnFreq >= 1_000 || (exactEnFreq > 0 && rawLettersOnly.any { it.isUpperCase() }))) {
                 val cased = applyCase(letters, typedCased)
                 if (items.none { it.text.equals(cased, ignoreCase = true) }) {
-                    val insertAt = minOf(2, items.size)
+                    val hasUpper = rawLettersOnly.any { it.isUpperCase() }
+                    val insertAt = minOf(if (hasUpper) 2 else 3, items.size)
                     items.add(insertAt, Scored(cased, "", exactEnFreq, 50.0, typedCased, false, letters.length))
                 }
             }
@@ -820,15 +914,28 @@ class PinyinDecoder(syllables: Set<String>) {
             val shattered = !keepWritten && !seg.partial && shattersIncompleteTail(seg.parts, trie)
             val items = ArrayList<Scored>()
             val fetch = if (seg.parts.size == 1) 200 else 40
-            for (row in spell(seg.parts, boostUser = true, limit = fetch)) {
+            val exactRows = spell(seg.parts, boostUser = true, limit = fetch)
+            for ((idx, row) in exactRows.withIndex()) {
                 val whole = if (!seg.partial && seg.parts.size >= 3 && row.text.length >= 3) FULL_WORD_BONUS else 0.0
-                items += scored(row, wordScore(row.text, row.freq) + whole, preedit, false, used, shatteredTail = shattered)
+                val k = seg.parts.size.coerceAtLeast(1)
+                val tailHomophoneAdj = if (idx >= 2 && k >= 2 && row.freq < 50_000) -0.35 * (idx - 1) * k * k else 0.0
+                items += scored(row, wordScore(row.text, row.freq) + whole + tailHomophoneAdj, preedit, false, used, shatteredTail = shattered)
+            }
+            if (seg.parts.size >= 2) {
+                for ((altParts, penPerSyl) in phoneticVariants(seg.parts)) {
+                    val whole = if (!seg.partial && altParts.size >= 3) FULL_WORD_BONUS else 0.0
+                    val count = altParts.size
+                    val pen = count * count * penPerSyl
+                    for (row in spell(altParts, boostUser = true, limit = 16)) {
+                        items += scored(row, wordScore(row.text, row.freq) + whole - pen, preedit, false, used, shatteredTail = shattered)
+                    }
+                }
             }
             for (piece in cover(seg.parts)) {
                 if (piece.text.isEmpty()) continue
                 items += Scored(piece.text, piece.syllables, piece.freq, piece.score, preedit, false, used, piece.pieces, shatteredTail = shattered)
             }
-            if ((seg.partial || seg.parts.size >= 2) && seg.parts.isNotEmpty() && trie.hasExtension(seg.parts.last())) {
+            if ((seg.partial || seg.parts.size >= 2 || items.isEmpty()) && seg.parts.isNotEmpty() && trie.hasExtension(seg.parts.last())) {
                 val codaSplit = !seg.partial &&
                     seg.parts.size >= 2 &&
                     trie.canonicalOf(seg.parts[seg.parts.lastIndex - 1] + seg.parts.last()) != null
@@ -886,6 +993,14 @@ class PinyinDecoder(syllables: Set<String>) {
             val paths = tokenPaths(letters)
             for (token in paths) {
                 if (token.size > 12) continue
+                if (shattersIncompleteTail(token, trie)) continue
+                if (token.indices.any { idx ->
+                        idx > 0 &&
+                            token[idx].length == 1 &&
+                            token[idx][0] in "aeiouv" &&
+                            trie.canonicalOf(token[idx - 1] + token[idx]) == null &&
+                            trie.hasPrefix(token[idx - 1] + token[idx], 0)
+                    }) continue
                 val shortened = token.count { it.length < 2 || !trie.isWord(it) }
                 if (shortened == 0) continue
                 val key = buildString { for (part in token) append(part[0]) }
@@ -895,10 +1010,11 @@ class PinyinDecoder(syllables: Set<String>) {
                     if (parts.size < token.size || parts.size > token.size + 2) continue
                     if (!fits(parts, token)) continue
                     val extra = parts.size - token.size
-                    var penalty = 8.0 * shortened + 12.0 * extra
+                    val pCount = parts.size.coerceAtLeast(1)
+                    var penalty = pCount * (2.6 * shortened + 4.2 * extra)
                     for (index in token.indices) {
                         val syllable = parts[index]
-                        if ('v' !in token[index] && syllable.length >= 2 && syllable[1] == 'v') penalty += 18.0
+                        if ('v' !in token[index] && syllable.length >= 2 && syllable[1] == 'v') penalty += pCount * 4.5
                     }
                     items += scored(
                         row,
@@ -907,7 +1023,7 @@ class PinyinDecoder(syllables: Set<String>) {
                         false,
                         letters.length,
                         opened = extra > 0,
-                        untyped = extra * 2,
+                        untyped = if (extra > 0) 1 else 0,
                     )
                 }
             }
@@ -916,7 +1032,15 @@ class PinyinDecoder(syllables: Set<String>) {
 
         // Multi-word DP combining full syllables and abbreviated initials (e.g. "jintiantq" -> "今天天气", "wszgr" -> "我是中国人")
         fun mixedAbbreviations(letters: String): List<Scored> {
-            data class AbbrevPiece(val text: String, val syllables: String, val freq: Int, val score: Double, val hasMulti: Boolean)
+            data class AbbrevPiece(
+                val text: String,
+                val syllables: String,
+                val freq: Int,
+                val linearScore: Double,
+                val hasMulti: Boolean,
+                val pieces: Int,
+                val extra: Int,
+            )
 
             val items = ArrayList<Scored>()
             val paths = tokenPaths(letters)
@@ -924,14 +1048,22 @@ class PinyinDecoder(syllables: Set<String>) {
                 if (token.size !in 2..20) continue
                 val shortenedCount = token.count { it.length < 2 || !trie.isWord(it) }
                 if (shortenedCount == 0) continue
+                val lastTok = token.last()
+                if (shortenedCount == 1 && (lastTok.length < 2 || !trie.isWord(lastTok)) && trie.hasExtension(lastTok)) {
+                    continue
+                }
+                // Abbreviated tokens must be consonant initials/prefixes, never vowel splits like "mao'bi'a"
+                if (token.any { (it.length < 2 || !trie.isWord(it)) && it[0] in "aeiouv" }) continue
+                if (shattersIncompleteTail(token, trie)) continue
 
                 val dp = Array(token.size + 1) { ArrayList<AbbrevPiece>() }
-                dp[0].add(AbbrevPiece("", "", 0, 0.0, false))
+                dp[0].add(AbbrevPiece("", "", 0, 0.0, false, pieces = 0, extra = 0))
                 val maxSpan = minOf(5, token.size)
 
                 for (end in 1..token.size) {
                     val found = ArrayList<AbbrevPiece>()
                     for (start in maxOf(0, end - maxSpan) until end) {
+                        if (token.size >= 2 && start == 0 && end == token.size) continue
                         if (dp[start].isEmpty()) continue
                         val span = token.subList(start, end)
                         val spanShortened = span.count { it.length < 2 || !trie.isWord(it) }
@@ -939,33 +1071,53 @@ class PinyinDecoder(syllables: Set<String>) {
                             (start == 0 && token.size >= 3) ||
                                 (end == token.size && start >= 2)
                             )
-                        val candidatesForSpan: List<Pair<LexRow, Double>> = when {
+                        val candidatesForSpan: List<Triple<LexRow, Double, Int>> = when {
                             spanShortened == 0 -> {
+                                val sLen = span.size
+                                val cohesion = 1.4 * (sLen - 1).coerceAtLeast(0)
                                 spell(span, boostUser = (start == 0 && end == token.size)).take(3).map { row ->
-                                    row to wordScore(row.text, row.freq)
+                                    val singlePen = when {
+                                        sLen != 1 || token.size <= 1 -> 0.0
+                                        start > 0 && row.text in grammaticalParticles -> 1.4
+                                        else -> 5.2
+                                    }
+                                    Triple(row, sLen * ln(row.freq.coerceAtLeast(1).toDouble()) + cohesion - singlePen, 0)
                                 }
                             }
                             span.size == 1 && allowSingleShort -> {
-                                charsOf(span[0]).take(3).map { row ->
-                                    val umlautPen = if ('v' !in span[0] && row.syllables.length >= 2 && row.syllables[1] == 'v') 18.0 else 0.0
-                                    row to (wordScore(row.text, row.freq) - 10.0 - umlautPen)
+                                val prefixHasShort = start > 0 && token.subList(0, start).any { it.length < 2 || !trie.isWord(it) }
+                                charsOf(span[0]).take(6).map { row ->
+                                    val umlautPen = if ('v' !in span[0] && row.syllables.length >= 2 && row.syllables[1] == 'v') 5.0 else 0.0
+                                    val clauseEndAdj = if (end == token.size && token.size >= 3 && row.text == "把") -1.8 else 0.0
+                                    val particleBonus = if (end == token.size && start >= 2 && row.text in clauseFinalParticles) 2.0 else 0.0
+                                    val chainedShortPen = if (prefixHasShort && row.text !in clauseFinalParticles) 4.5 else 0.0
+                                    Triple(
+                                        row,
+                                        ln(row.freq.coerceAtLeast(1).toDouble()) - 5.2 - umlautPen - chainedShortPen + clauseEndAdj + particleBonus,
+                                        0,
+                                    )
                                 }
                             }
                             span.size >= 2 -> {
-                                abbrevSpan(span, allowOneExtra = (end == token.size)).take(3)
+                                abbrevSpanLinear(span, allowOneExtra = (end == token.size)).take(24)
                             }
                             else -> emptyList()
                         }
                         if (candidatesForSpan.isEmpty()) continue
                         val isMultiSpan = span.size >= 2
                         for (prev in dp[start]) {
-                            for ((row, spanScore) in candidatesForSpan) {
+                            val stepPen = if (prev.pieces == 0) 0.0 else 5.5
+                            val prevIsDay = prev.text in dayPrefixes
+                            for ((row, spanScore, spanExtra) in candidatesForSpan) {
+                                val collocationBonus = if (prevIsDay && row.text in dayCollocations) 4.2 else 0.0
                                 found += AbbrevPiece(
                                     prev.text + row.text,
                                     joinSyl(prev.syllables, row.syllables),
                                     if (prev.text.isEmpty()) row.freq else minOf(prev.freq, row.freq),
-                                    prev.score + spanScore,
+                                    prev.linearScore + spanScore + collocationBonus - stepPen,
                                     prev.hasMulti || isMultiSpan,
+                                    prev.pieces + 1,
+                                    prev.extra + spanExtra,
                                 )
                             }
                         }
@@ -974,37 +1126,62 @@ class PinyinDecoder(syllables: Set<String>) {
                     for (cand in found) {
                         if (cand.text.isEmpty()) continue
                         val existing = dedup[cand.text]
-                        if (existing == null || cand.score > existing.score) dedup[cand.text] = cand
+                        if (existing == null || cand.linearScore > existing.linearScore) dedup[cand.text] = cand
                     }
-                    dp[end] = ArrayList(dedup.values.sortedByDescending { it.score }.take(3))
+                    dp[end] = ArrayList(dedup.values.sortedByDescending { it.linearScore }.take(5))
                 }
 
                 val preedit = token.joinToString("'")
                 for (piece in dp[token.size]) {
                     if (piece.text.isNotEmpty() && piece.hasMulti) {
-                        items += Scored(piece.text, piece.syllables, piece.freq, piece.score, preedit, false, letters.length)
+                        val totalK = (token.size + piece.extra).coerceAtLeast(1)
+                        val multiPieceAdj = if (piece.pieces > 1) 2.6 + 0.75 * (piece.pieces - 2).coerceAtLeast(0) else 0.0
+                        val avgPerSyl = piece.linearScore / totalK.toDouble() - multiPieceAdj
+                        val mappedScore = totalK.toDouble() * totalK * avgPerSyl +
+                            FRAGMENT_PENALTY * (piece.pieces - 1).coerceAtLeast(0)
+                        items += Scored(
+                            piece.text,
+                            piece.syllables,
+                            piece.freq,
+                            mappedScore,
+                            preedit,
+                            false,
+                            letters.length,
+                            pieces = piece.pieces.coerceAtLeast(1),
+                            opened = piece.extra > 0,
+                            untyped = if (piece.extra > 0) 1 else 0,
+                        )
                     }
                 }
             }
             return items
         }
 
-        private fun abbrevSpan(span: List<String>, allowOneExtra: Boolean): List<Pair<LexRow, Double>> {
+        private fun abbrevSpanLinear(span: List<String>, allowOneExtra: Boolean): List<Triple<LexRow, Double, Int>> {
             val key = buildString { for (part in span) append(normalizePrefix(part)[0]) }
             val shortened = span.count { it.length < 2 || !trie.isWord(it) }
             val maxParts = if (allowOneExtra) span.size + 1 else span.size
-            val out = ArrayList<Pair<LexRow, Double>>()
-            for (row in initialsQuery(key, 64, exactOnly = !allowOneExtra)) {
+            val out = ArrayList<Triple<LexRow, Double, Int>>()
+            val exactLimit = if (key.length == 2) 160 else 80
+            val candidateRows = if (allowOneExtra) {
+                (initialsQuery(key, exactLimit, exactOnly = true) + initialsQuery(key, 64, exactOnly = false))
+                    .distinctBy { it.text to it.syllables }
+            } else {
+                initialsQuery(key, exactLimit, exactOnly = true)
+            }
+            for (row in candidateRows) {
                 val parts = row.syllables.split(' ')
                 if (parts.size < span.size || parts.size > maxParts) continue
                 if (!fits(parts, span)) continue
                 val extra = parts.size - span.size
-                var penalty = 8.0 * shortened + 12.0 * extra
+                var linearPen = 4.2 * shortened + 4.5 * extra
                 for (index in span.indices) {
                     val syllable = parts[index]
-                    if ('v' !in span[index] && syllable.length >= 2 && syllable[1] == 'v') penalty += 18.0
+                    if ('v' !in span[index] && syllable.length >= 2 && syllable[1] == 'v') linearPen += 4.5
                 }
-                out += row to (wordScore(row.text, row.freq) - penalty)
+                val pCount = parts.size
+                val cohesion = 0.8 * (pCount - 1).coerceAtLeast(0)
+                out += Triple(row, pCount * ln(row.freq.coerceAtLeast(1).toDouble()) + cohesion - linearPen, extra)
             }
             return out.sortedByDescending { it.second }
         }
@@ -1037,7 +1214,7 @@ class PinyinDecoder(syllables: Set<String>) {
             val extraSplits = if (minSyl < Int.MAX_VALUE && k > minSyl) k - minSyl else 0
             val splitUnit = if (minSyl == 1) SINGLE_SYLLABLE_SPLIT_PENALTY else SPLIT_PENALTY
             val openPenalty = if (item.opened) {
-                OPENED_PENALTY + 0.8 * (item.untyped - 1).coerceAtLeast(0)
+                OPENED_PENALTY + 0.08 * (item.untyped - 1).coerceAtLeast(0)
             } else {
                 0.0
             }
@@ -1048,27 +1225,46 @@ class PinyinDecoder(syllables: Set<String>) {
         fun fuzzy(seg: Seg): List<Scored> {
             if (seg.parts.isEmpty() || seg.parts.size > 6) return emptyList()
             val used = typedLength(seg.parts)
+            val maxSubSyls = minOf(3, seg.parts.size)
+            data class FuzzyPath(val parts: List<String>, val subSyls: Int, val featureEdits: Int)
+            var beam = listOf(FuzzyPath(emptyList(), 0, 0))
+            for (part in seg.parts) {
+                val options = LinkedHashMap<String, Int>()
+                for ((variant, dist) in expandSyllableWithCost(part)) {
+                    val canonical = trie.canonicalOf(variant) ?: continue
+                    val prev = options[canonical]
+                    if (prev == null || dist < prev) options[canonical] = dist
+                    if (options.size >= 5) break
+                }
+                if (options.isEmpty()) return emptyList()
+                val nextBeam = ArrayList<FuzzyPath>(beam.size * options.size)
+                for (prefix in beam) {
+                    for ((alt, dist) in options) {
+                        val nextSub = prefix.subSyls + if (dist > 0) 1 else 0
+                        val nextEdits = prefix.featureEdits + dist
+                        if (nextSub > maxSubSyls || nextEdits > 4) continue
+                        nextBeam += FuzzyPath(prefix.parts + alt, nextSub, nextEdits)
+                    }
+                }
+                nextBeam.sortWith(compareBy<FuzzyPath> { it.featureEdits }.thenBy { it.subSyls })
+                beam = nextBeam.take(18)
+            }
+
             val items = ArrayList<Scored>()
-            for (index in seg.parts.indices) {
-                val variants = expandSyllable(seg.parts[index])
-                    .drop(1)
-                    .mapNotNull { trie.canonicalOf(it) }
-                    .distinct()
-                    .take(4)
-                for (alt in variants) {
-                    val parts = seg.parts.toMutableList()
-                    parts[index] = alt
-                    val preedit = parts.joinToString("'")
-                    val matched = spell(parts, boostUser = true).take(2)
-                    if (matched.isNotEmpty()) {
-                        for (row in matched) {
-                            items += scored(row, wordScore(row.text, row.freq) - 32.0, preedit, false, used)
-                        }
-                    } else if (parts.size >= 2) {
-                        for (piece in cover(parts).take(1)) {
-                            if (piece.text.isNotEmpty()) {
-                                items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 36.0, preedit, false, used, piece.pieces)
-                            }
+            val count = seg.parts.size
+            for (path in beam) {
+                if (path.featureEdits == 0) continue
+                val parts = path.parts
+                val preedit = parts.joinToString("'")
+                val rawPenalty = count.toDouble() * count * (4.62 + 0.15 * (path.featureEdits - 1))
+                val matched = spell(parts, boostUser = true).take(3)
+                for (row in matched) {
+                    items += scored(row, wordScore(row.text, row.freq) - rawPenalty, preedit, false, used)
+                }
+                if (parts.size >= 2 && (matched.maxOfOrNull { it.freq } ?: 0) < 5_000) {
+                    for (piece in cover(parts).take(1)) {
+                        if (piece.text.isNotEmpty()) {
+                            items += Scored(piece.text, piece.syllables, piece.freq, piece.score - rawPenalty, preedit, false, used, piece.pieces)
                         }
                     }
                 }
@@ -1099,11 +1295,13 @@ class PinyinDecoder(syllables: Set<String>) {
 
             val rescored = items.mapIndexed { idx, item ->
                 if (idx >= 24 || item.consumed < maxConsumed) return@mapIndexed item
+                val k = syllableCount(item).coerceAtLeast(1)
+                val kScale = (k.toDouble() * k) / maxOf(1.0, k * 0.85)
                 var bonus = 0.0
                 for (len in minOf(4, cjkContext.length) downTo 1) {
                     val count = userBigrams[cjkContext.takeLast(len)]?.get(item.text) ?: 0
                     if (count > 0) {
-                        val uBonus = (if (len >= 2) 48.0 else 28.0) + 12.0 * ln((count + 1).toDouble())
+                        val uBonus = ((if (len >= 2) 24.0 else 16.0) + 6.0 * ln((count + 1).toDouble())) * k * k
                         if (uBonus > bonus) bonus = uBonus
                     }
                 }
@@ -1112,9 +1310,9 @@ class PinyinDecoder(syllables: Set<String>) {
                         val freq = compoundFreqs[cjkContext.takeLast(len) + item.text] ?: 0
                         if (freq >= 100) {
                             val cBonus = if (len >= 2) {
-                                3.2 * ln(freq.toDouble())
+                                2.8 * ln(freq.toDouble()) * kScale
                             } else if (freq >= 500) {
-                                minOf(16.0, 1.35 * ln(freq.toDouble()))
+                                minOf(14.0, 1.25 * ln(freq.toDouble())) * kScale
                             } else {
                                 0.0
                             }
@@ -1136,27 +1334,34 @@ class PinyinDecoder(syllables: Set<String>) {
             touchSamples: List<TouchSample?> = emptyList(),
         ): List<Scored> {
             val items = ArrayList<Scored>()
-            for ((seg, cost, spatialPenalty) in correctedSegments(letters, touchHints, touchSamples)) {
-                val directPenalty = if (cost == 1) {
-                    18.0 - 6.0 * (1.0 - spatialPenalty.coerceIn(0f, 1f))
-                } else {
-                    36.0 * cost
-                }
-                val directRows = spell(seg.parts, boostUser = true).take(2)
-                if (directRows.isNotEmpty()) {
-                    for (row in directRows) {
-                        items += scored(row, wordScore(row.text, row.freq) - directPenalty, letters, true, letters.length)
+            val corrected = correctedSegments(letters, touchHints, touchSamples)
+            for ((seg, cost, spatialPenalty) in corrected) {
+                val k = seg.parts.size.coerceAtLeast(1)
+                val perSylPen = if (cost == 1) {
+                    if (spatialPenalty < 0.99f) {
+                        2.15 - 1.05 * (1.0 - spatialPenalty.coerceIn(0f, 1f))
+                    } else {
+                        3.95
                     }
-                } else if (seg.parts.size >= 2) {
+                } else {
+                    3.20 * cost
+                }
+                val scaleK2 = if (k == 1) 4.0 else k.toDouble() * k
+                val rawPenalty = scaleK2 * perSylPen
+                val directRows = spell(seg.parts, boostUser = true).take(2)
+                for (row in directRows) {
+                    items += scored(row, wordScore(row.text, row.freq) - rawPenalty, letters, true, letters.length)
+                }
+                if (seg.parts.size >= 2 && (directRows.maxOfOrNull { it.freq } ?: 0) < 5_000) {
                     for (piece in cover(seg.parts).take(1)) {
                         if (piece.text.isNotEmpty()) {
-                            items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 40.0 * cost, letters, true, letters.length, piece.pieces)
+                            items += Scored(piece.text, piece.syllables, piece.freq, piece.score - rawPenalty, letters, true, letters.length, piece.pieces)
                         }
                     }
                 }
             }
             // Cross-syllable adjacent transposition (e.g. "nhiao" -> "nihao", "wmoen" -> "women", "zohngguo" -> "zhongguo")
-            if (letters.length in 3..14) {
+            if (letters.length in 3..18) {
                 for (idx in 0 until letters.length - 1) {
                     if (letters[idx] == letters[idx + 1]) continue
                     val chars = letters.toCharArray()
@@ -1167,15 +1372,16 @@ class PinyinDecoder(syllables: Set<String>) {
                     val seg = segmentChunk(swapped, trie, allowPartial = false)
                         .firstOrNull { !it.partial && it.parts.size >= 2 && it.parts.all { p -> p.length >= 2 } }
                         ?: continue
+                    val k = seg.parts.size.coerceAtLeast(1)
+                    val rawSwapPen = k.toDouble() * k * 2.25
                     val direct = spell(seg.parts, boostUser = true).take(2)
-                    if (direct.isNotEmpty()) {
-                        for (row in direct) {
-                            items += scored(row, wordScore(row.text, row.freq) - 18.0, letters, true, letters.length)
-                        }
-                    } else {
+                    for (row in direct) {
+                        items += scored(row, wordScore(row.text, row.freq) - rawSwapPen, letters, true, letters.length)
+                    }
+                    if ((direct.maxOfOrNull { it.freq } ?: 0) < 5_000) {
                         for (piece in cover(seg.parts).take(1)) {
                             if (piece.text.isNotEmpty()) {
-                                items += Scored(piece.text, piece.syllables, piece.freq, piece.score - 38.0, letters, true, letters.length, piece.pieces)
+                                items += Scored(piece.text, piece.syllables, piece.freq, piece.score - rawSwapPen, letters, true, letters.length, piece.pieces)
                             }
                         }
                     }
@@ -1188,21 +1394,34 @@ class PinyinDecoder(syllables: Set<String>) {
                     val tailText = letters.takeLast(tailLen)
                     val tailChars = charsOf(tailText)
                     if (tailChars.isEmpty()) continue
-                    for ((seg, cost, _) in correctedSegments(
+                    for ((seg, cost, headSpatial) in correctedSegments(
                         headText,
                         touchHints.take(headText.length),
                         touchSamples.take(headText.length),
                     ).filter { it.second == 1 }.take(2)) {
+                        val hSyls = seg.parts.size.coerceAtLeast(1)
                         val headPieces = spell(seg.parts, boostUser = true).take(1).map {
                             Piece(it.text, it.syllables, it.freq, wordScore(it.text, it.freq))
                         }.ifEmpty { cover(seg.parts).take(1) }
                         for (hp in headPieces) {
                             for (tc in tailChars.take(2)) {
+                                val totalK = hSyls + 1
+                                val baseCombined = combinePiecesScore(
+                                    hp.score,
+                                    hSyls,
+                                    hp.pieces,
+                                    wordScore(tc.text, tc.freq),
+                                    1,
+                                    1,
+                                    stepPen = 8.5,
+                                )
+                                val editUnit = if (headSpatial < 0.99f) 3.2 else 6.2
+                                val rawPen = totalK.toDouble() * totalK * (editUnit * cost + 1.2)
                                 items += Scored(
                                     hp.text + tc.text,
                                     joinSyl(hp.syllables, tc.syllables),
                                     minOf(hp.freq.coerceAtLeast(1), tc.freq),
-                                    hp.score + wordScore(tc.text, tc.freq) - 44.0 * cost - 10.0,
+                                    baseCombined - rawPen,
                                     letters,
                                     true,
                                     letters.length,
@@ -1217,24 +1436,63 @@ class PinyinDecoder(syllables: Set<String>) {
             return rank(items)
         }
 
-        fun softFirstLetter(letters: String, samples: List<TouchSample?>): List<Scored> {
+        fun softTouchVariants(letters: String, samples: List<TouchSample?>): List<Scored> {
             if (letters.length < 2) return emptyList()
-            val sample = samples.getOrNull(0) ?: return emptyList()
-            val ambiguous = (sample.primary == letters[0]) ||
-                ((sample.penaltyOf(letters[0]) ?: 1f) >= 0.55f)
-            if (!ambiguous) return emptyList()
-            val alts = sample.alternatives
-                .filter { it.penalty <= 0.35f && it.ch in 'a'..'z' && it.ch != letters[0] }
-                .sortedBy { it.penalty }
-                .take(2)
-            if (alts.isEmpty()) return emptyList()
+            data class PosAlt(val pos: Int, val ch: Char, val penalty: Float)
+            val collected = ArrayList<PosAlt>()
+            val limit = minOf(letters.length, samples.size)
+            for (pos in 0 until limit) {
+                val sample = samples[pos] ?: continue
+                val ch = letters[pos]
+                val ambiguous = (sample.primary == ch) || ((sample.penaltyOf(ch) ?: 1f) >= 0.55f)
+                if (!ambiguous) continue
+                sample.alternatives
+                    .filter { it.penalty <= 0.35f && it.ch in 'a'..'z' && it.ch != ch }
+                    .sortedBy { it.penalty }
+                    .take(2)
+                    .forEach { alt -> collected += PosAlt(pos, alt.ch, alt.penalty) }
+            }
+            if (collected.isEmpty()) return emptyList()
+            collected.sortBy { it.penalty }
+
+            val variants = ArrayList<Pair<String, Double>>(8)
+            for (pa in collected.take(6)) {
+                val chars = letters.toCharArray()
+                chars[pa.pos] = pa.ch
+                variants += String(chars) to (0.80 + 4.50 * pa.penalty)
+            }
+            val distinctPos = collected.distinctBy { it.pos }
+            if (distinctPos.size >= 2 && distinctPos[0].penalty <= 0.30f && distinctPos[1].penalty <= 0.30f) {
+                val chars = letters.toCharArray()
+                chars[distinctPos[0].pos] = distinctPos[0].ch
+                chars[distinctPos[1].pos] = distinctPos[1].ch
+                variants += String(chars) to (1.40 + 4.00 * (distinctPos[0].penalty + distinctPos[1].penalty))
+            }
+
             val items = ArrayList<Scored>()
-            for (alt in alts) {
-                val variant = alt.ch + letters.substring(1)
-                val penalty = 6.0 + 16.0 * alt.penalty
-                for (seg in segmentPinyin(variant, trie).take(2)) {
-                    items += candidates(seg).take(4).map { it.copy(score = it.score - penalty) }
-                    items += prefixes(seg).take(2).map { it.copy(score = it.score - penalty) }
+            for ((variant, perSylPen) in variants) {
+                val vSegs = segmentPinyin(variant, trie)
+                val vFull = vSegs.filter { !it.partial }
+                val vOpen = vSegs.filter { seg ->
+                    seg.partial && seg.parts.isNotEmpty() &&
+                        (!trie.isWord(seg.parts.last()) || (seg.parts.last().length == 1 && trie.hasExtension(seg.parts.last())))
+                }
+                val vMinSyl = vFull
+                    .filter { !shattersIncompleteTail(it.parts, trie) }
+                    .minOfOrNull { it.parts.size }
+                    ?: if (vOpen.isEmpty()) variant.length.coerceAtLeast(1) else Int.MAX_VALUE
+                val vBook = Book(minFullSyllables = vMinSyl, fullLength = variant.length, keepWritten = false)
+                for (seg in (vFull.take(2) + vOpen.take(1)).take(2)) {
+                    for (cand in vBook.candidates(seg).take(4)) {
+                        val k = syllableCount(cand).coerceAtLeast(1)
+                        val extraSplits = if (vMinSyl < Int.MAX_VALUE && k > vMinSyl) k - vMinSyl else 0
+                        val rawPen = k.toDouble() * k * (perSylPen + SPLIT_PENALTY * extraSplits)
+                        items += cand.copy(score = cand.score - rawPen, shatteredTail = false)
+                    }
+                    for (pref in vBook.prefixes(seg).take(2)) {
+                        val k = syllableCount(pref).coerceAtLeast(1)
+                        items += pref.copy(score = pref.score - k.toDouble() * k * perSylPen)
+                    }
                 }
             }
             return rank(items)
@@ -1282,14 +1540,28 @@ class PinyinDecoder(syllables: Set<String>) {
             val items = ArrayList<Scored>()
             val head = seg.parts.dropLast(1)
             val tail = normalizePrefix(seg.parts.last())
+            val bareInitialTail = tail.length == 1 || tail in shengmu
             val canonicalHead = head.map { if (it == "r") "er" else (trie.canonicalOf(it) ?: it) }
             val normalizedParts = canonicalHead + tail
             val prefix = normalizedParts.joinToString(" ")
-            val longer = lexicon.spellingStarting(prefix, normalizedParts.size, 8) + user.filter { extends(it, normalizedParts) }
+            val longer = lexicon.spellingStarting(prefix, normalizedParts.size, 16) + user.filter { extends(it, normalizedParts) }
             for (row in longer) {
                 if (!extends(row, normalizedParts)) continue
-                val untyped = (row.syllables.substringAfterLast(' ').length - tail.length).coerceAtLeast(1)
+                val untyped = if (bareInitialTail) 1 else (row.syllables.substringAfterLast(' ').length - tail.length).coerceAtLeast(1)
                 items += scored(row, wordScore(row.text, row.freq), preedit, false, used, opened = true, untyped = untyped)
+            }
+            if (canonicalHead.isNotEmpty()) {
+                for ((altHead, penPerSyl) in phoneticVariants(canonicalHead, allowSingle = true)) {
+                    val altParts = altHead + tail
+                    val altPrefix = altParts.joinToString(" ")
+                    val count = altParts.size
+                    val pen = count * count * penPerSyl
+                    for (row in lexicon.spellingStarting(altPrefix, altParts.size, 10)) {
+                        if (!extends(row, altParts)) continue
+                        val untyped = if (bareInitialTail) 1 else (row.syllables.substringAfterLast(' ').length - tail.length).coerceAtLeast(1)
+                        items += scored(row, wordScore(row.text, row.freq) - pen, preedit, false, used, opened = true, untyped = untyped)
+                    }
+                }
             }
             // Trailing erhua support (e.g. "wanr" -> "玩儿", "niqunar" -> "你去哪儿", "yidianr" -> "一点儿")
             if (tail == "r" && canonicalHead.isNotEmpty()) {
@@ -1297,16 +1569,28 @@ class PinyinDecoder(syllables: Set<String>) {
                     val erhuaParts = canonicalHead.takeLast(takeCount) + "er"
                     val erhuaRows = spell(erhuaParts, boostUser = true).take(2)
                     if (erhuaRows.isEmpty()) continue
+                    val headLen = canonicalHead.size - takeCount
+                    val erSyls = erhuaParts.size
                     val prefixHeads = headPieces(canonicalHead.dropLast(takeCount))
                     for (hp in prefixHeads) {
                         for (erRow in erhuaRows) {
                             val combined = hp.text + erRow.text
                             if (combined.isEmpty()) continue
+                            val totalSyl = headLen + erSyls
+                            val erhuaBonus = if (erRow.text.endsWith("儿")) 1.5 * totalSyl * totalSyl else 0.0
+                            val combinedScore = combinePiecesScore(
+                                hp.score,
+                                headLen,
+                                hp.pieces,
+                                wordScore(erRow.text, erRow.freq),
+                                erSyls,
+                                1,
+                            ) + erhuaBonus
                             items += Scored(
                                 combined,
                                 joinSyl(hp.syllables, erRow.syllables),
                                 if (hp.text.isEmpty()) erRow.freq else minOf(hp.freq, erRow.freq),
-                                hp.score + wordScore(erRow.text, erRow.freq),
+                                combinedScore,
                                 preedit,
                                 false,
                                 used,
@@ -1317,16 +1601,31 @@ class PinyinDecoder(syllables: Set<String>) {
                 }
             }
             val heads = headPieces(canonicalHead)
+            val headSyls = canonicalHead.size
             for (piece in heads) {
                 for (row in charsOf(tail)) {
                     val text = piece.text + row.text
                     if (text.isEmpty()) continue
-                    val untyped = (row.syllables.length - tail.length).coerceAtLeast(1)
+                    val untyped = if (bareInitialTail) 1 else (row.syllables.length - tail.length).coerceAtLeast(1)
+                    val clauseEndAdj = when {
+                        headSyls >= 2 && row.text == "把" -> -1.8
+                        headSyls >= 2 && tail.length == 1 && row.text in clauseFinalParticles -> 2.2
+                        else -> 0.0
+                    }
+                    val combinedScore = combinePiecesScore(
+                        piece.score,
+                        headSyls,
+                        piece.pieces,
+                        wordScore(row.text, row.freq) + clauseEndAdj,
+                        1,
+                        1,
+                        stepPen = 14.5,
+                    )
                     items += Scored(
                         text,
                         joinSyl(piece.syllables, row.syllables),
                         if (piece.text.isEmpty()) row.freq else minOf(piece.freq, row.freq),
-                        piece.score + wordScore(row.text, row.freq),
+                        combinedScore,
                         preedit,
                         false,
                         used,
@@ -1342,8 +1641,18 @@ class PinyinDecoder(syllables: Set<String>) {
         private fun headPieces(head: List<String>): List<Piece> {
             if (head.isEmpty()) return listOf(Piece("", "", 0, 0.0, pieces = 0))
             val words = spell(head, boostUser = true).take(3).map { Piece(it.text, it.syllables, it.freq, wordScore(it.text, it.freq), pieces = 1) }
+            val altWords = if (head.size >= 1) {
+                phoneticVariants(head, allowSingle = head.size >= 1).flatMap { (alt, penPerSyl) ->
+                    val c = alt.size
+                    spell(alt, boostUser = true).take(2).map {
+                        Piece(it.text, it.syllables, it.freq, wordScore(it.text, it.freq) - c * c * penPerSyl, pieces = 1)
+                    }
+                }
+            } else {
+                emptyList()
+            }
             val built = if (head.size >= 2) cover(head) else emptyList()
-            val merged = rankPieces(words + built).take(3)
+            val merged = rankPieces(words + altWords + built).take(3)
             return merged.ifEmpty { listOf(Piece("", "", 0, 0.0, pieces = 0)) }
         }
 
@@ -1352,19 +1661,58 @@ class PinyinDecoder(syllables: Set<String>) {
             val dp = Array(parts.size + 1) { ArrayList<Piece>() }
             dp[0].add(Piece("", "", 0, 0.0, pieces = 0))
             val width = minOf(6, parts.size)
+            val multiSylSentence = parts.size >= 2
             for (end in 1..parts.size) {
                 val found = ArrayList<Piece>()
                 for (start in maxOf(0, end - width) until end) {
+                    if (parts.size >= 2 && start == 0 && end == parts.size) continue
                     if (dp[start].isEmpty()) continue
                     val spanLen = end - start
-                    val rows = spell(parts.subList(start, end), boostUser = (spanLen >= 2)).take(if (spanLen == 1) 4 else 3)
+                    val subParts = parts.subList(start, end)
+                    val spanOptions = ArrayList<Pair<LexRow, Double>>(6)
+                    for (row in spell(subParts, boostUser = (spanLen >= 2)).take(if (spanLen == 1) 4 else 3)) {
+                        spanOptions += row to 0.0
+                    }
+                    if (spanLen >= 2) {
+                        for ((altSub, penPerSyl) in phoneticVariants(subParts)) {
+                            for (row in spell(altSub, boostUser = true).take(2)) {
+                                spanOptions += row to (spanLen * penPerSyl)
+                            }
+                        }
+                    } else if (multiSylSentence && (subParts[0] == "nu" || subParts[0] == "zhei" || subParts[0] == "nei")) {
+                        for ((altSub, penPerSyl) in phoneticVariants(subParts, allowSingle = true)) {
+                            for (row in spell(altSub, boostUser = false).take(1)) {
+                                spanOptions += row to (penPerSyl + 1.1)
+                            }
+                        }
+                    }
                     for (prev in dp[start]) {
-                        for (row in rows) {
+                        var singleAddedForPrev = 0
+                        for ((row, variantPen) in spanOptions) {
+                            if (spanLen == 1 && parts.size > 1) {
+                                if (singleAddedForPrev >= 2) continue
+                                singleAddedForPrev++
+                            }
+                            val stepPenalty = if (prev.pieces == 0) 0.0 else 5.5
+                            val beforeParticle = start > 0 &&
+                                end < parts.size &&
+                                row.text in resultativeComplements &&
+                                parts[end] in particleSyllables
+                            val singleCharPen = when {
+                                spanLen != 1 || parts.size <= 1 -> 0.0
+                                start > 0 && row.text in grammaticalParticles -> 1.4
+                                beforeParticle -> 2.0
+                                else -> 5.2
+                            }
+                            val cohesion = 1.8 * (spanLen - 1) + if (spanLen >= 4) 7.5 * (spanLen - 2) else 0.0
+                            val timeBonus = if (spanLen == 2 && isTemporalPrefix(prev.text) && isClockHourWord(row.text)) 5.5 else 0.0
+                            val clauseEndAdj = if (end == parts.size && parts.size >= 3 && spanLen == 1 && row.text == "把") -1.5 else 0.0
+                            val linearStep = spanLen * ln(row.freq.coerceAtLeast(1).toDouble()) + cohesion + timeBonus + clauseEndAdj - singleCharPen - variantPen - stepPenalty
                             found += Piece(
                                 prev.text + row.text,
                                 joinSyl(prev.syllables, row.syllables),
                                 if (prev.text.isEmpty()) row.freq else minOf(prev.freq, row.freq),
-                                prev.score + wordScore(row.text, row.freq),
+                                prev.score + linearStep,
                                 prev.pieces + 1,
                             )
                         }
@@ -1375,19 +1723,78 @@ class PinyinDecoder(syllables: Set<String>) {
                     val bridgeRows = fallbackCharsForSyllable(parts[end - 1])
                     for (prev in dp[end - 1]) {
                         for (row in bridgeRows) {
+                            val stepPenalty = if (prev.pieces == 0) 0.0 else 5.5
+                            val linearStep = ln(row.freq.coerceAtLeast(1).toDouble()) - 6.0 - stepPenalty
                             found += Piece(
                                 prev.text + row.text,
                                 joinSyl(prev.syllables, row.syllables),
                                 if (prev.text.isEmpty()) row.freq else minOf(prev.freq, row.freq),
-                                prev.score + wordScore(row.text, row.freq) - 24.0,
+                                prev.score + linearStep,
                                 prev.pieces + 1,
                             )
                         }
                     }
                 }
-                dp[end] = ArrayList(rankPieces(found).take(3))
+                val bestLinear = LinkedHashMap<String, Piece>()
+                for (cand in found) {
+                    if (cand.text.isEmpty()) continue
+                    val existing = bestLinear[cand.text]
+                    if (existing == null || cand.score > existing.score) bestLinear[cand.text] = cand
+                }
+                dp[end] = ArrayList(bestLinear.values.sortedByDescending { it.score }.take(6))
             }
-            return dp[parts.size]
+            val totalSyl = parts.size.coerceAtLeast(1)
+            return dp[parts.size].take(4).map { piece ->
+                val mappedScore = if (totalSyl == 1) {
+                    wordScore(piece.text, piece.freq)
+                } else {
+                    val avgPerSyl = piece.score / totalSyl.toDouble() - 2.8
+                    totalSyl.toDouble() * totalSyl * avgPerSyl + FRAGMENT_PENALTY * (piece.pieces - 1).coerceAtLeast(0)
+                }
+                piece.copy(score = mappedScore)
+            }
+        }
+
+        private fun phoneticVariants(parts: List<String>, allowSingle: Boolean = false): List<Pair<List<String>, Double>> {
+            if (parts.isEmpty() || (!allowSingle && parts.size < 2)) return emptyList()
+            val canonical = parts.map { if (it == "r") "er" else (trie.canonicalOf(it) ?: it) }
+            val positions = ArrayList<Triple<Int, String, Double>>(2)
+            for ((idx, syl) in canonical.withIndex()) {
+                when (syl) {
+                    "lu" -> positions += Triple(idx, "lv", 0.50)
+                    "nu" -> positions += Triple(idx, "nv", 0.50)
+                    "zhei" -> positions += Triple(idx, "zhe", 0.40)
+                    "nei" -> positions += Triple(idx, "na", 0.40)
+                }
+                if (positions.size >= 2) break
+            }
+            if (positions.isEmpty()) return emptyList()
+            val out = ArrayList<Pair<List<String>, Double>>(3)
+            val totalMasks = 1 shl positions.size
+            for (mask in 1 until totalMasks) {
+                val copy = canonical.toMutableList()
+                var totalPen = 0.0
+                var subs = 0
+                for (bit in positions.indices) {
+                    if ((mask and (1 shl bit)) != 0) {
+                        val (idx, replacement, pen) = positions[bit]
+                        copy[idx] = replacement
+                        totalPen += pen
+                        subs++
+                    }
+                }
+                out += copy to (totalPen / subs.coerceAtLeast(1))
+            }
+            return out
+        }
+
+        private fun isTemporalPrefix(text: String): Boolean {
+            if (text.length < 2) return false
+            return temporalSuffixes.any { text.endsWith(it) }
+        }
+
+        private fun isClockHourWord(text: String): Boolean {
+            return text.length == 2 && text[1] == '点' && text[0] in "一二两三四五六七八九十几"
         }
 
         private fun fallbackCharsForSyllable(syllable: String): List<LexRow> {
@@ -1579,6 +1986,25 @@ class PinyinDecoder(syllables: Set<String>) {
             right.isEmpty() -> left
             else -> "$left $right"
         }
+
+        private fun combinePiecesScore(
+            leftScore: Double,
+            leftSyls: Int,
+            leftPieces: Int,
+            rightScore: Double,
+            rightSyls: Int,
+            rightPieces: Int,
+            stepPen: Double = 2.8,
+        ): Double {
+            if (leftSyls <= 0) return rightScore
+            val rSyl = rightSyls.coerceAtLeast(1)
+            val leftPerSyl = (leftScore - FRAGMENT_PENALTY * (leftPieces - 1).coerceAtLeast(0)) / (leftSyls.toDouble() * leftSyls)
+            val rightPerSyl = (rightScore - FRAGMENT_PENALTY * (rightPieces - 1).coerceAtLeast(0)) / (rSyl.toDouble() * rSyl)
+            val total = leftSyls + rSyl
+            val totalPieces = leftPieces + rightPieces
+            val avg = (leftSyls * leftPerSyl + rSyl * rightPerSyl - stepPen) / total.toDouble()
+            return total.toDouble() * total * avg + FRAGMENT_PENALTY * (totalPieces - 1).coerceAtLeast(0)
+        }
     }
 
     private fun wordScore(text: String, freq: Int): Double {
@@ -1592,8 +2018,15 @@ class PinyinDecoder(syllables: Set<String>) {
         const val CONSUMED_WEIGHT = 25.0
         const val SPLIT_PENALTY = 5.5
         const val SINGLE_SYLLABLE_SPLIT_PENALTY = 8.5
-        const val OPENED_PENALTY = 5.2
+        const val OPENED_PENALTY = 4.50
         val shengmu = setOf("zh", "ch", "sh")
+        val grammaticalParticles = setOf("的", "了", "吗", "呢", "吧", "啊", "呀", "啦", "着", "过")
+        val clauseFinalParticles = setOf("吧", "了", "吗", "呢", "啊", "呀", "啦")
+        val resultativeComplements = setOf("到", "好", "完", "走", "来", "去", "给", "上", "下", "成", "住", "出")
+        val particleSyllables = setOf("le", "de", "ma", "ba", "ne", "la", "guo", "zhe")
+        val dayPrefixes = setOf("今天", "明天", "昨天", "后天", "每天", "今晚", "明早")
+        val dayCollocations = setOf("早上", "上午", "下午", "晚上", "中午", "凌晨", "天气")
+        val temporalSuffixes = listOf("早上", "上午", "下午", "晚上", "中午", "凌晨", "明早", "今晚")
         val commonContinuations = mapOf(
             "我" to listOf("们", "的", "是", "在", "有", "也", "觉得", "想"),
             "你" to listOf("们", "的", "好", "是", "在", "有"),
@@ -1617,12 +2050,13 @@ class PinyinDecoder(syllables: Set<String>) {
         touchSamples: List<TouchSample?> = emptyList(),
     ): List<Triple<Seg, Int, Float>> {
         val paths = Array(text.length + 1) { ArrayList<Node>(4) }
-        paths[0].add(Node(emptyList(), 0, 0.0, 1f))
+        paths[0].add(Node(emptyList(), 0, 0.0, 1f, -1))
         for (start in 0 until text.length) {
             val from = paths[start]
             if (from.isEmpty()) continue
             for (edge in syllableEdges(text, start, touchHints, touchSamples)) {
                 val dest = paths[edge.end]
+                val consumed = edge.end - start
                 for (node in from) {
                     val cost = node.cost + edge.cost
                     if (cost > 2) continue
@@ -1631,22 +2065,39 @@ class PinyinDecoder(syllables: Set<String>) {
                     } else {
                         node.spatialPenalty
                     }
-                    val spatialBonus = if (edge.cost > 0) 2.0 * (1.0 - edge.spatialPenalty) else 0.0
+                    val spatialBonus = if (edge.cost > 0) 6.0 * (1.0 - edge.spatialPenalty) else 0.0
+                    val nextEditPos = if (edge.cost > 0 && node.editPos < 0) start else node.editPos
                     dest += Node(
                         node.parts + edge.syllable,
                         cost,
-                        node.score + edge.syllable.length * edge.syllable.length - edge.cost * 5.0 + spatialBonus,
+                        node.score + consumed * consumed - edge.cost * 6.0 + spatialBonus,
                         nextPenalty,
+                        nextEditPos,
                     )
                 }
                 prune(dest)
             }
         }
-        return paths[text.length]
+        val sortedFinal = paths[text.length]
             .filter { it.cost > 0 && it.parts.isNotEmpty() }
-            .map { Triple(Seg(it.parts, partial = false), it.cost, it.spatialPenalty) }
-            .distinctBy { it.first.parts to it.second }
-            .take(8)
+            .sortedWith(
+                compareBy<Node> { it.cost }
+                    .thenBy { it.spatialPenalty }
+                    .thenByDescending { it.score },
+            )
+        val finalPerPos = HashMap<Int, Int>()
+        val diversified = ArrayList<Triple<Seg, Int, Float>>(36)
+        val seenFinal = HashSet<Pair<List<String>, Int>>()
+        for (node in sortedFinal) {
+            val key = node.parts to node.cost
+            if (!seenFinal.add(key)) continue
+            val posCount = finalPerPos[node.editPos] ?: 0
+            if (posCount >= 5) continue
+            finalPerPos[node.editPos] = posCount + 1
+            diversified += Triple(Seg(node.parts, partial = false), node.cost, node.spatialPenalty)
+            if (diversified.size >= 36) break
+        }
+        return diversified
     }
 
     private data class Edge(val syllable: String, val end: Int, val cost: Int, val spatialPenalty: Float = 1f)
@@ -1657,8 +2108,8 @@ class PinyinDecoder(syllables: Set<String>) {
         touchHints: List<String>,
         touchSamples: List<TouchSample?>,
     ): List<Edge> {
-        val exact = trie.canonicalEndings(text, start).map { (end, canonical) ->
-            Edge(canonical, end, 0)
+        val exact = trie.canonicalEndings(text, start).mapNotNull { (end, canonical) ->
+            if (isFullLatticeSyllable(canonical)) Edge(canonical, end, 0) else null
         }
         val typos = ArrayList<Edge>()
         val remain = text.length - start
@@ -1687,6 +2138,7 @@ class PinyinDecoder(syllables: Set<String>) {
         for (take in intArrayOf(syllable.length, syllable.length - 1, syllable.length + 1)) {
             if (take < 1 || take > remain) continue
             val sub = text.substring(start, start + take)
+            if (take == syllable.length - 1 && start + take == text.length && syllable.startsWith(sub)) continue
             val (cost, spatialPenalty) = editCost(sub, syllable, touchHints, touchSamples, start) ?: continue
             if (cost != 1) continue
             val edge = Edge(syllable, start + take, cost, spatialPenalty)
@@ -1702,25 +2154,30 @@ class PinyinDecoder(syllables: Set<String>) {
     }
 
     private fun prune(nodes: MutableList<Node>) {
-        if (nodes.size <= 8) return
-        nodes.sortWith(compareBy<Node> { it.cost }.thenByDescending { it.score })
-        val kept = ArrayList<Node>(8)
+        if (nodes.size <= 24) return
+        nodes.sortWith(compareBy<Node> { it.cost }.thenBy { it.spatialPenalty }.thenByDescending { it.score })
+        val kept = ArrayList<Node>(42)
         var plain = 0
         var edited = 0
+        val perEditPos = HashMap<Int, Int>()
         for (node in nodes) {
-            if (node.cost == 0 && plain < 4) {
+            if (node.cost == 0 && plain < 6) {
                 kept += node
                 plain++
-            } else if (node.cost > 0 && edited < 4) {
-                kept += node
-                edited++
+            } else if (node.cost > 0 && edited < 36) {
+                val posCount = perEditPos[node.editPos] ?: 0
+                if (posCount < 5) {
+                    kept += node
+                    edited++
+                    perEditPos[node.editPos] = posCount + 1
+                }
             }
         }
         nodes.clear()
         nodes.addAll(kept)
     }
 
-    private data class Node(val parts: List<String>, val cost: Int, val score: Double, val spatialPenalty: Float)
+    private data class Node(val parts: List<String>, val cost: Int, val score: Double, val spatialPenalty: Float, val editPos: Int = -1)
 }
 
 private fun editCost(
@@ -1752,12 +2209,14 @@ private fun editCost(
         val sample = touchSamples.getOrNull(offset + diff)
         val samplePenalty = sample?.penaltyOf(target[diff])
         val legacyHit = sample == null && target[diff] in touchHints.getOrNull(offset + diff).orEmpty()
+        val isNeighbor = adjacentKey(typed[diff], target[diff])
         val spatialPenalty = when {
             samplePenalty != null -> samplePenalty.coerceIn(0f, 1f)
             legacyHit -> 0.2f
+            isNeighbor -> 0.55f
             else -> 1f
         }
-        return if (samplePenalty != null || legacyHit || adjacentKey(typed[diff], target[diff])) {
+        return if (samplePenalty != null || legacyHit || isNeighbor) {
             1 to spatialPenalty
         } else {
             null

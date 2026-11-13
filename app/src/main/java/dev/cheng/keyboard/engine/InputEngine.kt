@@ -823,7 +823,8 @@ class InputEngine(private val latin: LatinDecoder) {
         if (state.raw.isEmpty()) return state to emptyList()
         if (state.language == Language.Chinese) {
             val chosen = state.candidates.firstOrNull()
-            val text = chosen?.text ?: state.raw
+            val unconsumed = if (chosen != null) leftover(state.raw, chosen.consumed).filter { it != '\'' } else ""
+            val text = if (chosen != null) chosen.text + unconsumed else state.raw
             val cmds = mutableListOf<Cmd>(Cmd.Commit(text))
             if (chosen != null && learnable(state) && chosen.syllables.isNotBlank()) {
                 if (state.partialText.isNotEmpty() && (state.partialText.length + chosen.text.length) in 2..8) {
