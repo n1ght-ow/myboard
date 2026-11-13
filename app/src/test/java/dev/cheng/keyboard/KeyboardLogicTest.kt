@@ -1033,6 +1033,11 @@ class KeyboardLogicTest {
                 LexRow("啊", "a", "a", 5_366_043),
                 LexRow("哦", "o", "o", 3_563_330),
                 LexRow("呢", "ne", "ne", 2_000_000),
+                LexRow("上", "shang", "shang", 5_075_000),
+                LexRow("见", "jian", "jian", 4_030_000),
+                LexRow("年", "nian", "nian", 3_520_000),
+                LexRow("冒犯", "mao fan", "maofan", 200_000),
+                LexRow("你好吗", "ni hao ma", "nihaoma", 90_000),
             ),
         )
 
@@ -1057,6 +1062,16 @@ class KeyboardLogicTest {
         val dangao = decoder.decode("dangao", fuzzy = false)
         assertEquals("蛋糕", dangao.candidates.first().text)
         assertEquals("dan gao", dangao.candidates.first().syllables)
+
+        // The composing text never shows a separator that the glue would hide.
+        assertEquals("shang", decoder.decode("shang", fuzzy = false).preedit)
+        assertEquals("jian", decoder.decode("jian", fuzzy = false).preedit)
+        assertEquals("nian", decoder.decode("nian", fuzzy = false).preedit)
+        assertEquals("mao'fan", decoder.decode("maofan", fuzzy = false).preedit)
+        assertEquals("ni'hao'ma", decoder.decode("nihaoma", fuzzy = false).preedit)
+        // A separator the typist asked for is kept as written.
+        assertEquals("xi'an", decoder.decode("xi'an", fuzzy = false).preedit)
+        assertEquals("zhi'hua", decoder.decode("zhi'hua", fuzzy = false).preedit)
     }
 
     @Test

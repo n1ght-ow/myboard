@@ -532,17 +532,51 @@ class PinyinDecoder(syllables: Set<String>) {
         }
 
         val best = items.firstOrNull()
-        val preedit = when {
-            best == null -> chosen.firstOrNull()?.parts?.joinToString("'") ?: letters
+        val keepWritten = '\'' in text
+        val preedit = if (keepWritten) {
+            text
+        } else when {
+            best == null -> joinPreedit(chosen.firstOrNull()?.parts ?: listOf(letters))
             best.typo -> letters
             best.consumed in 1 until letters.length -> {
                 val tail = letters.substring(best.consumed)
-                "${best.preedit}'$tail"
+                joinPreedit(best.preedit.split('\'')) + "'" + tail
             }
-            else -> best.preedit
+            else -> joinPreedit(best.preedit.split('\''))
         }
         val shown = if (text.endsWith("'") && !preedit.endsWith("'")) "$preedit'" else preedit
         return Decode(shown, items.map { Candidate(it.text, it.syllables, it.freq, it.consumed) })
+    }
+
+    // Show the fewest separators that still describe the typing: neighbouring parts merge whenever the
+    // glued letters are themselves a syllable, so "shan|g", "ni|a|n" or "mao|fa|n" never show up as
+    // shan'g / ni'a'n / mao'fa'n. A separator the typist typed is displayed as written instead.
+    private fun joinPreedit(parts: List<String>): String {
+        val cleaned = parts.filter { it.isNotEmpty() }
+        if (cleaned.isEmpty()) return ""
+        if (cleaned.size == 1) return cleaned.joinToString("'")
+        val merged = ArrayList<String>(cleaned.size)
+        var index = 0
+        while (index < cleaned.size) {
+            var end = cleaned.lastIndex
+            var syllable: String? = null
+            while (end > index) {
+                val joined = cleaned.subList(index, end + 1).joinToString("")
+                if (joined.length <= 6 && joined.all { it in 'a'..'z' } && trie.isWord(joined)) {
+                    syllable = joined
+                    break
+                }
+                end--
+            }
+            if (syllable != null) {
+                merged += syllable
+                index = end + 1
+            } else {
+                merged += cleaned[index]
+                index++
+            }
+        }
+        return merged.joinToString("'")
     }
 
     fun associate(text: String): List<Candidate> {

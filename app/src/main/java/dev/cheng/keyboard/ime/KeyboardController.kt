@@ -1171,7 +1171,10 @@ class KeyboardController(
     private suspend fun loadDictionaries() {
         val syllables = runCatching {
             context.assets.open("dict/syllables.txt").bufferedReader().use { reader ->
-                reader.readLines().filter { it.isNotBlank() }.toSet()
+                reader.readLines()
+                    .map { line -> line.replace("\uFEFF", "").trim().lowercase() }
+                    .filter { line -> line.isNotEmpty() && line.all { it in 'a'..'z' } }
+                    .toSet()
             }
         }.getOrDefault(emptySet())
         val fresh = if (syllables.isEmpty()) pinyin else PinyinDecoder(syllables)

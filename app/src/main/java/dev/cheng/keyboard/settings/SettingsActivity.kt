@@ -83,6 +83,7 @@ import dev.cheng.keyboard.data.Secrets
 import dev.cheng.keyboard.data.UserStore
 import dev.cheng.keyboard.data.settingsStore
 import dev.cheng.keyboard.data.themeMode
+import dev.cheng.keyboard.engine.PinyinDecoder
 import dev.cheng.keyboard.ime.ui.CheckIcon
 import dev.cheng.keyboard.ime.ui.CycleIcon
 import dev.cheng.keyboard.ime.ui.GridIcon
@@ -96,6 +97,7 @@ import dev.cheng.keyboard.update.UpdateClient
 import dev.cheng.keyboard.update.UpdateDownload
 import dev.cheng.keyboard.update.UpdatePhase
 import dev.cheng.keyboard.update.checkForUpdate
+import dev.cheng.keyboard.update.installedVersionCode
 import dev.cheng.keyboard.update.installedVersionName
 import dev.cheng.keyboard.update.markDownloaded
 import dev.cheng.keyboard.update.openInstallPermission
@@ -805,6 +807,15 @@ private fun LexiconAndUpdateSection(
 }
 
 @Composable
+private fun EngineProbeNote(context: Context, colors: SettingsColors) {
+    var note by remember { mutableStateOf("引擎自检读取中…") }
+    LaunchedEffect(Unit) {
+        note = withContext(Dispatchers.IO) { engineProbe(context) }
+    }
+    Text(note, color = colors.subtle, fontSize = 11.5.sp, lineHeight = 15.sp)
+}
+
+@Composable
 private fun UpdateSection(
     context: Context,
     secrets: Secrets,
@@ -872,6 +883,7 @@ private fun UpdateSection(
         Column(Modifier.weight(1f).padding(start = 10.dp)) {
             Text("版本与更新", color = colors.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Text("当前安装版本 v$version", color = colors.subtle, fontSize = 12.5.sp)
+            EngineProbeNote(context, colors)
         }
         if (phase is UpdatePhase.UpToDate) {
             StatusBadge("已是最新", bg = colors.successSoft, fg = colors.success)
@@ -1277,4 +1289,23 @@ private fun Segment(
             )
         }
     }
+}
+
+// Mirrors the input engine's own syllable table so a stale or mangled install shows up on screen:
+// if this line reads "shang→shan'g" the device's assets are not the ones the build shipped.
+private fun engineProbe(context: Context): String {
+    val syllables = runCatching {
+        context.assets.open("dict/syllables.txt").bufferedReader().use { reader ->
+            reader.readLines()
+                .map { line -> line.replace("\uFEFF", "").trim().lowercase() }
+                .filter { line -> line.isNotEmpty() && line.all { it in 'a'..'z' } }
+                .toSet()
+        }
+    }.getOrDefault(emptySet())
+    val build = "build ${installedVersionCode(context)}"
+    if (syllables.isEmpty()) return "$build · 音节表读取失败"
+    val decoder = PinyinDecoder(syllables)
+    val samples = listOf("shang", "jian", "nian", "maofan")
+    val probe = samples.joinToString(" ") { input -> "$input→" + decoder.decode(input, fuzzy = false).preedit }
+    return "$build · 音节 ${syllables.size} · $probe"
 }

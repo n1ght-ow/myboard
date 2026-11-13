@@ -236,6 +236,12 @@ internal fun installedVersionName(context: Context): String {
     return info?.versionName?.substringBefore('-').orEmpty().ifBlank { "0" }
 }
 
+internal fun installedVersionCode(context: Context): Int {
+    val info = packageInfo(context.packageManager, context.packageName, flags = 0L)
+    @Suppress("DEPRECATION")
+    return info?.versionCode ?: 0
+}
+
 internal fun prepareInstall(context: Context, file: File): UpdatePhase {
     val info = packageArchive(context.packageManager, file.absolutePath) ?: run {
         file.delete()
