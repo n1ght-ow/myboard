@@ -240,6 +240,12 @@ private fun shattersIncompleteTail(parts: List<String>, trie: SylTrie): Boolean 
     return trie.canonicalOf(merged) == null && trie.hasPrefix(merged, 0)
 }
 
+private fun isPronounAh(text: String): Boolean {
+    if (text.codePointCount(0, text.length) != 2) return false
+    if (text.codePointAt(text.offsetByCodePoints(0, 1)) != '啊'.code) return false
+    return text.codePointAt(0) in intArrayOf('你'.code, '我'.code, '他'.code, '她'.code, '它'.code, '您'.code)
+}
+
 private fun segmentChunk(chunk: String, trie: SylTrie, allowPartial: Boolean): List<Seg> {
     val text = chunk.filter { it in 'a'..'z' }
     if (text.isEmpty()) return emptyList()
@@ -543,8 +549,10 @@ class PinyinDecoder(syllables: Set<String>) {
             letters.length >= 4 &&
             rankedPinyin.none { it.consumed == letters.length && !it.opened && it.pieces == 1 } &&
             (rankedPinyin.firstOrNull()?.freq ?: 0) <= 80_000
+        val strongFuzzyRepair = fuzzy && book.strongFuzzyRepair(body, letters)
         val shouldTryTypos = when {
             letters.length !in 2..22 -> false
+            strongFuzzyRepair -> false
             cleanMidTyping -> false
             body.isEmpty() -> true
             pinyin.isEmpty() && wholeAbbrev.isEmpty() -> true
@@ -557,6 +565,15 @@ class PinyinDecoder(syllables: Set<String>) {
             val typoItems = book.typos(letters, touchHints, touchSamples)
             if (typoItems.isNotEmpty()) {
                 body = if (body.isEmpty()) typoItems else book.rank(body + typoItems)
+            }
+        }
+        if (fuzzy && body.isNotEmpty()) body = book.promoteFuzzyRepair(body, letters)
+        if (body.size > 2) {
+            val particleAt = body.indexOfFirst { isPronounAh(it.text) }
+            if (particleAt > 1) {
+                val next = body.toMutableList()
+                next.add(1, next.removeAt(particleAt))
+                body = next
             }
         }
 
@@ -916,7 +933,7 @@ class PinyinDecoder(syllables: Set<String>) {
             val fetch = if (seg.parts.size == 1) 200 else 40
             val exactRows = spell(seg.parts, boostUser = true, limit = fetch)
             for ((idx, row) in exactRows.withIndex()) {
-                val whole = if (!seg.partial && seg.parts.size >= 3 && row.text.length >= 3) FULL_WORD_BONUS else 0.0
+                val whole = if (!seg.partial && seg.parts.size >= 3 && row.text.codePointCount(0, row.text.length) >= 3) FULL_WORD_BONUS else 0.0
                 val k = seg.parts.size.coerceAtLeast(1)
                 val tailHomophoneAdj = if (idx >= 2 && k >= 2 && row.freq < 50_000) -0.35 * (idx - 1) * k * k else 0.0
                 items += scored(row, wordScore(row.text, row.freq) + whole + tailHomophoneAdj, preedit, false, used, shatteredTail = shattered)
@@ -1198,7 +1215,7 @@ class PinyinDecoder(syllables: Set<String>) {
 
         private fun syllableCount(item: Scored): Int {
             return if (item.syllables.isBlank()) {
-                item.text.length.coerceAtLeast(1)
+                item.text.codePointCount(0, item.text.length).coerceAtLeast(1)
             } else {
                 item.syllables.count { it == ' ' } + 1
             }
@@ -1532,6 +1549,66 @@ class PinyinDecoder(syllables: Set<String>) {
                 if (previous == null || effective(item) > effective(previous)) best[item.text] = item
             }
             return best.values.sortedByDescending { effective(it) }
+        }
+
+        fun strongFuzzyRepair(items: List<Scored>, letters: String): Boolean {
+            return items.any { item ->
+                isFuzzyRepair(item, letters) && item.freq >= 100_000
+            }
+        }
+
+        fun promoteFuzzyRepair(items: List<Scored>, letters: String): List<Scored> {
+            val ranked = rank(items)
+            if (ranked.size < 3) return ranked
+            val repair = ranked
+                .filter { isPromotableFuzzy(it, letters) && it.pieces == 1 && it.freq >= 400_000 }
+                .maxByOrNull { it.freq }
+                ?: return ranked
+            val index = ranked.indexOfFirst { it.text == repair.text }
+            if (index in 0..2) return ranked
+            val exactAhead = ranked.take(3).count { isExactReading(it, letters) }
+            if (exactAhead == 0) return ranked
+            val insertAt = maxOf(1, minOf(2, exactAhead))
+            val displaced = ranked.getOrNull(insertAt) ?: return ranked
+            if (repair.freq < displaced.freq * 3) return ranked
+            val next = ranked.toMutableList()
+            next.removeAt(index)
+            next.add(insertAt, repair)
+            return next
+        }
+
+        private fun isFuzzyRepair(item: Scored, letters: String): Boolean {
+            return !item.typo &&
+                !item.opened &&
+                item.consumed == letters.length &&
+                item.preedit.filter { it in 'a'..'z' } != letters
+        }
+
+        private fun isPromotableFuzzy(item: Scored, letters: String): Boolean {
+            if (item.typo || item.consumed != letters.length) return false
+            if (isFuzzyRepair(item, letters)) return true
+            return item.opened && isFuzzySyllableExtension(item)
+        }
+
+        private fun isFuzzySyllableExtension(item: Scored): Boolean {
+            val typed = item.preedit.split('\'').filter { it.isNotEmpty() }
+            val actual = item.syllables.split(' ').filter { it.isNotEmpty() }
+            if (typed.size != actual.size || typed.isEmpty()) return false
+            var edits = 0
+            for (index in typed.indices) {
+                if (typed[index] == actual[index]) continue
+                val expanded = expandSyllable(typed[index])
+                if (actual[index] !in expanded || actual[index] == typed[index]) return false
+                edits++
+            }
+            return edits in 1..2
+        }
+
+        private fun isExactReading(item: Scored, letters: String): Boolean {
+            return !item.typo &&
+                !item.opened &&
+                item.consumed == letters.length &&
+                item.preedit.filter { it in 'a'..'z' } == letters
         }
 
         private fun opened(seg: Seg): List<Scored> {
@@ -2008,7 +2085,7 @@ class PinyinDecoder(syllables: Set<String>) {
     }
 
     private fun wordScore(text: String, freq: Int): Double {
-        val count = text.length.coerceAtLeast(1)
+        val count = text.codePointCount(0, text.length).coerceAtLeast(1)
         return count * count * ln(freq.coerceAtLeast(1).toDouble())
     }
 

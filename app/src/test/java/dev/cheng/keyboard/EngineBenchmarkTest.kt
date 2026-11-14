@@ -1030,5 +1030,216 @@ class EngineBenchmarkTest {
         assertEquals("Expected EN_LONG_TYPO Top1 == 15/15 ($enLtMiss)", enLongTypos.size, enLt1)
         assertEquals("Expected EN_SPATIAL Top3 == 8/8 ($enSpMiss)", enSpatialCases.size, enSp3)
     }
+
+    @Test
+    fun round3SelfMine() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = lexicon
+            it.latin = latin
+        }
+        val bestExact = HashMap<String, FullEntry>(180_000)
+        val bestInitial = HashMap<String, FullEntry>(120_000)
+        val bestSingle = HashMap<String, LexRow>(8_192)
+        for (entry in lexicon.allEntries) {
+            val row = entry.row
+            if (entry.nsy == 1 && ' ' !in row.syllables && row.syllables.all { it in 'a'..'z' }) {
+                val prev = bestSingle[row.syllables]
+                if (prev == null || row.freq > prev.freq) bestSingle[row.syllables] = row
+            }
+            if (entry.nsy !in 2..4) continue
+            if ('v' in row.letters || row.letters.any { it !in 'a'..'z' }) continue
+            val exactPrev = bestExact[row.letters]
+            if (exactPrev == null || row.freq > exactPrev.row.freq) bestExact[row.letters] = entry
+            val initials = entry.initials
+            if (initials.length in 2..6 && initials != row.letters && initials.all { it in 'a'..'z' }) {
+                val initPrev = bestInitial[initials]
+                if (initPrev == null || row.freq > initPrev.row.freq) bestInitial[initials] = entry
+            }
+        }
+        val byFreq = bestExact.values.sortedByDescending { it.row.freq }
+
+        val lines = ArrayList<String>(400)
+        val band = byFreq.drop(2_000).take(700)
+        var bandTop1 = 0
+        var bandTop3 = 0
+        var bandShown = 0
+        for (entry in band) {
+            val decoded = decoder.decode(entry.row.letters, fuzzy = false)
+            val top = decoded.candidates.take(3).map { it.text }
+            if (top.firstOrNull() == entry.row.text) bandTop1++
+            if (entry.row.text in top) bandTop3++
+            else if (bandShown < 24) {
+                bandShown++
+                lines += "[EXACT_BAND] '${entry.row.letters}' -> want '${entry.row.text}' (${entry.row.syllables}, f=${entry.row.freq}), got $top preedit=${decoded.preedit}"
+            }
+        }
+        lines += "EXACT_BAND : Top1=$bandTop1/${band.size}, Top3=$bandTop3/${band.size}"
+
+        val singles = bestSingle.values.filter { it.freq >= 40_000 }.sortedByDescending { it.freq }
+        var singleTop1 = 0
+        var singleShown = 0
+        for (row in singles) {
+            val decoded = decoder.decode(row.syllables, fuzzy = false)
+            val top = decoded.candidates.take(3).map { it.text }
+            if (top.firstOrNull() == row.text) {
+                singleTop1++
+            } else if (singleShown < 20) {
+                singleShown++
+                lines += "[SINGLE] '${row.syllables}' -> want '${row.text}' (f=${row.freq}), got $top preedit=${decoded.preedit}"
+            }
+        }
+        lines += "SINGLE : Top1=$singleTop1/${singles.size}"
+
+        val jianpin = bestInitial.values
+            .sortedByDescending { it.row.freq }
+            .filter { entry ->
+                val rival = lexicon.exact(entry.initials, 1).firstOrNull()
+                rival == null || entry.row.freq > rival.freq * 4
+            }
+            .take(280)
+        var jp1 = 0
+        var jp3 = 0
+        var jpShown = 0
+        for (entry in jianpin) {
+            val decoded = decoder.decode(entry.initials, fuzzy = false)
+            val top = decoded.candidates.take(3).map { it.text }
+            if (top.firstOrNull() == entry.row.text) jp1++
+            if (entry.row.text in top) jp3++
+            else if (jpShown < 24) {
+                jpShown++
+                val rival = lexicon.exact(entry.initials, 1).firstOrNull()
+                lines += "[JIANPIN] '${entry.initials}' -> want '${entry.row.text}' (${entry.row.syllables}, f=${entry.row.freq}), rival=${rival?.text}(${rival?.freq}), got $top preedit=${decoded.preedit}"
+            }
+        }
+        lines += "JIANPIN : Top1=$jp1/${jianpin.size}, Top3=$jp3/${jianpin.size}"
+
+        val prefixes = byFreq.drop(200).take(500).filter { entry ->
+            val last = entry.row.syllables.substringAfterLast(' ')
+            if (last.length < 2) return@filter false
+            val prefix = entry.row.letters.dropLast(1)
+            val rival = lexicon.exact(prefix, 1).firstOrNull()
+            rival == null || entry.row.freq > rival.freq * 8
+        }
+        var pre1 = 0
+        var pre3 = 0
+        var preShown = 0
+        for (entry in prefixes) {
+            val prefix = entry.row.letters.dropLast(1)
+            val decoded = decoder.decode(prefix, fuzzy = false)
+            val top = decoded.candidates.take(3).map { it.text }
+            if (top.firstOrNull() == entry.row.text) pre1++
+            if (entry.row.text in top) pre3++
+            else if (preShown < 20) {
+                preShown++
+                lines += "[PREFIX] '$prefix' -> want '${entry.row.text}' (f=${entry.row.freq}), got $top preedit=${decoded.preedit}"
+            }
+        }
+        lines += "PREFIX : Top1=$pre1/${prefixes.size}, Top3=$pre3/${prefixes.size}"
+
+        val fuzzyPool = byFreq.take(160)
+        var fzTried = 0
+        var fz1 = 0
+        var fz3 = 0
+        var fzShown = 0
+        for (entry in fuzzyPool) {
+            if (fzTried >= 90) break
+            val parts = entry.row.syllables.split(' ')
+            val changed = parts.map { fuzzyShrink(it) }
+            if (changed == parts) continue
+            val raw = changed.joinToString("")
+            if (raw == entry.row.letters) continue
+            val rival = lexicon.exact(raw, 1).firstOrNull()
+            if (rival != null && rival.freq * 3 >= entry.row.freq) continue
+            fzTried++
+            val decoded = decoder.decode(raw, fuzzy = true)
+            val top = decoded.candidates.take(3).map { it.text }
+            if (top.firstOrNull() == entry.row.text) fz1++
+            if (entry.row.text in top) fz3++
+            else if (fzShown < 20) {
+                fzShown++
+                lines += "[FUZZY] '$raw' -> want '${entry.row.text}' (${entry.row.syllables}, f=${entry.row.freq}), rival=${rival?.text}(${rival?.freq}), got $top"
+            }
+        }
+        lines += "FUZZY_AUTO : Top1=$fz1/$fzTried, Top3=$fz3/$fzTried"
+
+        val typos = byFreq.take(80).filter { it.row.letters.length >= 6 && it.nsy == 2 }
+        var typoTried = 0
+        var typo3 = 0
+        var typoShown = 0
+        for (entry in typos) {
+            if (typoTried >= 36) break
+            val letters = entry.row.letters
+            val cut = entry.row.syllables.substringBefore(' ').length
+            if (cut <= 0 || cut >= letters.length) continue
+            val chars = letters.toCharArray()
+            val tmp = chars[cut - 1]
+            chars[cut - 1] = chars[cut]
+            chars[cut] = tmp
+            val swapped = String(chars)
+            val rival = lexicon.exact(swapped, 1).firstOrNull()
+            if (rival != null && rival.freq * 8 >= entry.row.freq) continue
+            typoTried++
+            val decoded = decoder.decode(swapped, fuzzy = false)
+            val top = decoded.candidates.take(5).map { it.text }
+            if (entry.row.text in top) typo3++
+            else if (typoShown < 16) {
+                typoShown++
+                lines += "[BOUNDARY_SWAP] '$swapped' -> want '${entry.row.text}' (${entry.row.letters}, f=${entry.row.freq}), rival=${rival?.text}(${rival?.freq}), got $top preedit=${decoded.preedit}"
+            }
+        }
+        lines += "BOUNDARY_SWAP : Top5=$typo3/$typoTried"
+
+        val probes = listOf(
+            "nia", "nima", "niba", "woa", "taa", "dama", "mama",
+            "dang", "dan", "shang", "xiang", "jian", "nian", "qian",
+            "zhidao", "keyi", "meiyou", "yixia", "women", "shenme", "zenme",
+            "haode", "haoba", "xiexie", "buneng", "app", "wifi", "hello",
+        )
+        for (raw in probes) {
+            val decoded = decoder.decode(raw, fuzzy = false)
+            val top = decoded.candidates.take(5).map { it.text }
+            lines += "[PROBE] '$raw' -> $top preedit=${decoded.preedit}"
+        }
+
+        val niaDecoded = decoder.decode("nia", fuzzy = false)
+        val niaTop = niaDecoded.candidates.take(3).map { it.text }
+        lines += "[CHECK] nia -> $niaTop preedit=${niaDecoded.preedit}"
+        val denji = decoder.decode("denji", fuzzy = true).candidates.take(3).map { it.text }
+        lines += "[CHECK] denji -> $denji"
+        val jisu = decoder.decode("jisu", fuzzy = true).candidates.take(3).map { it.text }
+        lines += "[CHECK] jisu -> $jisu"
+        val yijin = decoder.decode("yijin", fuzzy = true).candidates.take(3).map { it.text }
+        lines += "[CHECK] yijin -> $yijin"
+
+        val report = File("build/reports/round3-mine.txt")
+        report.parentFile?.mkdirs()
+        report.writeText(lines.joinToString("\n"), StandardCharsets.UTF_8)
+        lines.forEach { println(it) }
+        assertTrue("round3 evaluated an empty exact band", band.size >= 500)
+        assertEquals("common syllables should keep their highest-frequency character first", singles.size, singleTop1)
+        assertEquals("nia", niaDecoded.preedit)
+        assertTrue("nia should rank 你啊 in top3, got $niaTop", "你啊" in niaTop)
+        assertEquals("年", niaTop.first())
+        assertEquals("当", decoder.decode("dang", fuzzy = false).candidates.first().text)
+        assertTrue("denji fuzzy should rank 等级 in top3, got $denji", "等级" in denji)
+        assertEquals("激素", jisu.first())
+        assertTrue("jisu fuzzy should keep 技术 in top3, got $jisu", "技术" in jisu)
+        assertEquals("一斤", yijin.first())
+        assertTrue("yijin fuzzy should keep 已经 in top3, got $yijin", "已经" in yijin)
+        assertTrue(report.isFile)
+    }
+
+    private fun fuzzyShrink(syllable: String): String = when {
+        syllable.startsWith("zh") -> "z" + syllable.removePrefix("zh")
+        syllable.startsWith("ch") -> "c" + syllable.removePrefix("ch")
+        syllable.startsWith("sh") -> "s" + syllable.removePrefix("sh")
+        syllable.endsWith("iang") -> syllable.dropLast(1)
+        syllable.endsWith("uang") -> syllable.dropLast(1)
+        syllable.endsWith("ang") -> syllable.dropLast(1)
+        syllable.endsWith("eng") -> syllable.dropLast(1)
+        syllable.endsWith("ing") -> syllable.dropLast(1)
+        else -> syllable
+    }
 }
 
