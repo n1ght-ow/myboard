@@ -153,12 +153,14 @@ class LatinDecoder {
         if (prefix.length >= 2 && (!strongPrefixMatch || completions.size < 3 || hasBorderTap)) {
             for (hit in fuzzyMatches(prefix, touchHints, touchSamples)) {
                 val baseScore = ln(hit.freq.coerceAtLeast(1).toDouble()) - hit.cost * 3.2 + contextBonus(hit.word)
+                val spatialFuzzy = hasBorderTap && hit.cost <= 1.5
                 val adjusted = when {
                     !strongPrefixMatch -> baseScore
                     hit.cost <= 0.60 && credibleExact && hit.freq.toLong() > (exactWord?.freq ?: 0).toLong() * 8L ->
                         baseScore + 28.5
                     hit.cost <= 0.60 && !credibleExact -> baseScore - 1.2
                     hit.cost <= 0.60 -> baseScore - 2.0
+                    spatialFuzzy -> baseScore - 0.8
                     else -> baseScore - 8.0
                 }
                 offer(hit.word, hit.freq, adjusted)

@@ -435,6 +435,9 @@ class PinyinDecoder(syllables: Set<String>) {
     @Volatile
     var latin: LatinDecoder? = null
 
+    @Volatile
+    var poetry: PoetryIndex = PoetryIndex.Empty
+
     var nowProvider: () -> LocalDateTime = { LocalDateTime.now() }
 
     private val user = mutableListOf<LexRow>()
@@ -538,36 +541,178 @@ class PinyinDecoder(syllables: Set<String>) {
         // Typo & transposition recovery when input is not a clean multi-letter syllable string or multi-initial abbreviation
         val startsWithSyllable = trie.canonicalEndings(letters, 0).any { it.first >= 2 }
         val hasStrongExactAbbrev = wholeAbbrev.any { !it.opened && it.freq >= 200_000 }
+        val topBodyFreq = body.firstOrNull()?.freq ?: 0
+        val solidExactWord = rankedPinyin.firstOrNull {
+            it.consumed == letters.length && !it.opened && it.pieces == 1
+        }
+        val weakSolidWord = solid && solidExactWord != null && solidExactWord.freq < 500
+        val highConfidenceSolidRepair = solid && solidExactWord != null && solidExactWord.freq < 30_000
+        val topSolidText = rankedPinyin.firstOrNull()?.text.orEmpty()
+        val cleanOpenCompletion = open.any { seg ->
+            seg.parts.size >= 2 &&
+                seg.parts.last().length >= 2 &&
+                seg.parts.all { it.length >= 2 && it !in shengmu } &&
+                !activeTrie.isWord(seg.parts.last())
+        }
+        val cleanOpenLongTail = open.any { seg ->
+            seg.parts.size >= 2 &&
+                seg.parts.last().length >= 3 &&
+                seg.parts.all { it.length >= 2 && it !in shengmu } &&
+                !activeTrie.isWord(seg.parts.last())
+        }
+        val topSolidTailFreq = if (
+            solid &&
+            solidExactWord == null &&
+            topSolidText.length >= 2 &&
+            topBodyFreq <= 80_000
+        ) {
+            val tail = topSolidText.takeLast(2)
+            lexicon.phraseFreqs(listOf(tail))[tail] ?: 0
+        } else {
+            Int.MAX_VALUE
+        }
+        val weakSolidComposition = solid &&
+            solidExactWord == null &&
+            letters.length >= 4 &&
+            topBodyFreq <= 1_000_000 &&
+            topSolidTailFreq < 10_000 &&
+            (rankedPinyin.firstOrNull()?.text?.lastOrNull()?.toString() ?: "") !in clauseFinalParticles &&
+            !cleanOpenCompletion
+        val compositionSolidRepair = solid &&
+            solidExactWord == null &&
+            letters.length in 4..7 &&
+            (body.firstOrNull()?.pieces ?: 1) >= 2 &&
+            topBodyFreq <= 4_500_000 &&
+            (body.firstOrNull()?.text?.lastOrNull()?.toString() ?: "") !in clauseFinalParticles &&
+            !cleanOpenCompletion
+        val noCleanReading = open.isEmpty() && pinyin.isEmpty() && wholeAbbrev.isEmpty()
+        val abbrevOnlyReading = open.isEmpty() &&
+            pinyin.isEmpty() &&
+            wholeAbbrev.isNotEmpty() &&
+            letters.length >= 4 &&
+            topBodyFreq <= 1_000_000
+        val hasCleanOpenedCompletion = body.any { it.opened && it.pieces == 1 }
         val cleanMidTyping = !solid &&
             body.isNotEmpty() &&
+            (topBodyFreq >= 20_000 || hasCleanOpenedCompletion) &&
+            ((body.firstOrNull()?.pieces ?: 1) == 1 || cleanOpenLongTail) &&
+            cleanOpenCompletion
+        val topBodyText = body.firstOrNull()?.text.orEmpty()
+        val topBodyPhraseFreq = if (topBodyText.isNotEmpty()) {
+            lexicon.phraseFreqs(listOf(topBodyText))[topBodyText] ?: 0
+        } else {
+            0
+        }
+        val cleanSingleInitial = !solid &&
+            body.isNotEmpty() &&
+            topBodyFreq >= 5_000 &&
+            topBodyPhraseFreq >= 100 &&
             open.any { seg ->
-                seg.parts.last().length >= 3 &&
-                    seg.parts.all { it.length >= 2 && it !in shengmu } &&
-                    !activeTrie.isWord(seg.parts.last())
+                seg.parts.size >= 2 &&
+                    seg.parts.last().length == 1 &&
+                    seg.parts.last()[0] !in "aeiouv" &&
+                    seg.parts.dropLast(1).all { it.length >= 2 && it !in shengmu && activeTrie.isWord(it) }
             }
-        val weakSolidComposition = solid &&
-            letters.length >= 4 &&
-            rankedPinyin.none { it.consumed == letters.length && !it.opened && it.pieces == 1 } &&
-            (rankedPinyin.firstOrNull()?.freq ?: 0) <= 80_000
+        val weakComposedBody = !solid &&
+            body.isNotEmpty() &&
+            (body.firstOrNull()?.pieces ?: 1) >= 2 &&
+            topBodyFreq <= 5_000_000 &&
+            !cleanOpenCompletion
         val strongFuzzyRepair = fuzzy && book.strongFuzzyRepair(body, letters)
         val shouldTryTypos = when {
             letters.length !in 2..22 -> false
             strongFuzzyRepair -> false
-            cleanMidTyping -> false
+            cleanMidTyping || cleanSingleInitial -> false
             body.isEmpty() -> true
             pinyin.isEmpty() && wholeAbbrev.isEmpty() -> true
-            weakSolidComposition -> true
+            weakSolidWord || weakSolidComposition || compositionSolidRepair -> true
+            highConfidenceSolidRepair -> true
+            noCleanReading || abbrevOnlyReading -> true
             !solid && letters.length >= 4 && pinyin.isEmpty() && startsWithSyllable && !hasStrongExactAbbrev -> true
             !solid && letters.length >= 3 && !book.hasMultiAbbrevInitials(letters, wholeAbbrev) -> true
             else -> false
         }
         if (shouldTryTypos) {
-            val typoItems = book.typos(letters, touchHints, touchSamples)
-            if (typoItems.isNotEmpty()) {
-                body = if (body.isEmpty()) typoItems else book.rank(body + typoItems)
+            val typoItems = book.typos(letters, touchHints, touchSamples).let { items ->
+                if (weakSolidWord) {
+                    items.filter {
+                        it.freq >= 1_000_000 ||
+                            (
+                                it.freq >= 10_000 &&
+                                    it.syllables.replace(" ", "").length > letters.length
+                                )
+                    }
+                } else if (highConfidenceSolidRepair) {
+                    items.filter { it.freq >= 1_000_000 }
+                } else if (compositionSolidRepair) {
+                    items.filter { it.freq >= 800_000 }
+                } else if (abbrevOnlyReading) {
+                    items.filter { it.freq >= 500_000 }
+                } else {
+                    items
+                }
+            }
+            val insertionMinFreq = when {
+                weakSolidWord -> 10_000
+                highConfidenceSolidRepair -> 500_000
+                weakComposedBody -> 500_000
+                weakSolidComposition -> 1_000_000
+                compositionSolidRepair -> 1_000_000
+                abbrevOnlyReading -> 1_000_000
+                noCleanReading -> 250_000
+                cleanOpenCompletion -> 1_000_000
+                else -> Int.MAX_VALUE
+            }
+            val hasExactReading = book.hasExactReading(body, letters)
+            val hasUmlautReading = body.take(1).any { item ->
+                item.syllables.split(' ').any { it == "lv" || it == "nv" }
+            }
+            val insertionItems = if (
+                insertionMinFreq < Int.MAX_VALUE &&
+                !(fuzzy && hasExactReading) &&
+                !hasUmlautReading
+            ) {
+                book.insertionRepairs(letters, insertionMinFreq)
+            } else {
+                emptyList()
+            }
+            val repaired = typoItems + insertionItems
+            if (repaired.isNotEmpty()) {
+                val combined = ArrayList<Scored>(body.size + repaired.size)
+                combined.addAll(body)
+                combined.addAll(repaired)
+                body = book.rank(combined)
             }
         }
+        val doubledLead = if (
+            letters.length >= 3 &&
+            letters[0] == letters[1] &&
+            letters[0] !in "aeiouv"
+        ) {
+            book.doubleLeadRepairs(letters, 500_000)
+        } else {
+            emptyList()
+        }
+        if (doubledLead.isNotEmpty()) {
+            val best = doubledLead.first()
+            body = listOf(best) + body.filter { it.text != best.text }
+        }
+        val interiorDuplicate = if (!solid && letters.length >= 4) {
+            book.interiorDuplicateRepairs(letters, 500_000)
+        } else {
+            emptyList()
+        }
+        val bestInteriorDuplicate = interiorDuplicate.firstOrNull()
+        if (
+            bestInteriorDuplicate != null &&
+            bestInteriorDuplicate.freq >= maxOf(500_000, topBodyPhraseFreq * 2)
+        ) {
+            body = listOf(bestInteriorDuplicate) + body.filter { it.text != bestInteriorDuplicate.text }
+        }
         if (fuzzy && body.isNotEmpty()) body = book.promoteFuzzyRepair(body, letters)
+        val leadingStrongRepair = body.firstOrNull()?.let { top ->
+            top.typo && top.freq >= 1_000_000
+        } == true
         if (body.size > 2) {
             val particleAt = body.indexOfFirst { isPronounAh(it.text) }
             if (particleAt > 1) {
@@ -643,7 +788,21 @@ class PinyinDecoder(syllables: Set<String>) {
                 !topZh.typo &&
                 topZh.freq >= 500_000 &&
                 exactEnFreq < 20_000
+            val strongOpenedZh = topZh != null &&
+                open.isNotEmpty() &&
+                topZh.text.length >= 2 &&
+                topZh.pieces == 1 &&
+                !topZh.typo &&
+                topZh.freq >= 200_000 &&
+                exactEnFreq in 100_000..499_999 &&
+                topZh.freq >= exactEnFreq &&
+                topZh.freq <= exactEnFreq * 2
             val strongZh = solid || strongZhPrefix || (
+                topZh != null &&
+                    topZh.opened &&
+                    topZh.freq >= 200_000 &&
+                    open.isNotEmpty()
+                ) || (
                 topZh != null &&
                     !credibleEnOverAbbrev &&
                     !topZh.typo &&
@@ -651,8 +810,8 @@ class PinyinDecoder(syllables: Set<String>) {
                     topZh.pieces == 1 &&
                     !invertedInitialFull &&
                     topZh.freq >= 12_000
-                )
-            if (!strongZh && exactEnFreq > 0) {
+                ) || strongOpenedZh
+            if (!strongZh && !leadingStrongRepair && exactEnFreq > 0) {
                 val enSource = en.suggest(letters).filter { it.freq >= 50 || it.text.equals(letters, ignoreCase = true) }.take(2)
                 val enItems = enSource.map { cand ->
                     val cased = applyCase(cand.text, typedCased)
@@ -661,7 +820,11 @@ class PinyinDecoder(syllables: Set<String>) {
                 if (enItems.isNotEmpty()) {
                     items.addAll(0, enItems)
                 }
-            } else if (!hadDirectFullOrAbbrevChinese && (exactEnFreq > 0 || (full.isEmpty() && open.isEmpty()))) {
+            } else if (
+                !hadDirectFullOrAbbrevChinese &&
+                !leadingStrongRepair &&
+                (exactEnFreq > 0 || (full.isEmpty() && open.isEmpty()))
+            ) {
                 val enSource = if (exactEnFreq > 0) {
                     en.suggest(letters).take(3)
                 } else {
@@ -681,6 +844,33 @@ class PinyinDecoder(syllables: Set<String>) {
                     val insertAt = minOf(if (hasUpper) 2 else 3, items.size)
                     items.add(insertAt, Scored(cased, "", exactEnFreq, 50.0, typedCased, false, letters.length))
                 }
+            }
+        }
+
+        if (
+            poetry.size > 0 &&
+            letters.length in PoetryIndex.MIN_INITIALS..PoetryIndex.MAX_INITIALS &&
+            (solidExactWord?.freq ?: 0) < 50_000 &&
+            (latin?.exactFreq(letters) ?: 0) < 50_000
+        ) {
+            val poems = poetry.exact(letters)
+            if (poems.isNotEmpty()) {
+                val poemTexts = poems.mapTo(HashSet()) { it.text }
+                items.removeAll { it.text in poemTexts }
+                items.addAll(
+                    0,
+                    poems.map { line ->
+                        Scored(
+                            text = line.text,
+                            syllables = "",
+                            freq = 500_000,
+                            score = 420.0,
+                            preedit = text,
+                            typo = false,
+                            consumed = letters.length,
+                        )
+                    },
+                )
             }
         }
 
@@ -1007,6 +1197,34 @@ class PinyinDecoder(syllables: Set<String>) {
 
         fun abbreviations(letters: String): List<Scored> {
             val items = ArrayList<Scored>()
+            if (letters.length in 2..8) {
+                val directPreedit = letters.toCharArray().joinToString("'")
+                for (row in initialsQuery(letters, 64, exactOnly = true)) {
+                    val parts = row.syllables.split(' ')
+                    val count = parts.size.coerceAtLeast(1)
+                    var penalty = count * 2.6
+                    var cursor = 0
+                    for (part in parts) {
+                        val typedLen = if (part.startsWith("zh") || part.startsWith("ch") || part.startsWith("sh")) 2 else 1
+                        val typed = if (cursor + typedLen <= letters.length) {
+                            letters.substring(cursor, cursor + typedLen)
+                        } else {
+                            ""
+                        }
+                        if ('v' !in typed && part.length >= 2 && part[1] == 'v') {
+                            penalty += count * 4.5
+                        }
+                        cursor += typedLen
+                    }
+                    items += scored(
+                        row,
+                        wordScore(row.text, row.freq) - penalty,
+                        directPreedit,
+                        false,
+                        letters.length,
+                    )
+                }
+            }
             val paths = tokenPaths(letters)
             for (token in paths) {
                 if (token.size > 12) continue
@@ -1231,7 +1449,9 @@ class PinyinDecoder(syllables: Set<String>) {
             val extraSplits = if (minSyl < Int.MAX_VALUE && k > minSyl) k - minSyl else 0
             val splitUnit = if (minSyl == 1) SINGLE_SYLLABLE_SPLIT_PENALTY else SPLIT_PENALTY
             val openPenalty = if (item.opened) {
-                OPENED_PENALTY + 0.08 * (item.untyped - 1).coerceAtLeast(0)
+                OPENED_PENALTY +
+                    0.08 * (item.untyped - 1).coerceAtLeast(0) +
+                    0.9 * (item.pieces - 1).coerceAtLeast(0)
             } else {
                 0.0
             }
@@ -1355,16 +1575,22 @@ class PinyinDecoder(syllables: Set<String>) {
             for ((seg, cost, spatialPenalty) in corrected) {
                 val k = seg.parts.size.coerceAtLeast(1)
                 val perSylPen = if (cost == 1) {
-                    if (spatialPenalty < 0.99f) {
+                    if (spatialPenalty <= 0.35f) {
+                        0.55 + 0.8 * spatialPenalty.coerceIn(0f, 1f)
+                    } else if (spatialPenalty < 0.99f) {
                         2.15 - 1.05 * (1.0 - spatialPenalty.coerceIn(0f, 1f))
                     } else {
-                        3.95
+                        4.2
                     }
                 } else {
                     3.20 * cost
                 }
                 val scaleK2 = if (k == 1) 4.0 else k.toDouble() * k
-                val rawPenalty = scaleK2 * perSylPen
+                val rawPenalty = if (cost == 1 && k >= 2) {
+                    k * perSylPen * 1.6
+                } else {
+                    scaleK2 * perSylPen
+                }
                 val directRows = spell(seg.parts, boostUser = true).take(2)
                 for (row in directRows) {
                     items += scored(row, wordScore(row.text, row.freq) - rawPenalty, letters, true, letters.length)
@@ -1390,7 +1616,7 @@ class PinyinDecoder(syllables: Set<String>) {
                         .firstOrNull { !it.partial && it.parts.size >= 2 && it.parts.all { p -> p.length >= 2 } }
                         ?: continue
                     val k = seg.parts.size.coerceAtLeast(1)
-                    val rawSwapPen = k.toDouble() * k * 2.25
+                    val rawSwapPen = k.toDouble() * k * 1.4
                     val direct = spell(seg.parts, boostUser = true).take(2)
                     for (row in direct) {
                         items += scored(row, wordScore(row.text, row.freq) - rawSwapPen, letters, true, letters.length)
@@ -1451,6 +1677,65 @@ class PinyinDecoder(syllables: Set<String>) {
                 }
             }
             return rank(items)
+        }
+
+        fun insertionRepairs(letters: String, minFreq: Int = 10_000): List<Scored> {
+            if (letters.length !in 3..18) return emptyList()
+            val items = ArrayList<Scored>()
+            val seen = HashSet<String>()
+            for (pos in 0..letters.length) {
+                for (ch in 'a'..'z') {
+                    if (pos in 1 until letters.length && letters[pos - 1] == ch) continue
+                    val candidate = letters.substring(0, pos) + ch + letters.substring(pos)
+                    for (row in lexicon.exact(candidate, 3)) {
+                        if (row.freq < minFreq) continue
+                        val count = row.text.codePointCount(0, row.text.length)
+                        if (count !in 2..6 || !seen.add(row.text)) continue
+                        val k = row.syllables.count { it == ' ' } + 1
+                        val rawPenalty = k * 3.6
+                        items += scored(
+                            row,
+                            wordScore(row.text, row.freq) - rawPenalty,
+                            letters,
+                            true,
+                            letters.length,
+                        )
+                    }
+                }
+            }
+            val repaired = rank(items).take(6)
+            return repaired
+        }
+
+        fun doubleLeadRepairs(letters: String, minFreq: Int): List<Scored> {
+            if (letters.length !in 3..18 || letters[0] != letters[1] || letters[0] in "aeiouv") return emptyList()
+            val items = ArrayList<Scored>(4)
+            for (row in lexicon.exact(letters.drop(1), 6)) {
+                if (row.freq < minFreq) continue
+                val count = row.text.codePointCount(0, row.text.length)
+                if (count !in 2..6) continue
+                val k = row.syllables.count { it == ' ' } + 1
+                items += scored(row, wordScore(row.text, row.freq) - k * 4.0, letters, true, letters.length)
+            }
+            return rank(items).take(2)
+        }
+
+        fun interiorDuplicateRepairs(letters: String, minFreq: Int): List<Scored> {
+            if (letters.length !in 4..18) return emptyList()
+            val items = ArrayList<Scored>(6)
+            val seen = HashSet<String>()
+            for (index in 1 until letters.length - 1) {
+                if (letters[index] != letters[index + 1]) continue
+                val candidate = letters.removeRange(index, index + 1)
+                for (row in lexicon.exact(candidate, 6)) {
+                    if (row.freq < minFreq) continue
+                    val count = row.text.codePointCount(0, row.text.length)
+                    if (count !in 2..6 || !seen.add(row.text)) continue
+                    val k = row.syllables.count { it == ' ' } + 1
+                    items += scored(row, wordScore(row.text, row.freq) - k * 4.0, letters, true, letters.length)
+                }
+            }
+            return rank(items).take(2)
         }
 
         fun softTouchVariants(letters: String, samples: List<TouchSample?>): List<Scored> {
@@ -1557,6 +1842,10 @@ class PinyinDecoder(syllables: Set<String>) {
             }
         }
 
+        fun hasExactReading(items: List<Scored>, letters: String): Boolean {
+            return items.any { isExactReading(it, letters) }
+        }
+
         fun promoteFuzzyRepair(items: List<Scored>, letters: String): List<Scored> {
             val ranked = rank(items)
             if (ranked.size < 3) return ranked
@@ -1611,6 +1900,22 @@ class PinyinDecoder(syllables: Set<String>) {
                 item.preedit.filter { it in 'a'..'z' } == letters
         }
 
+        private fun continuationBonus(prefix: String, text: String): Double {
+            if (prefix.isEmpty() || !text.startsWith(prefix)) return 0.0
+            val rest = text.removePrefix(prefix)
+            if (rest.isEmpty()) return 0.0
+            val best = commonContinuations[prefix].orEmpty()
+                .maxOfOrNull { hint ->
+                    when {
+                        rest.startsWith(hint) -> hint.length
+                        hint.startsWith(rest) -> rest.length
+                        else -> 0
+                    }
+                }
+                ?: 0
+            return if (best > 0) 1.8 + 0.4 * best else 0.0
+        }
+
         private fun opened(seg: Seg): List<Scored> {
             val preedit = seg.parts.joinToString("'")
             val used = typedLength(seg.parts)
@@ -1621,11 +1926,36 @@ class PinyinDecoder(syllables: Set<String>) {
             val canonicalHead = head.map { if (it == "r") "er" else (trie.canonicalOf(it) ?: it) }
             val normalizedParts = canonicalHead + tail
             val prefix = normalizedParts.joinToString(" ")
-            val longer = lexicon.spellingStarting(prefix, normalizedParts.size, 16) + user.filter { extends(it, normalizedParts) }
+            val headText = if (canonicalHead.isEmpty()) {
+                ""
+            } else {
+                spell(canonicalHead, boostUser = true).firstOrNull()?.text.orEmpty()
+            }
+            val longer = ArrayList<LexRow>(16)
+            longer += lexicon.spellingStarting(prefix, normalizedParts.size, 16)
+            if (bareInitialTail && normalizedParts.size < 6) {
+                longer += lexicon.spellingStarting(prefix, normalizedParts.size + 1, 12)
+            }
+            longer += user.filter { extends(it, normalizedParts) }
             for (row in longer) {
                 if (!extends(row, normalizedParts)) continue
-                val untyped = if (bareInitialTail) 1 else (row.syllables.substringAfterLast(' ').length - tail.length).coerceAtLeast(1)
-                items += scored(row, wordScore(row.text, row.freq), preedit, false, used, opened = true, untyped = untyped)
+                val untyped = if (bareInitialTail) {
+                    (row.syllables.split(' ').size - normalizedParts.size + 1).coerceAtLeast(1)
+                } else {
+                    (row.syllables.substringAfterLast(' ').length - tail.length).coerceAtLeast(1)
+                }
+                val rowSyllables = row.syllables.count { it == ' ' } + 1
+                val collocation = continuationBonus(headText, row.text)
+                items += scored(
+                    row,
+                    wordScore(row.text, row.freq) +
+                        collocation * rowSyllables * rowSyllables,
+                    preedit,
+                    false,
+                    used,
+                    opened = true,
+                    untyped = untyped,
+                )
             }
             if (canonicalHead.isNotEmpty()) {
                 for ((altHead, penPerSyl) in phoneticVariants(canonicalHead, allowSingle = true)) {
@@ -1654,7 +1984,7 @@ class PinyinDecoder(syllables: Set<String>) {
                             val combined = hp.text + erRow.text
                             if (combined.isEmpty()) continue
                             val totalSyl = headLen + erSyls
-                            val erhuaBonus = if (erRow.text.endsWith("儿")) 1.5 * totalSyl * totalSyl else 0.0
+                            val erhuaBonus = if (erRow.text.endsWith("儿")) 2.5 * totalSyl * totalSyl else 0.0
                             val combinedScore = combinePiecesScore(
                                 hp.score,
                                 headLen,
@@ -2021,14 +2351,15 @@ class PinyinDecoder(syllables: Set<String>) {
 
         private fun extends(row: LexRow, parts: List<String>): Boolean {
             val syllables = row.syllables.split(' ')
-            if (syllables.size != parts.size || parts.isEmpty()) return false
+            if (syllables.size < parts.size || parts.isEmpty()) return false
             for (index in 0 until parts.lastIndex) {
                 val target = trie.canonicalOf(parts[index]) ?: parts[index]
                 if (syllables[index] != target) return false
             }
             val typed = normalizePrefix(parts.last())
-            val last = syllables.last()
-            return last.startsWith(typed) && last.length > typed.length
+            val last = syllables[parts.lastIndex]
+            if (!last.startsWith(typed) || last.length <= typed.length) return false
+            return syllables.drop(parts.size).all { it.isNotEmpty() }
         }
 
         private fun scored(
@@ -2090,12 +2421,12 @@ class PinyinDecoder(syllables: Set<String>) {
     }
 
     private companion object {
-        const val FULL_WORD_BONUS = 28.0
+        const val FULL_WORD_BONUS = 50.0
         const val FRAGMENT_PENALTY = 10.0
         const val CONSUMED_WEIGHT = 25.0
         const val SPLIT_PENALTY = 5.5
         const val SINGLE_SYLLABLE_SPLIT_PENALTY = 8.5
-        const val OPENED_PENALTY = 4.50
+        const val OPENED_PENALTY = 3.0
         val shengmu = setOf("zh", "ch", "sh")
         val grammaticalParticles = setOf("的", "了", "吗", "呢", "吧", "啊", "呀", "啦", "着", "过")
         val clauseFinalParticles = setOf("吧", "了", "吗", "呢", "啊", "呀", "啦")

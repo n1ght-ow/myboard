@@ -101,6 +101,54 @@ data class FieldSource(
     val contextAfter: String = "",
 )
 
+data class EditorTextSpan(val start: Int, val end: Int) {
+    fun ordered(): EditorTextSpan = if (start <= end) this else EditorTextSpan(end, start)
+}
+
+fun compositionDetachTarget(
+    compositionLength: Int,
+    remembered: EditorTextSpan?,
+    candidates: EditorTextSpan?,
+    oldSelection: EditorTextSpan,
+    newSelection: EditorTextSpan,
+): EditorTextSpan? {
+    if (compositionLength <= 0) return null
+    val old = oldSelection.ordered()
+    val next = newSelection.ordered()
+    if (old.start < 0 || old.end < 0 || next.start < 0 || next.end < 0) return null
+    if (old == next) return null
+    val composition = candidates?.takeIf { it.start >= 0 && it.end > it.start }
+        ?: remembered?.takeIf {
+            it.start >= 0 && it.end > it.start && it.end - it.start == compositionLength
+        }
+        ?: run {
+            if (old.start == old.end && old.end >= compositionLength) {
+                EditorTextSpan(old.end - compositionLength, old.end)
+            } else {
+                null
+            }
+        }
+        ?: return null
+    return composition.takeUnless { next.start >= it.start && next.end <= it.end }
+}
+
+fun remapSelectionAfterReplacement(
+    selection: EditorTextSpan,
+    replaced: EditorTextSpan,
+    replacementLength: Int,
+): EditorTextSpan {
+    val source = selection.ordered()
+    val range = replaced.ordered()
+    fun map(position: Int): Int = when {
+        position <= range.start -> position
+        position >= range.end -> position - (range.end - range.start) + replacementLength
+        else -> range.start + replacementLength
+    }
+    val start = map(source.start)
+    val end = map(source.end)
+    return if (selection.start <= selection.end) EditorTextSpan(start, end) else EditorTextSpan(end, start)
+}
+
 fun readField(connection: InputConnection): FieldSource? {
     val extracted = connection.getExtractedText(extractedRequest(), 0)
     if (extracted?.text != null) {
@@ -175,6 +223,35 @@ private fun paragraphSource(all: String, cursor: Int): FieldSource {
 
 class EditorBridge(private val connection: () -> InputConnection?) {
     private var composing = false
+
+    fun detachComposition(
+        composition: EditorTextSpan,
+        selection: EditorTextSpan,
+        composedText: String,
+        candidate: String?,
+    ) {
+        val input = connection() ?: return
+        val range = composition.ordered()
+        val document = input.getExtractedText(extractedRequest(), 0)?.text?.toString()
+        val rangeMatches = range.start >= 0 &&
+            range.end > range.start &&
+            (
+                document == null ||
+                    (range.end <= document.length && document.substring(range.start, range.end) == composedText)
+                )
+        var replacementLength = range.end - range.start
+        val replacement = candidate?.takeIf { rangeMatches }
+        if (replacement != null) {
+            input.setSelection(range.start, range.end)
+            input.commitText(replacement, 1)
+            replacementLength = replacement.length
+        } else {
+            input.finishComposingText()
+        }
+        composing = false
+        val restored = remapSelectionAfterReplacement(selection, range, replacementLength)
+        input.setSelection(restored.start, restored.end)
+    }
 
     fun apply(cmds: List<Cmd>) {
         val input = connection() ?: return

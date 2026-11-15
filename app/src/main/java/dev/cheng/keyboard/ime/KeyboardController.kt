@@ -38,6 +38,7 @@ import dev.cheng.keyboard.engine.EngineState
 import dev.cheng.keyboard.engine.InputEngine
 import dev.cheng.keyboard.engine.LatinDecoder
 import dev.cheng.keyboard.engine.PinyinDecoder
+import dev.cheng.keyboard.engine.PoetryIndex
 import dev.cheng.keyboard.engine.applyAskDraft
 import dev.cheng.keyboard.engine.extractTrailingCjk
 import dev.cheng.keyboard.engine.stripWrapped
@@ -94,7 +95,7 @@ class KeyboardController(
     private var engineState = EngineState()
     private var preferredLanguage = Language.Chinese
     private var activeInfo: EditorInfo? = null
-    private var sawComposingSpan = false
+    private var lastComposingSpan: EditorTextSpan? = null
     private var enter = dev.cheng.keyboard.model.EnterKind.Newline
     private var fuzzy = false
     private var askModel = MODEL_FLASH
@@ -233,7 +234,7 @@ class KeyboardController(
                 touchSamples = emptyList(),
             )
             bridge.reset()
-            sawComposingSpan = false
+            lastComposingSpan = null
             candidateRaw = ""
             calibrator.markDirty()
         } else {
@@ -276,41 +277,26 @@ class KeyboardController(
         candidatesEnd: Int,
     ) {
         if (state.overlay == Overlay.Ask || state.overlay == Overlay.NeedKey) return
-        if (candidatesStart >= 0 && candidatesEnd > candidatesStart) {
-            sawComposingSpan = true
+        val currentComposition = if (candidatesStart >= 0 && candidatesEnd > candidatesStart) {
+            EditorTextSpan(candidatesStart, candidatesEnd).also { lastComposingSpan = it }
+        } else {
+            null
+        }
+        val tapSelection = EditorTextSpan(newSelStart, newSelEnd)
+        val detachTarget = compositionDetachTarget(
+            compositionLength = engineState.raw.length,
+            remembered = lastComposingSpan,
+            candidates = currentComposition,
+            oldSelection = EditorTextSpan(oldSelStart, oldSelEnd),
+            newSelection = tapSelection,
+        )
+        if (detachTarget != null) {
+            detachComposition(detachTarget, tapSelection)
             return
         }
+        if (currentComposition != null) return
+        if (engineState.raw.isEmpty()) lastComposingSpan = null
         val selectionMoved = newSelStart != oldSelStart || newSelEnd != oldSelEnd
-        if (engineState.raw.isNotEmpty() && sawComposingSpan && candidatesStart < 0 && candidatesEnd < 0 && selectionMoved) {
-            token++
-            sawComposingSpan = false
-            candidateRaw = ""
-            bridge.reset()
-            val before = if (engineState.password) "" else connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
-            val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps) {
-                activeInfo?.let { resolveAutoShift(it, before) } ?: ShiftState.Off
-            } else {
-                engineState.shift
-            }
-            engineState = engineState.copy(
-                raw = "",
-                preedit = "",
-                candidates = emptyList(),
-                associating = false,
-                partialText = "",
-                partialSyllables = "",
-                autoSpace = false,
-                undoAutocorrect = null,
-                verbatimFirst = false,
-                shift = nextShift,
-                lastChineseContext = if (engineState.password) "" else extractTrailingCjk(before),
-                touchHints = emptyList(),
-                touchSamples = emptyList(),
-            )
-            calibrator.markDirty()
-            publish()
-            return
-        }
         if (engineState.raw.isEmpty() && selectionMoved && !engineState.password) {
             val before = connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
             val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps) {
@@ -331,6 +317,50 @@ class KeyboardController(
                 publish()
             }
         }
+    }
+
+    private fun detachComposition(composition: EditorTextSpan, selection: EditorTextSpan) {
+        val composedText = engineState.raw
+        if (composedText.isEmpty()) return
+        val candidate = if (
+            engineState.language == Language.Chinese &&
+            !engineState.password &&
+            candidateRaw == composedText
+        ) {
+            engineState.candidates.firstOrNull()?.text
+        } else {
+            null
+        }
+        token++
+        lastComposingSpan = null
+        candidateRaw = ""
+        engineState = engineState.copy(
+            raw = "",
+            preedit = "",
+            candidates = emptyList(),
+            associating = false,
+            partialText = "",
+            partialSyllables = "",
+            autoSpace = false,
+            undoAutocorrect = null,
+            verbatimFirst = false,
+            touchHints = emptyList(),
+            touchSamples = emptyList(),
+        )
+        bridge.detachComposition(composition, selection, composedText, candidate)
+        bridge.reset()
+        val before = if (engineState.password) "" else connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+        val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps) {
+            activeInfo?.let { resolveAutoShift(it, before) } ?: ShiftState.Off
+        } else {
+            engineState.shift
+        }
+        engineState = engineState.copy(
+            shift = nextShift,
+            lastChineseContext = if (engineState.password) "" else extractTrailingCjk(before),
+        )
+        calibrator.markDirty()
+        publish()
     }
 
     fun onHidden() {
@@ -1069,7 +1099,7 @@ class KeyboardController(
                 }
             }
             bridge.apply(step.cmds)
-            if (engineState.raw.isEmpty()) sawComposingSpan = false
+            if (engineState.raw.isEmpty()) lastComposingSpan = null
         } else {
             val draft = applyAskDraft(state.askDraft, step.cmds)
             update { it.copy(askDraft = draft) }
@@ -1217,6 +1247,11 @@ class KeyboardController(
         }.getOrDefault(emptySet())
         val fresh = if (syllables.isEmpty()) pinyin else PinyinDecoder(syllables)
         fresh.latin = latin
+        fresh.poetry = runCatching {
+            context.assets.open("poetry/lines.txt").bufferedReader().use { reader ->
+                PoetryIndex.parse(reader.readText())
+            }
+        }.getOrDefault(PoetryIndex.Empty)
         val file = installLexicon(context)
         if (file != null) {
             val sqlite = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY)

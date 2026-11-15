@@ -1,0 +1,40 @@
+N1ghtKey classical Chinese poetry initials corpus
+
+Retrieved: 2026-11-16
+
+Poetry data
+------------
+唐诗三百首 (366 poems)
+https://raw.githubusercontent.com/chinese-poetry/chinese-poetry/b8594f81a89752241442f2ce267d6f66f96704ee/%E5%85%A8%E5%94%90%E8%AF%97/%E5%94%90%E8%AF%97%E4%B8%89%E7%99%BE%E9%A6%96.json
+
+宋词三百首 (280 poems)
+https://raw.githubusercontent.com/chinese-poetry/chinese-poetry/b8594f81a89752241442f2ce267d6f66f96704ee/%E5%AE%8B%E8%AF%8D/%E5%AE%8B%E8%AF%8D%E4%B8%89%E7%99%BE%E9%A6%96.json
+
+Source project: chinese-poetry/chinese-poetry
+https://github.com/chinese-poetry/chinese-poetry
+License: MIT License, Copyright (c) 2016 JackeyGao.
+The classical texts are public domain; the JSON compilation is distributed
+under the MIT License. Raw files are pinned to commit b8594f81a89752241442f2ce267d6f66f96704ee.
+
+Traditional-to-simplified conversion
+------------------------------------
+OpenCC TSCharacters.txt
+https://raw.githubusercontent.com/BYVoid/OpenCC/ver.1.1.9/data/dictionary/TSCharacters.txt
+OpenCC project: https://github.com/BYVoid/OpenCC
+License: Apache-2.0.
+
+Build notes
+-----------
+The pinyin initials in lines.txt are generated from the bundled
+app/src/main/assets/dict/lexicon.db. A character's highest-frequency
+single-character reading is primary. Alternate polyphonic readings are expanded
+as distinct initials, in frequency order, with at most 8 variants
+per clause. The conventional literary reading z is preferred for 朝 in
+"朝辞白帝彩云间"; c remains available as an alternate.
+
+The upstream anthology uses some historical textual variants and omits a few
+canonical recitations used by the regression checks. A small set of canonical
+public-domain lines is therefore included explicitly and deduplicated against
+the anthology rows.
+
+Source downloads are cached under tools/cache, which is ignored by Git.

@@ -10,3 +10,7 @@ which is licensed under GPL-3.0-only. See app/src/main/assets/dict/SOURCES.txt.
 
 The English word list is derived from FrequencyWords by Hermit Dave
 (https://github.com/hermitdave/FrequencyWords), licensed under the MIT License.
+
+The classical Chinese poetry corpus is derived from chinese-poetry/chinese-poetry
+(https://github.com/chinese-poetry/chinese-poetry), licensed under the MIT License.
+See app/src/main/assets/poetry/SOURCES.txt.

@@ -18,6 +18,7 @@ import dev.cheng.keyboard.engine.EngineState
 import dev.cheng.keyboard.engine.InputEngine
 import dev.cheng.keyboard.engine.LatinDecoder
 import dev.cheng.keyboard.engine.PinyinDecoder
+import dev.cheng.keyboard.engine.PoetryIndex
 import dev.cheng.keyboard.engine.expandSyllable
 import dev.cheng.keyboard.engine.applyAskDraft
 import dev.cheng.keyboard.engine.applyCase
@@ -26,10 +27,13 @@ import dev.cheng.keyboard.engine.resolveSmartCommit
 import dev.cheng.keyboard.engine.segmentPinyin
 import dev.cheng.keyboard.engine.shouldAutoCap
 import dev.cheng.keyboard.engine.stripWrapped
+import dev.cheng.keyboard.ime.EditorTextSpan
+import dev.cheng.keyboard.ime.compositionDetachTarget
 import dev.cheng.keyboard.ime.gesture.KeyGesture
 import dev.cheng.keyboard.ime.layout.hitKey
 import dev.cheng.keyboard.ime.layout.nearbyLetters
 import dev.cheng.keyboard.ime.layout.placeKeys
+import dev.cheng.keyboard.ime.remapSelectionAfterReplacement
 import dev.cheng.keyboard.ime.symbol.symbolCategories
 import dev.cheng.keyboard.model.Choice
 import dev.cheng.keyboard.model.EnterKind
@@ -501,6 +505,83 @@ class KeyboardLogicTest {
     }
 
     @Test
+    fun layoutGivesPunctuationAndDigitsMoreRoom() {
+        val letters = placeKeys(KeyboardPage.Letters, Language.Chinese, 1080f, 132f, 18f, 30f, 12f)
+        val comma = letters.keys.first { it.model.id == "comma" }
+        val space = letters.keys.first { it.model.id == "space" }
+        val period = letters.keys.first { it.model.id == "period" }
+        assertEquals(comma.w, period.w, 0.01f)
+        assertTrue("Comma key should be at least 100px at 1080px width, got ${comma.w}", comma.w >= 100f)
+        assertTrue("Space should be at most 3x comma, got ${space.w} vs ${comma.w}", space.w <= comma.w * 3f)
+
+        val numbers = placeKeys(KeyboardPage.Number, Language.Chinese, 1080f, 132f, 18f, 30f, 12f)
+        val digit = numbers.keys.first { it.model.id == "num-5" }
+        val leftOuter = numbers.keys.first { it.model.id == "np-l1a" }
+        val rightOuter = numbers.keys.first { it.model.id == "np-r1a" }
+        assertTrue("Digit key should be at least 200px at 1080px width, got ${digit.w}", digit.w >= 200f)
+        assertTrue("Digit should be much wider than the left flank", digit.w >= leftOuter.w * 2.2f)
+        assertTrue("Digit should be much wider than the right flank", digit.w >= rightOuter.w * 2.2f)
+    }
+
+    @Test
+    fun poetryInitialsResolveWholeLines() {
+        val poetry = PoetryIndex.parse(
+            """
+            # initials|text|author|title
+            cqmyg|床前明月光|李白|静夜思
+            lghlmcl|两个黄鹂鸣翠柳|杜甫|绝句
+            qljlyrh|千里江陵一日还|李白|早发白帝城
+            """.trimIndent(),
+        )
+        assertEquals(3, poetry.size)
+        assertEquals("床前明月光", poetry.exact("cqmyg").single().text)
+        assertTrue(poetry.exact("cqmy").isEmpty())
+
+        val decoder = PinyinDecoder(
+            setOf("chuang", "qian", "ming", "yue", "guang", "liang", "ge", "huang", "li", "cui", "liu"),
+        ).also { it.poetry = poetry }
+        val five = decoder.decode("cqmyg", fuzzy = false)
+        assertEquals("cqmyg", five.preedit)
+        assertEquals("床前明月光", five.candidates.first().text)
+        val seven = decoder.decode("lghlmcl", fuzzy = false)
+        assertEquals("lghlmcl", seven.preedit)
+        assertEquals("两个黄鹂鸣翠柳", seven.candidates.first().text)
+    }
+
+    @Test
+    fun bundledPoetryCorpusCoversFamousLinesAndPolyphones() {
+        val file = listOf(
+            File("src/main/assets/poetry/lines.txt"),
+            File("app/src/main/assets/poetry/lines.txt"),
+        ).firstOrNull { it.isFile }
+        assertTrue("Bundled poetry asset missing", file != null)
+        val poetry = PoetryIndex.parse(file!!.readText())
+        assertTrue("Poetry corpus is unexpectedly small: ${poetry.size}", poetry.size >= 6_000)
+        assertTrue(poetry.exact("cqmyg").any { it.text == "床前明月光" })
+        assertTrue(poetry.exact("lghlmcl").any { it.text == "两个黄鹂鸣翠柳" })
+        assertTrue(poetry.exact("qljlyrh").any { it.text == "千里江陵一日还" })
+        assertTrue(poetry.exact("laystbz").any { it.text == "两岸猿声啼不住" })
+        assertTrue(poetry.exact("ccbdcyj").any { it.text == "朝辞白帝彩云间" })
+        assertTrue(poetry.exact("zcbdcyj").any { it.text == "朝辞白帝彩云间" })
+        assertTrue(poetry.exact("yjhcfzx").any { it.text == "一骑红尘妃子笑" })
+        assertTrue(poetry.exact("fccdxny").any { it.text == "风吹草低见牛羊" })
+    }
+
+    @Test
+    fun poetryDoesNotHijackStrongExactWords() {
+        val poetry = PoetryIndex.parse("shijian|山河尽入诗人眼|测试|测试")
+        val lexicon = MemoryLexicon(
+            listOf(LexRow("时间", "shi jian", "shijian", 1_000_000)),
+        )
+        val decoder = PinyinDecoder(setOf("shi", "jian")).also {
+            it.lexicon = lexicon
+            it.poetry = poetry
+        }
+        val decoded = decoder.decode("shijian", fuzzy = false)
+        assertEquals("时间", decoded.candidates.first().text)
+    }
+
+    @Test
     fun textHelpers() {
         assertTrue(shouldAutoCap(""))
         assertTrue(shouldAutoCap("Hi. "))
@@ -512,6 +593,79 @@ class KeyboardLogicTest {
         assertEquals("你好", applyAskDraft("你好 世界", listOf(Cmd.DeleteWord)))
         assertEquals("hi", parseSseLine("data: {\"content\":\"hi\"}")?.content)
         assertEquals(true, parseSseLine("data: [DONE]")?.done)
+    }
+
+    @Test
+    fun cursorLeavingCompositionRequestsDetachAndRestoresTappedCursor() {
+        val composing = EditorTextSpan(20, 26)
+        val tap = EditorTextSpan(5, 5)
+
+        assertEquals(
+            composing,
+            compositionDetachTarget(
+                compositionLength = 6,
+                remembered = composing,
+                candidates = composing,
+                oldSelection = EditorTextSpan(26, 26),
+                newSelection = tap,
+            ),
+        )
+        assertEquals(
+            composing,
+            compositionDetachTarget(
+                compositionLength = 6,
+                remembered = composing,
+                candidates = null,
+                oldSelection = EditorTextSpan(26, 26),
+                newSelection = tap,
+            ),
+        )
+        assertEquals(
+            composing,
+            compositionDetachTarget(
+                compositionLength = 6,
+                remembered = EditorTextSpan(20, 30),
+                candidates = null,
+                oldSelection = EditorTextSpan(26, 26),
+                newSelection = tap,
+            ),
+        )
+        assertEquals(
+            composing,
+            compositionDetachTarget(
+                compositionLength = 6,
+                remembered = null,
+                candidates = null,
+                oldSelection = EditorTextSpan(26, 26),
+                newSelection = tap,
+            ),
+        )
+        assertEquals(
+            null,
+            compositionDetachTarget(
+                compositionLength = 6,
+                remembered = composing,
+                candidates = composing,
+                oldSelection = EditorTextSpan(26, 26),
+                newSelection = EditorTextSpan(26, 26),
+            ),
+        )
+        assertEquals(
+            null,
+            compositionDetachTarget(
+                compositionLength = 0,
+                remembered = composing,
+                candidates = composing,
+                oldSelection = EditorTextSpan(26, 26),
+                newSelection = tap,
+            ),
+        )
+
+        assertEquals(tap, remapSelectionAfterReplacement(tap, composing, replacementLength = 2))
+        assertEquals(
+            EditorTextSpan(22, 22),
+            remapSelectionAfterReplacement(EditorTextSpan(26, 26), composing, replacementLength = 2),
+        )
     }
 
     @Test

@@ -333,9 +333,9 @@ private fun letterRows(language: Language): List<KeyRow> {
             listOf(
                 KeyModel("to-number", KeyKind.PageNumber, "123", weight = 1.35f),
                 KeyModel("to-symbols", KeyKind.PageSymbols, "符号", weight = 1.35f),
-                KeyModel("comma", KeyKind.Char, comma(language), insert = comma(language)),
-                KeyModel("space", KeyKind.Space, "", weight = 4.4f),
-                KeyModel("period", KeyKind.Char, period(language), insert = period(language)),
+                KeyModel("comma", KeyKind.Char, comma(language), insert = comma(language), weight = 1.35f),
+                KeyModel("space", KeyKind.Space, "", weight = 3.6f),
+                KeyModel("period", KeyKind.Char, period(language), insert = period(language), weight = 1.35f),
                 KeyModel("lang", KeyKind.Language, "", weight = 1.35f),
                 KeyModel("enter", KeyKind.Enter, "", weight = 1.75f, accent = true),
             ),
@@ -344,9 +344,9 @@ private fun letterRows(language: Language): List<KeyRow> {
 }
 
 private fun numberRows(language: Language): List<KeyRow> {
-    val outerWeight = 0.88f
-    val innerWeight = 0.84f
-    val digitWeight = 1.22f
+    val outerWeight = 0.64f
+    val innerWeight = 0.58f
+    val digitWeight = 1.50f
     fun digit(value: Int) = KeyModel(
         id = "num-$value",
         kind = KeyKind.Char,
@@ -406,9 +406,9 @@ private fun numberRows(language: Language): List<KeyRow> {
                 KeyModel("to-symbols", KeyKind.PageSymbols, "符号", weight = innerWeight),
                 punct("comma", ",", digitWeight),
                 digit(0),
-                punct("period", ".", digitWeight),
-                KeyModel("space", KeyKind.Space, "", weight = innerWeight),
-                KeyModel("enter", KeyKind.Enter, "", weight = outerWeight, accent = true),
+                punct("period", ".", 1.20f),
+                KeyModel("space", KeyKind.Space, "", weight = 0.90f),
+                KeyModel("enter", KeyKind.Enter, "", weight = 0.62f, accent = true),
             ),
         ),
     )
@@ -444,9 +444,9 @@ private fun symbolRows(language: Language): List<KeyRow> {
         KeyRow(
             listOf(
                 KeyModel("to-letters", KeyKind.PageLetters, "返回", weight = 1.5f),
-                KeyModel("comma", KeyKind.Char, comma(language), insert = comma(language)),
-                KeyModel("space", KeyKind.Space, "", weight = 4f),
-                KeyModel("period", KeyKind.Char, period(language), insert = period(language)),
+                KeyModel("comma", KeyKind.Char, comma(language), insert = comma(language), weight = 1.35f),
+                KeyModel("space", KeyKind.Space, "", weight = 3.4f),
+                KeyModel("period", KeyKind.Char, period(language), insert = period(language), weight = 1.35f),
                 KeyModel("enter", KeyKind.Enter, "", weight = 1.7f, accent = true),
             ),
         ),
@@ -469,9 +469,9 @@ private fun moreRows(language: Language): List<KeyRow> {
         KeyRow(
             listOf(
                 KeyModel("to-letters", KeyKind.PageLetters, "返回", weight = 1.5f),
-                KeyModel("comma", KeyKind.Char, comma(language), insert = comma(language)),
-                KeyModel("space", KeyKind.Space, "", weight = 4f),
-                KeyModel("period", KeyKind.Char, period(language), insert = period(language)),
+                KeyModel("comma", KeyKind.Char, comma(language), insert = comma(language), weight = 1.35f),
+                KeyModel("space", KeyKind.Space, "", weight = 3.4f),
+                KeyModel("period", KeyKind.Char, period(language), insert = period(language), weight = 1.35f),
                 KeyModel("enter", KeyKind.Enter, "", weight = 1.7f, accent = true),
             ),
         ),

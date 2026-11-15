@@ -6,6 +6,7 @@ import dev.cheng.keyboard.engine.EngineState
 import dev.cheng.keyboard.engine.InputEngine
 import dev.cheng.keyboard.engine.LatinDecoder
 import dev.cheng.keyboard.engine.PinyinDecoder
+import dev.cheng.keyboard.engine.PoetryIndex
 import dev.cheng.keyboard.ime.layout.placeKeys
 import dev.cheng.keyboard.ime.layout.touchSampleOf
 import dev.cheng.keyboard.model.EnterKind
@@ -1228,6 +1229,369 @@ class EngineBenchmarkTest {
         assertEquals("一斤", yijin.first())
         assertTrue("yijin fuzzy should keep 已经 in top3, got $yijin", "已经" in yijin)
         assertTrue(report.isFile)
+    }
+
+    @Test
+    fun round4BroadSelfMine() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = lexicon
+            it.latin = latin
+        }
+
+        val report = ArrayList<String>(600)
+        fun rate(hit: Int, total: Int): String =
+            if (total == 0) "0/0" else String.format("%d/%d (%.1f%%)", hit, total, 100.0 * hit / total)
+
+        val bestExact = HashMap<String, FullEntry>(220_000)
+        val bestSingle = HashMap<String, LexRow>(8_192)
+        val bestInitial = HashMap<String, FullEntry>(140_000)
+        for (entry in lexicon.allEntries) {
+            val row = entry.row
+            if (entry.nsy == 1 && ' ' !in row.syllables && row.syllables.all { it in 'a'..'z' }) {
+                val prev = bestSingle[row.syllables]
+                if (prev == null || row.freq > prev.freq) bestSingle[row.syllables] = row
+            }
+            if (entry.nsy !in 2..5) continue
+            if ('v' in row.letters || row.letters.any { it !in 'a'..'z' }) continue
+            val exactPrev = bestExact[row.letters]
+            if (exactPrev == null || row.freq > exactPrev.row.freq) bestExact[row.letters] = entry
+            val initials = entry.initials
+            if (entry.nsy in 2..4 && initials.length in 2..6 && initials != row.letters && initials.all { it in 'a'..'z' }) {
+                val initPrev = bestInitial[initials]
+                if (initPrev == null || row.freq > initPrev.row.freq) bestInitial[initials] = entry
+            }
+        }
+        val byFreq = bestExact.values.sortedByDescending { it.row.freq }
+
+        fun evalExactBand(tag: String, from: Int, count: Int) {
+            var top1 = 0
+            var top3 = 0
+            var shown = 0
+            var displacedShown = 0
+            val band = byFreq.drop(from).take(count)
+            for (entry in band) {
+                val decoded = decoder.decode(entry.row.letters, fuzzy = false)
+                val top = decoded.candidates.take(3).map { it.text }
+                val top1Hit = top.firstOrNull() == entry.row.text
+                val top3Hit = entry.row.text in top
+                if (top1Hit) top1++
+                if (top3Hit) top3++
+                else if (shown < 18) {
+                    shown++
+                    report += "[R4_EXACT] '${entry.row.letters}' -> want '${entry.row.text}' (${entry.row.syllables}, f=${entry.row.freq}), got $top preedit=${decoded.preedit}"
+                }
+                if (!top1Hit && top3Hit && displacedShown < 18) {
+                    displacedShown++
+                    report += "[R4_EXACT_R23] '${entry.row.letters}' -> want '${entry.row.text}' (${entry.row.syllables}, f=${entry.row.freq}), got $top preedit=${decoded.preedit}"
+                }
+            }
+            report += "R4_EXACT_$tag : Top1=${rate(top1, band.size)}, Top3=${rate(top3, band.size)}"
+        }
+        evalExactBand("2K", 0, 2_000)
+        evalExactBand("10K", 2_000, 8_000)
+        evalExactBand("30K", 10_000, 20_000)
+
+        fun evalSingles(tag: String, minFreq: Int, maxFreq: Int) {
+            val rows = bestSingle.values
+                .filter { it.freq in minFreq until maxFreq }
+                .sortedByDescending { it.freq }
+            var top1 = 0
+            var top3 = 0
+            var shown = 0
+            for (row in rows) {
+                val decoded = decoder.decode(row.syllables, fuzzy = false)
+                val top = decoded.candidates.take(3).map { it.text }
+                if (top.firstOrNull() == row.text) top1++
+                if (row.text in top) top3++
+                else if (shown < 16) {
+                    shown++
+                    report += "[R4_SINGLE] '${row.syllables}' -> want '${row.text}' (f=${row.freq}), got $top"
+                }
+            }
+            report += "R4_SINGLE_$tag : Top1=${rate(top1, rows.size)}, Top3=${rate(top3, rows.size)}"
+        }
+        evalSingles("HIGH", 100_000, Int.MAX_VALUE)
+        evalSingles("MID", 30_000, 100_000)
+        evalSingles("LOW", 10_000, 30_000)
+
+        val topPhrases = byFreq.take(700)
+        fun rivalOf(letters: String): LexRow? = lexicon.exact(letters, 1).firstOrNull()
+        fun evalPrefix(tag: String, prefixOf: (FullEntry) -> String?, accept: (FullEntry, String, LexRow?) -> Boolean) {
+            var top1 = 0
+            var top3 = 0
+            var total = 0
+            var shown = 0
+            for (entry in topPhrases) {
+                val prefix = prefixOf(entry) ?: continue
+                if (prefix.isEmpty() || prefix == entry.row.letters) continue
+                val rival = rivalOf(prefix)
+                if (!accept(entry, prefix, rival)) continue
+                total++
+                val decoded = decoder.decode(prefix, fuzzy = false)
+                val top = decoded.candidates.take(3).map { it.text }
+                if (top.firstOrNull() == entry.row.text) top1++
+                if (entry.row.text in top) top3++
+                else if (shown < 18) {
+                    shown++
+                    report += "[R4_$tag] '$prefix' -> want '${entry.row.text}' (${entry.row.syllables}, f=${entry.row.freq}), rival=${rival?.text}(${rival?.freq}), got $top preedit=${decoded.preedit}"
+                }
+            }
+            report += "R4_$tag : Top1=${rate(top1, total)}, Top3=${rate(top3, total)}"
+        }
+        evalPrefix("DROP1", { e ->
+            val last = e.row.syllables.substringAfterLast(' ')
+            if (last.length >= 2) e.row.letters.dropLast(1) else null
+        }, { e, _, rival -> rival == null || e.row.freq > rival.freq * 3 })
+        evalPrefix("DROP2", { e ->
+            val last = e.row.syllables.substringAfterLast(' ')
+            if (last.length >= 3) e.row.letters.dropLast(2) else null
+        }, { e, _, rival -> rival == null || e.row.freq > rival.freq * 3 })
+        evalPrefix("LASTINIT", { e ->
+            val syls = e.row.syllables.split(' ')
+            val last = syls.last()
+            if (last.length < 2) return@evalPrefix null
+            val initial = if (last.substring(0, 2) in setOf("zh", "ch", "sh")) last.substring(0, 2) else last.substring(0, 1)
+            syls.dropLast(1).joinToString("") + initial
+        }, { e, _, rival -> rival == null || e.row.freq > rival.freq * 4 })
+        evalPrefix("BOUNDARY_SWAP_PREFIX", { e ->
+            val syls = e.row.syllables.split(' ')
+            if (syls.size != 2) return@evalPrefix null
+            if (syls[0].last() == syls[1].first()) return@evalPrefix null
+            syls[0].dropLast(1) + syls[1].first() + syls[0].last() + syls[1].drop(1)
+        }, { e, _, rival -> rival == null || e.row.freq > rival.freq * 8 })
+
+        data class TypoProbe(val kind: String, val raw: String, val target: String, val freq: Int, val rival: LexRow?)
+        val typoProbes = ArrayList<TypoProbe>(2_600)
+        val typoBase = byFreq.take(500).filter { it.nsy == 2 && it.row.letters.length in 5..12 }
+        val neighbors = mapOf(
+            'q' to "wa", 'w' to "qes", 'e' to "wrd", 'r' to "etf", 't' to "ryg", 'y' to "tuh", 'u' to "yij",
+            'i' to "uok", 'o' to "ipl", 'p' to "ol", 'a' to "qsz", 's' to "awdx", 'd' to "sefc",
+            'f' to "drgv", 'g' to "fthb", 'h' to "gyjn", 'j' to "hukm", 'k' to "jil", 'l' to "kop",
+            'z' to "asx", 'x' to "zsdc", 'c' to "xdfv", 'v' to "cfgb", 'b' to "vghn", 'n' to "bhjm", 'm' to "njk",
+        )
+        for (entry in typoBase) {
+            val letters = entry.row.letters
+            val cut = entry.row.syllables.substringBefore(' ').length
+            if (cut in 1 until letters.length && letters[cut - 1] != letters[cut]) {
+                val chars = letters.toCharArray()
+                val tmp = chars[cut - 1]
+                chars[cut - 1] = chars[cut]
+                chars[cut] = tmp
+                val raw = String(chars)
+                val rival = rivalOf(raw)
+                if (rival == null || entry.row.freq > rival.freq * 8) {
+                    typoProbes += TypoProbe("TRANSPOSE", raw, entry.row.text, entry.row.freq, rival)
+                }
+            }
+            for (pos in letters.indices step 3) {
+                val alts = neighbors[letters[pos]].orEmpty()
+                if (alts.isEmpty()) continue
+                for (alt in alts.take(2)) {
+                    val raw = letters.substring(0, pos) + alt + letters.substring(pos + 1)
+                    val rival = rivalOf(raw)
+                    if (rival != null && entry.row.freq < rival.freq * 6) continue
+                    typoProbes += TypoProbe("NEIGHBOR", raw, entry.row.text, entry.row.freq, rival)
+                }
+            }
+            for (pos in 1 until letters.length - 1 step 4) {
+                val raw = letters.removeRange(pos, pos + 1)
+                val rival = rivalOf(raw)
+                if (rival != null && entry.row.freq < rival.freq * 6) continue
+                typoProbes += TypoProbe("DELETE", raw, entry.row.text, entry.row.freq, rival)
+            }
+        }
+        val typoStats = LinkedHashMap<String, IntArray>()
+        var typoShown = 0
+        for (probe in typoProbes) {
+            val st = typoStats.getOrPut(probe.kind) { IntArray(3) }
+            st[0]++
+            val decoded = decoder.decode(probe.raw, fuzzy = false)
+            val top = decoded.candidates.take(5).map { it.text }
+            if (top.firstOrNull() == probe.target) st[1]++
+            if (probe.target in top) st[2]++
+            else if (typoShown < 24) {
+                typoShown++
+                report += "[R4_TYPO_${probe.kind}] '${probe.raw}' -> want '${probe.target}' (f=${probe.freq}), rival=${probe.rival?.text}(${probe.rival?.freq}), got $top preedit=${decoded.preedit}"
+            }
+        }
+        for ((kind, st) in typoStats) {
+            report += "R4_TYPO_$kind : Top1=${rate(st[1], st[0])}, Top5=${rate(st[2], st[0])}"
+        }
+
+        val abbrevPool = bestInitial.values
+            .sortedByDescending { it.row.freq }
+            .filter { entry ->
+                val rival = rivalOf(entry.initials)
+                rival == null || entry.row.freq > rival.freq * 4
+            }
+            .take(600)
+        var abbr1 = 0
+        var abbr3 = 0
+        var abbrShown = 0
+        for (entry in abbrevPool) {
+            val decoded = decoder.decode(entry.initials, fuzzy = false)
+            val top = decoded.candidates.take(3).map { it.text }
+            if (top.firstOrNull() == entry.row.text) abbr1++
+            if (entry.row.text in top) abbr3++
+            else if (abbrShown < 20) {
+                abbrShown++
+                report += "[R4_ABBREV] '${entry.initials}' -> want '${entry.row.text}' (${entry.row.syllables}, f=${entry.row.freq}), got $top preedit=${decoded.preedit}"
+            }
+        }
+        report += "R4_ABBREV : Top1=${rate(abbr1, abbrevPool.size)}, Top3=${rate(abbr3, abbrevPool.size)}"
+
+        val out = File("build/reports/round4-mine.txt")
+        out.parentFile?.mkdirs()
+        out.writeText(report.joinToString("\n"), StandardCharsets.UTF_8)
+        report.forEach { println(it) }
+        assertTrue(out.isFile)
+        assertTrue("round4 should mine a large exact corpus", byFreq.size >= 30_000)
+        assertTrue("round4 should generate typo probes", typoProbes.size >= 1_000)
+    }
+
+    @Test
+    fun round5SlipMining() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = lexicon
+            it.latin = latin
+        }
+        val report = ArrayList<String>(400)
+        fun rate(hit: Int, total: Int): String =
+            if (total == 0) "0/0" else String.format("%d/%d (%.1f%%)", hit, total, 100.0 * hit / total)
+
+        val bestExact = HashMap<String, FullEntry>(120_000)
+        for (entry in lexicon.allEntries) {
+            if (entry.nsy != 2) continue
+            val row = entry.row
+            if ('v' in row.letters || row.letters.any { it !in 'a'..'z' }) continue
+            val prev = bestExact[row.letters]
+            if (prev == null || row.freq > prev.row.freq) bestExact[row.letters] = entry
+        }
+        val byFreq = bestExact.values.sortedByDescending { it.row.freq }.take(600)
+
+        data class Probe(val kind: String, val raw: String, val target: String, val freq: Int, val rival: LexRow?)
+        val probes = ArrayList<Probe>(1_800)
+        fun rivalOf(letters: String): LexRow? = lexicon.exact(letters, 1).firstOrNull()
+        fun accept(raw: String, entry: FullEntry): Boolean {
+            val rival = rivalOf(raw)
+            return rival == null || entry.row.freq > rival.freq * 6
+        }
+        for (entry in byFreq) {
+            val letters = entry.row.letters
+            val parts = entry.row.syllables.split(' ')
+            if (parts.size != 2) continue
+            val cut = parts[0].length
+            if (cut !in 1 until letters.length) continue
+            val doubleFirst = letters[0] + letters
+            if (accept(doubleFirst, entry)) {
+                probes += Probe("DOUBLE_FIRST", doubleFirst, entry.row.text, entry.row.freq, rivalOf(doubleFirst))
+            }
+            val doubleSecond = letters.substring(0, cut) + letters[cut] + letters.substring(cut)
+            if (accept(doubleSecond, entry)) {
+                probes += Probe("DOUBLE_SECOND", doubleSecond, entry.row.text, entry.row.freq, rivalOf(doubleSecond))
+            }
+            if (cut < letters.length - 1) {
+                val missingInitial = letters.removeRange(cut, cut + 1)
+                if (missingInitial.length >= 4 && accept(missingInitial, entry)) {
+                    probes += Probe("MISS_INITIAL", missingInitial, entry.row.text, entry.row.freq, rivalOf(missingInitial))
+                }
+            }
+        }
+
+        val unique = probes.distinctBy { it.kind to it.raw }
+        val stats = LinkedHashMap<String, IntArray>()
+        var shown = 0
+        for (probe in unique) {
+            val st = stats.getOrPut(probe.kind) { IntArray(4) }
+            st[0]++
+            val top = decoder.decode(probe.raw, fuzzy = false).candidates.take(5).map { it.text }
+            if (top.firstOrNull() == probe.target) st[1]++
+            if (probe.target in top.take(3)) st[2]++
+            if (probe.target in top) st[3]++
+            if (probe.target !in top && shown < 24) {
+                shown++
+                report += "[R5_${probe.kind}] '${probe.raw}' -> want '${probe.target}' (f=${probe.freq}), rival=${probe.rival?.text}(${probe.rival?.freq}), got $top"
+            }
+        }
+        for ((kind, st) in stats) {
+            report += "R5_$kind : Top1=${rate(st[1], st[0])}, Top3=${rate(st[2], st[0])}, Top5=${rate(st[3], st[0])}"
+        }
+
+        val out = File("build/reports/round5-mine.txt")
+        out.parentFile?.mkdirs()
+        out.writeText(report.joinToString("\n"), StandardCharsets.UTF_8)
+        report.forEach { println(it) }
+        assertTrue(out.isFile)
+        assertTrue("round5 should generate slip probes", unique.size >= 500)
+    }
+
+    @Test
+    fun repairedTypingSlipsStayFixed() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = lexicon
+            it.latin = latin
+        }
+        val cases = linkedMapOf(
+            "bnquan" to "版权",
+            "gngsi" to "公司",
+            "zaiquan" to "债券",
+            "zuanli" to "专利",
+            "pinggo" to "苹果",
+            "zhaobao" to "招标",
+            "yubu" to "有不",
+            "womrn" to "我们",
+            "shenmr" to "什么",
+            "zenmr" to "怎么",
+            "jiaolu" to "焦虑",
+            "meiyouw" to "没有问题",
+            "deifa" to "非法",
+            "linglun" to "评论",
+            "woomen" to "我们",
+            "jjingji" to "经济",
+            "jingjji" to "经济",
+            "ddangao" to "蛋糕",
+            "hennan" to "很难",
+            "xinnian" to "新年",
+            "banuan" to "版权",
+            "quani" to "权利",
+            "renliziyuanbu" to "人力资源部",
+            "xingzhengxukefa" to "行政许可法",
+            "jiantizhongwenban" to "简体中文版",
+            "shirenminzhengfu" to "市人民政府",
+            "shengrenminzhengfu" to "省人民政府",
+            "nihaoma" to "你好吗",
+            "woxihuanni" to "我喜欢你",
+            "jintiantianqi" to "今天天气",
+            "nizaiganma" to "你在干嘛",
+        )
+        val misses = ArrayList<String>()
+        for ((raw, want) in cases) {
+            val top3 = decoder.decode(raw, fuzzy = false).candidates.take(3).map { it.text }
+            if (want !in top3) misses += "'$raw' -> want '$want', got $top3"
+        }
+        assertTrue("typing slip repairs regressed: $misses", misses.isEmpty())
+    }
+
+    @Test
+    fun bundledPoetryWorksWithProductionLexicon() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val poetryFile = listOf(
+            File("src/main/assets/poetry/lines.txt"),
+            File("app/src/main/assets/poetry/lines.txt"),
+        ).firstOrNull { it.isFile } ?: error("Bundled poetry asset missing")
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = lexicon
+            it.latin = latin
+            it.poetry = PoetryIndex.parse(poetryFile.readText())
+        }
+        assertEquals("床前明月光", decoder.decode("cqmyg", fuzzy = false).candidates.first().text)
+        assertEquals("两个黄鹂鸣翠柳", decoder.decode("lghlmcl", fuzzy = false).candidates.first().text)
+        assertEquals("千里江陵一日还", decoder.decode("qljlyrh", fuzzy = false).candidates.first().text)
+        assertEquals("朝辞白帝彩云间", decoder.decode("ccbdcyj", fuzzy = false).candidates.first().text)
+        assertEquals("时间", decoder.decode("shijian", fuzzy = false).candidates.first().text)
     }
 
     private fun fuzzyShrink(syllable: String): String = when {
