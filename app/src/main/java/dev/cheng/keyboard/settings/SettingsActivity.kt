@@ -2,7 +2,6 @@ package dev.cheng.keyboard.settings
 
 import android.content.Context
 import android.content.Intent
-import android.database.sqlite.SQLiteDatabase
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -81,12 +80,9 @@ import dev.cheng.keyboard.ai.MODEL_FLASH
 import dev.cheng.keyboard.ai.MODEL_PRO
 import dev.cheng.keyboard.data.PrefKeys
 import dev.cheng.keyboard.data.Secrets
-import dev.cheng.keyboard.data.SqliteLexicon
 import dev.cheng.keyboard.data.UserStore
-import dev.cheng.keyboard.data.installLexicon
 import dev.cheng.keyboard.data.settingsStore
 import dev.cheng.keyboard.data.themeMode
-import dev.cheng.keyboard.engine.PinyinDecoder
 import dev.cheng.keyboard.ime.ui.CheckIcon
 import dev.cheng.keyboard.ime.ui.CycleIcon
 import dev.cheng.keyboard.ime.ui.GridIcon
@@ -823,15 +819,6 @@ private fun LexiconAndUpdateSection(
 }
 
 @Composable
-private fun EngineProbeNote(context: Context, colors: SettingsColors) {
-    var note by remember { mutableStateOf("引擎自检读取中…") }
-    LaunchedEffect(Unit) {
-        note = withContext(Dispatchers.IO) { engineProbe(context) }
-    }
-    Text(note, color = colors.subtle, fontSize = 11.5.sp, lineHeight = 15.sp)
-}
-
-@Composable
 private fun UpdateSection(
     context: Context,
     version: String,
@@ -911,20 +898,29 @@ private fun UpdateSection(
         }
         Column(Modifier.weight(1f).padding(start = 10.dp)) {
             Text("版本与更新", color = colors.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Text("当前安装版本 v$version", color = colors.subtle, fontSize = 12.5.sp)
-            EngineProbeNote(context, colors)
+            Text("当前版本 v$version", color = colors.subtle, fontSize = 12.5.sp)
         }
         if (phase is UpdatePhase.UpToDate) {
-            StatusBadge("已是最新", bg = colors.successSoft, fg = colors.success)
+            StatusBadge(
+                "已是最新",
+                bg = colors.successSoft,
+                fg = colors.success,
+                modifier = Modifier.padding(start = 10.dp),
+            )
         } else if (phase is UpdatePhase.Available || phase is UpdatePhase.Ready || phase is UpdatePhase.NeedsPermission) {
-            StatusBadge("有新版本", bg = colors.accentSoft, fg = colors.accent)
+            StatusBadge(
+                "有新版本",
+                bg = colors.accentSoft,
+                fg = colors.accent,
+                modifier = Modifier.padding(start = 10.dp),
+            )
         }
     }
 
     when (val current = phase) {
         UpdatePhase.Idle -> Unit
         UpdatePhase.Checking -> StatusNote("正在通过官方与加速通道检查新版本…", colors.subtle)
-        UpdatePhase.UpToDate -> StatusNote("当前已是最新正式版本。", colors.subtle)
+        UpdatePhase.UpToDate -> Unit
         is UpdatePhase.Available -> {
             val noteShape = RoundedCornerShape(12.dp)
             val sizeLabel = if (current.release.size > 0L) {
@@ -1131,9 +1127,9 @@ private fun CardDivider(colors: SettingsColors) {
 }
 
 @Composable
-private fun StatusBadge(label: String, bg: Color, fg: Color) {
+private fun StatusBadge(label: String, bg: Color, fg: Color, modifier: Modifier = Modifier) {
     Box(
-        Modifier
+        modifier
             .clip(RoundedCornerShape(999.dp))
             .background(bg)
             .padding(horizontal = 9.dp, vertical = 3.dp),
@@ -1274,39 +1270,4 @@ private fun Segment(
             )
         }
     }
-}
-
-// Mirrors the input engine's own syllable table so a stale or mangled install shows up on screen:
-// if this line reads "shang→shan'g" the device's assets are not the ones the build shipped.
-private fun engineProbe(context: Context): String {
-    val syllables = runCatching {
-        context.assets.open("dict/syllables.txt").bufferedReader().use { reader ->
-            reader.readLines()
-                .map { line -> line.replace("\uFEFF", "").trim().lowercase() }
-                .filter { line -> line.isNotEmpty() && line.all { it in 'a'..'z' } }
-                .toSet()
-        }
-    }.getOrDefault(emptySet())
-    val build = "build ${installedVersionCode(context)}"
-    if (syllables.isEmpty()) return "$build · 音节表读取失败"
-    val decoder = PinyinDecoder(syllables)
-    val samples = listOf("shang", "jian", "nian", "maofan")
-    val lexFile = installLexicon(context)
-    val probe = if (lexFile != null && lexFile.isFile) {
-        runCatching {
-            SQLiteDatabase.openDatabase(lexFile.path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
-                decoder.lexicon = SqliteLexicon(db)
-                samples.joinToString(" ") { input ->
-                    val decoded = decoder.decode(input, fuzzy = false)
-                    val top = decoded.candidates.firstOrNull()?.text.orEmpty()
-                    if (top.isNotEmpty()) "$input→$top(${decoded.preedit})" else "$input→${decoded.preedit}"
-                }
-            }
-        }.getOrElse {
-            samples.joinToString(" ") { input -> "$input→" + decoder.decode(input, fuzzy = false).preedit }
-        }
-    } else {
-        samples.joinToString(" ") { input -> "$input→" + decoder.decode(input, fuzzy = false).preedit }
-    }
-    return "$build · 音节 ${syllables.size} · $probe"
 }
