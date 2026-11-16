@@ -510,17 +510,20 @@ class KeyboardLogicTest {
         val comma = letters.keys.first { it.model.id == "comma" }
         val space = letters.keys.first { it.model.id == "space" }
         val period = letters.keys.first { it.model.id == "period" }
+        val toNumber = letters.keys.first { it.model.id == "to-number" }
+        val toSymbols = letters.keys.first { it.model.id == "to-symbols" }
+        val letter = letters.keys.first { it.model.id == "l-q" }
         assertEquals(comma.w, period.w, 0.01f)
-        assertTrue("Comma key should be at least 100px at 1080px width, got ${comma.w}", comma.w >= 100f)
-        assertTrue("Space should be at most 3x comma, got ${space.w} vs ${comma.w}", space.w <= comma.w * 3f)
+        assertEquals(toNumber.w, toSymbols.w, 0.01f)
+        assertTrue("123 should be wider than a letter key, got ${toNumber.w} vs ${letter.w}", toNumber.w > letter.w * 1.5f)
+        val spaceToPageRatio = space.w / toNumber.w
+        assertTrue("Space should stay compact, got ${space.w} vs ${toNumber.w}", spaceToPageRatio in 1.7f..2.0f)
 
         val numbers = placeKeys(KeyboardPage.Number, Language.Chinese, 1080f, 132f, 18f, 30f, 12f)
         val digit = numbers.keys.first { it.model.id == "num-5" }
-        val leftOuter = numbers.keys.first { it.model.id == "np-l1a" }
-        val rightOuter = numbers.keys.first { it.model.id == "np-r1a" }
+        val plus = numbers.keys.first { it.model.id == "np-plus" }
         assertTrue("Digit key should be at least 200px at 1080px width, got ${digit.w}", digit.w >= 200f)
-        assertTrue("Digit should be much wider than the left flank", digit.w >= leftOuter.w * 2.2f)
-        assertTrue("Digit should be much wider than the right flank", digit.w >= rightOuter.w * 2.2f)
+        assertTrue("Digit should be wider than an operation key, got ${digit.w} vs ${plus.w}", digit.w > plus.w * 1.4f)
     }
 
     @Test
@@ -1630,21 +1633,21 @@ class KeyboardLogicTest {
     }
 
     @Test
-    fun recentClipboardHistoryKeepsFiveItemsAndRoundTrips() {
-        assertEquals(5, MAX_RECENT_CLIPS)
+    fun recentClipboardHistoryKeepsTwelveItemsAndRoundTrips() {
+        assertEquals(12, MAX_RECENT_CLIPS)
         var clips = emptyList<String>()
-        for (index in 1..7) {
+        for (index in 1..14) {
             clips = mergeRecentClips("条目-$index", clips)
         }
-        assertEquals(listOf("条目-7", "条目-6", "条目-5", "条目-4", "条目-3"), clips)
+        assertEquals((14 downTo 3).map { "条目-$it" }, clips)
 
         val promoted = mergeRecentClips("条目-4", clips)
-        assertEquals(listOf("条目-4", "条目-7", "条目-6", "条目-5", "条目-3"), promoted)
+        assertEquals(listOf("条目-4") + clips.filter { it != "条目-4" }, promoted)
         assertEquals(promoted, mergeRecentClips("   ", promoted))
 
         val multiline = "第一行\n\"第二行\""
         val mergedWithStored = mergeRecentClipLists(listOf(multiline), promoted)
-        assertEquals(listOf(multiline, "条目-4", "条目-7", "条目-6", "条目-5"), mergedWithStored)
+        assertEquals((listOf(multiline) + promoted).take(MAX_RECENT_CLIPS), mergedWithStored)
 
         val encoded = encodeRecentClips(mergedWithStored)
         assertEquals(mergedWithStored, decodeRecentClips(encoded))
@@ -1677,7 +1680,16 @@ class KeyboardLogicTest {
         assertEquals("to-number", hitKey(letters.keys, tapX, tapY)?.model?.id)
         assertEquals("to-letters", hitKey(numbers.keys, tapX, tapY)?.model?.id)
 
-        // Center 9-key + 0 grid alignment
+        assertEquals(
+            listOf(
+                "np-plus", "num-1", "num-2", "num-3", "backspace",
+                "np-minus", "num-4", "num-5", "num-6", "space",
+                "np-slash", "num-7", "num-8", "num-9", "to-symbols",
+                "to-letters", "comma", "num-0", "period", "enter",
+            ),
+            numbers.keys.map { it.model.id },
+        )
+
         val digits = (0..9).associateWith { d -> numbers.keys.first { it.model.id == "num-$d" } }
         assertEquals(digits.getValue(1).x, digits.getValue(4).x, 0.01f)
         assertEquals(digits.getValue(4).x, digits.getValue(7).x, 0.01f)
@@ -1686,16 +1698,16 @@ class KeyboardLogicTest {
         assertEquals(digits.getValue(8).x, digits.getValue(0).x, 0.01f)
         assertEquals(digits.getValue(3).x, digits.getValue(6).x, 0.01f)
         assertEquals(digits.getValue(6).x, digits.getValue(9).x, 0.01f)
-
-        // Flanking common punctuation on left and right sides
-        val leftLabelsZh = numbers.keys.filter { it.x < digits.getValue(1).x && it.model.kind == KeyKind.Char }.map { it.model.label }
-        val rightLabelsZh = numbers.keys.filter { it.x > digits.getValue(3).x && it.model.kind == KeyKind.Char }.map { it.model.label }
-        assertEquals(listOf("，", "。", "？", "！", "、", "@"), leftLabelsZh)
-        assertEquals(listOf("+", "-", "/", ":", "%"), rightLabelsZh)
+        assertEquals(digits.getValue(1).w, digits.getValue(4).w, 0.01f)
+        assertEquals(digits.getValue(4).w, digits.getValue(7).w, 0.01f)
+        assertEquals(digits.getValue(2).w, digits.getValue(5).w, 0.01f)
+        assertEquals(digits.getValue(5).w, digits.getValue(8).w, 0.01f)
+        assertEquals(digits.getValue(8).w, digits.getValue(0).w, 0.01f)
+        assertEquals(digits.getValue(3).w, digits.getValue(6).w, 0.01f)
+        assertEquals(digits.getValue(6).w, digits.getValue(9).w, 0.01f)
 
         val numbersEn = placeKeys(KeyboardPage.Number, Language.English, 1080f, 132f, 18f, 30f, 12f)
-        val leftLabelsEn = numbersEn.keys.filter { it.x < digits.getValue(1).x && it.model.kind == KeyKind.Char }.map { it.model.label }
-        assertEquals(listOf("?", "!", "(", ")", "@", "#"), leftLabelsEn)
+        assertEquals(numbers.keys.map { it.model }, numbersEn.keys.map { it.model })
     }
 
     @Test

@@ -67,7 +67,7 @@ private const val CoreBoxEpsilon = 1e-3f
 
 fun keyboardRows(page: KeyboardPage, language: Language): List<KeyRow> = when (page) {
     KeyboardPage.Letters -> letterRows(language)
-    KeyboardPage.Number -> numberRows(language)
+    KeyboardPage.Number -> numberRows()
     KeyboardPage.Symbols -> symbolRows(language)
     KeyboardPage.More -> moreRows(language)
 }
@@ -331,22 +331,21 @@ private fun letterRows(language: Language): List<KeyRow> {
         ),
         KeyRow(
             listOf(
-                KeyModel("to-number", KeyKind.PageNumber, "123", weight = 1.35f),
-                KeyModel("to-symbols", KeyKind.PageSymbols, "符号", weight = 1.35f),
-                KeyModel("comma", KeyKind.Char, comma(language), insert = comma(language), weight = 1.35f),
-                KeyModel("space", KeyKind.Space, "", weight = 3.6f),
-                KeyModel("period", KeyKind.Char, period(language), insert = period(language), weight = 1.35f),
-                KeyModel("lang", KeyKind.Language, "", weight = 1.35f),
-                KeyModel("enter", KeyKind.Enter, "", weight = 1.75f, accent = true),
+                KeyModel("to-number", KeyKind.PageNumber, "123", weight = 1.6f),
+                KeyModel("to-symbols", KeyKind.PageSymbols, "符号", weight = 1.6f),
+                KeyModel("comma", KeyKind.Char, comma(language), insert = comma(language), weight = 0.9f),
+                KeyModel("space", KeyKind.Space, "", weight = 3.0f),
+                KeyModel("period", KeyKind.Char, period(language), insert = period(language), weight = 0.9f),
+                KeyModel("lang", KeyKind.Language, "", weight = 1.2f),
+                KeyModel("enter", KeyKind.Enter, "", weight = 1.6f, accent = true),
             ),
         ),
     )
 }
 
-private fun numberRows(language: Language): List<KeyRow> {
-    val outerWeight = 0.64f
-    val innerWeight = 0.58f
-    val digitWeight = 1.50f
+private fun numberRows(): List<KeyRow> {
+    val sideWeight = 1.1f
+    val digitWeight = 1.6f
     fun digit(value: Int) = KeyModel(
         id = "num-$value",
         kind = KeyKind.Char,
@@ -354,61 +353,48 @@ private fun numberRows(language: Language): List<KeyRow> {
         insert = value.toString(),
         weight = digitWeight,
     )
-    fun punct(id: String, text: String, weight: Float) = KeyModel(
+    fun character(id: String, text: String, weight: Float = sideWeight) = KeyModel(
         id = id,
         kind = KeyKind.Char,
         label = text,
         insert = text,
         weight = weight,
     )
-    val left = if (language == Language.Chinese) {
-        listOf("，" to "。", "？" to "！", "、" to "@")
-    } else {
-        listOf("?" to "!", "(" to ")", "@" to "#")
-    }
     return listOf(
         KeyRow(
             listOf(
-                punct("np-l1a", left[0].first, outerWeight),
-                punct("np-l1b", left[0].second, innerWeight),
+                character("np-plus", "+"),
                 digit(1),
                 digit(2),
                 digit(3),
-                punct("np-r1a", "+", innerWeight),
-                punct("np-r1b", "-", outerWeight),
+                KeyModel("backspace", KeyKind.Backspace, "", weight = sideWeight),
             ),
         ),
         KeyRow(
             listOf(
-                punct("np-l2a", left[1].first, outerWeight),
-                punct("np-l2b", left[1].second, innerWeight),
+                character("np-minus", "-"),
                 digit(4),
                 digit(5),
                 digit(6),
-                punct("np-r2a", "/", innerWeight),
-                punct("np-r2b", ":", outerWeight),
+                KeyModel("space", KeyKind.Space, "", weight = sideWeight),
             ),
         ),
         KeyRow(
             listOf(
-                punct("np-l3a", left[2].first, outerWeight),
-                punct("np-l3b", left[2].second, innerWeight),
+                character("np-slash", "/"),
                 digit(7),
                 digit(8),
                 digit(9),
-                punct("np-r3a", "%", innerWeight),
-                KeyModel("backspace", KeyKind.Backspace, "", weight = outerWeight),
+                KeyModel("to-symbols", KeyKind.PageSymbols, "符号", weight = sideWeight),
             ),
         ),
         KeyRow(
             listOf(
-                KeyModel("to-letters", KeyKind.PageLetters, "ABC", weight = outerWeight),
-                KeyModel("to-symbols", KeyKind.PageSymbols, "符号", weight = innerWeight),
-                punct("comma", ",", digitWeight),
+                KeyModel("to-letters", KeyKind.PageLetters, "ABC", weight = sideWeight),
+                character("comma", ",", digitWeight),
                 digit(0),
-                punct("period", ".", 1.20f),
-                KeyModel("space", KeyKind.Space, "", weight = 0.90f),
-                KeyModel("enter", KeyKind.Enter, "", weight = 0.62f, accent = true),
+                character("period", ".", digitWeight),
+                KeyModel("enter", KeyKind.Enter, "", weight = sideWeight, accent = true),
             ),
         ),
     )

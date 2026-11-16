@@ -1240,6 +1240,7 @@ class EngineBenchmarkTest {
         }
 
         val report = ArrayList<String>(600)
+        val cleanSnapshot = ArrayList<String>(34_000)
         fun rate(hit: Int, total: Int): String =
             if (total == 0) "0/0" else String.format("%d/%d (%.1f%%)", hit, total, 100.0 * hit / total)
 
@@ -1273,6 +1274,7 @@ class EngineBenchmarkTest {
             for (entry in band) {
                 val decoded = decoder.decode(entry.row.letters, fuzzy = false)
                 val top = decoded.candidates.take(3).map { it.text }
+                cleanSnapshot += "EXACT_$tag\t${entry.row.letters}\t${entry.row.text}\t${top.joinToString("|")}"
                 val top1Hit = top.firstOrNull() == entry.row.text
                 val top3Hit = entry.row.text in top
                 if (top1Hit) top1++
@@ -1302,6 +1304,7 @@ class EngineBenchmarkTest {
             for (row in rows) {
                 val decoded = decoder.decode(row.syllables, fuzzy = false)
                 val top = decoded.candidates.take(3).map { it.text }
+                cleanSnapshot += "SINGLE_$tag\t${row.syllables}\t${row.text}\t${top.joinToString("|")}"
                 if (top.firstOrNull() == row.text) top1++
                 if (row.text in top) top3++
                 else if (shown < 16) {
@@ -1330,6 +1333,7 @@ class EngineBenchmarkTest {
                 total++
                 val decoded = decoder.decode(prefix, fuzzy = false)
                 val top = decoded.candidates.take(3).map { it.text }
+                cleanSnapshot += "$tag\t$prefix\t${entry.row.text}\t${top.joinToString("|")}"
                 if (top.firstOrNull() == entry.row.text) top1++
                 if (entry.row.text in top) top3++
                 else if (shown < 18) {
@@ -1432,6 +1436,7 @@ class EngineBenchmarkTest {
         for (entry in abbrevPool) {
             val decoded = decoder.decode(entry.initials, fuzzy = false)
             val top = decoded.candidates.take(3).map { it.text }
+            cleanSnapshot += "ABBREV\t${entry.initials}\t${entry.row.text}\t${top.joinToString("|")}"
             if (top.firstOrNull() == entry.row.text) abbr1++
             if (entry.row.text in top) abbr3++
             else if (abbrShown < 20) {
@@ -1444,6 +1449,7 @@ class EngineBenchmarkTest {
         val out = File("build/reports/round4-mine.txt")
         out.parentFile?.mkdirs()
         out.writeText(report.joinToString("\n"), StandardCharsets.UTF_8)
+        File("build/reports/round4-clean-snapshot.tsv").writeText(cleanSnapshot.joinToString("\n"), StandardCharsets.UTF_8)
         report.forEach { println(it) }
         assertTrue(out.isFile)
         assertTrue("round4 should mine a large exact corpus", byFreq.size >= 30_000)
@@ -1592,6 +1598,291 @@ class EngineBenchmarkTest {
         assertEquals("千里江陵一日还", decoder.decode("qljlyrh", fuzzy = false).candidates.first().text)
         assertEquals("朝辞白帝彩云间", decoder.decode("ccbdcyj", fuzzy = false).candidates.first().text)
         assertEquals("时间", decoder.decode("shijian", fuzzy = false).candidates.first().text)
+    }
+
+    @Test
+    fun round6BoundaryAndMixedMining() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = lexicon
+            it.latin = latin
+        }
+        data class Probe(val split: String, val kind: String, val raw: String, val target: String)
+        val best = lexicon.allEntries.asSequence()
+            .filter { it.nsy in 2..4 && it.row.letters.length in 5..16 && it.row.letters.all { c -> c in 'a'..'z' } && 'v' !in it.row.letters }
+            .sortedWith(compareByDescending<FullEntry> { it.row.freq }.thenBy { it.row.letters }.thenBy { it.row.text })
+            .distinctBy { it.row.letters }
+            .take(1_600)
+            .toList()
+        val probes = ArrayList<Probe>()
+        for ((index, entry) in best.withIndex()) {
+            val split = if (index % 2 == 0) "DISCOVERY" else "HOLDOUT"
+            val letters = entry.row.letters
+            val parts = entry.row.syllables.split(' ')
+            if (parts.size != entry.nsy || parts.any { it.isEmpty() }) continue
+            fun add(kind: String, raw: String) {
+                if (raw.length < 4 || raw == letters) return
+                // Exact spellings are protected separately; do not count an ambiguous real word as a typo miss.
+                if (lexicon.exact(raw, 1).isNotEmpty()) return
+                probes += Probe(split, kind, raw, entry.row.text)
+            }
+            var cut = 0
+            for (part in parts.dropLast(1)) {
+                cut += part.length
+                if (letters[cut - 1] != letters[cut]) {
+                    val chars = letters.toCharArray()
+                    val tmp = chars[cut - 1]
+                    chars[cut - 1] = chars[cut]
+                    chars[cut] = tmp
+                    add("BOUNDARY_SWAP", String(chars))
+                }
+                if (cut < letters.lastIndex) {
+                    add("MISSING_INITIAL", letters.removeRange(cut, cut + 1))
+                }
+            }
+            val middle = letters.length / 2
+            add("DUPLICATE_MIDDLE", letters.substring(0, middle) + letters[middle] + letters.substring(middle))
+            if (parts.size == 2 && parts.first().first() !in "aeiouv") {
+                add("FIRST_INITIAL", parts.first().take(1) + parts.last())
+            }
+        }
+        val unique = probes.distinctBy { Triple(it.split, it.kind, it.raw) }
+        val report = ArrayList<String>()
+        val snapshot = ArrayList<String>(unique.size)
+        val stats = linkedMapOf<String, IntArray>()
+        val elapsed = linkedMapOf<String, MutableList<Long>>()
+        val misses = linkedMapOf<String, Int>()
+        for (probe in unique) {
+            val key = "${probe.split}_${probe.kind}"
+            val before = System.nanoTime()
+            val top = decoder.decode(probe.raw, fuzzy = false).candidates.take(5).map { it.text }
+            snapshot += "$key\t${probe.raw}\t${probe.target}\t${top.joinToString("|")}"
+            elapsed.getOrPut(key) { ArrayList() } += System.nanoTime() - before
+            val st = stats.getOrPut(key) { IntArray(4) }
+            st[0]++
+            if (top.firstOrNull() == probe.target) st[1]++
+            if (probe.target in top.take(3)) st[2]++
+            if (probe.target in top) st[3]++
+            if (probe.target !in top && (misses[key] ?: 0) < 20) {
+                misses[key] = (misses[key] ?: 0) + 1
+                report += "[$key] '${probe.raw}' -> want '${probe.target}', got $top"
+            }
+        }
+        for ((key, st) in stats) {
+            val times = elapsed.getValue(key).sorted()
+            val p95 = times[((times.size - 1) * 95 / 100)] / 1_000_000.0
+            report += "R6_$key : Top1=${st[1]}/${st[0]}, Top3=${st[2]}/${st[0]}, Top5=${st[3]}/${st[0]}, JVM p95=${String.format(java.util.Locale.ROOT, "%.2f", p95)}ms"
+        }
+        val guards = linkedMapOf(
+            "wanguo" to "玩过", "chahu" to "茶壶", "shidu" to "适度", "dayuan" to "大院",
+            "feida" to "肥大", "dazhan" to "大战", "weida" to "伟大", "shengfu" to "胜负",
+            "zengfu" to "增幅", "shifa" to "始发", "zifa" to "自发", "jisu" to "激素",
+            "yijin" to "一斤", "shijian" to "时间", "hennan" to "很难", "xinnian" to "新年",
+        )
+        val guardMisses = guards.mapNotNull { (raw, want) ->
+            val top = decoder.decode(raw, fuzzy = false).candidates.firstOrNull()?.text
+            if (top == want) null else "$raw -> want $want, got $top"
+        }
+        report += "R6_EXACT_GUARDS : ${guards.size - guardMisses.size}/${guards.size} ($guardMisses)"
+        val out = File("build/reports/round6-mine.txt")
+        out.parentFile?.mkdirs()
+        out.writeText(report.joinToString("\n"), StandardCharsets.UTF_8)
+        File("build/reports/round6-snapshot.tsv").writeText(snapshot.joinToString("\n"), StandardCharsets.UTF_8)
+        report.forEach { println(it) }
+        assertTrue("round6 should generate a broad frozen set", unique.size >= 4_000)
+        assertTrue("exact spellings must keep precedence: $guardMisses", guardMisses.isEmpty())
+        for ((kind, minimum) in mapOf("HOLDOUT_BOUNDARY_SWAP" to 0.99, "HOLDOUT_MISSING_INITIAL" to 0.90, "HOLDOUT_DUPLICATE_MIDDLE" to 0.995)) {
+            val st = stats.getValue(kind)
+            assertTrue("$kind recovery regressed: Top5=${st[3]}/${st[0]}", st[3].toDouble() / st[0] >= minimum)
+        }
+    }
+
+    @Test
+    fun round7EnglishSlipMining() {
+        val latin = sharedEnv.third
+        val words = GZIPInputStream(resolveAsset("dict/english.tsv.gz").inputStream())
+            .bufferedReader(StandardCharsets.UTF_8).use { reader ->
+                reader.lineSequence().mapNotNull { line ->
+                    val parts = line.split('\t')
+                    val word = parts.firstOrNull() ?: return@mapNotNull null
+                    val freq = parts.getOrNull(1)?.toIntOrNull() ?: return@mapNotNull null
+                    if (word.length !in 4..12 || word.any { it !in 'a'..'z' }) return@mapNotNull null
+                    word to freq
+                }.sortedWith(compareByDescending<Pair<String, Int>> { it.second }.thenBy { it.first })
+                    .distinctBy { it.first }.take(800).toList()
+            }
+        data class Probe(val kind: String, val raw: String, val target: String)
+        val probes = ArrayList<Probe>()
+        for ((index, entry) in words.withIndex()) {
+            val word = entry.first
+            val split = if (index % 2 == 0) "DISCOVERY" else "HOLDOUT"
+            val middle = word.length / 2
+            fun add(kind: String, raw: String) {
+                if (raw == word || latin.exactFreq(raw) > 0) return
+                probes += Probe("${split}_$kind", raw, word)
+            }
+            val chars = word.toCharArray()
+            val temp = chars[middle - 1]
+            chars[middle - 1] = chars[middle]
+            chars[middle] = temp
+            add("TRANSPOSE", String(chars))
+            add("DELETE", word.removeRange(middle, middle + 1))
+            add("DUPLICATE", word.substring(0, middle) + word[middle] + word.substring(middle))
+        }
+        val stats = linkedMapOf<String, IntArray>()
+        val shown = hashMapOf<String, Int>()
+        val report = ArrayList<String>()
+        val snapshot = ArrayList<String>(probes.size)
+        for (probe in probes.distinctBy { it.kind to it.raw }) {
+            val top = latin.suggest(probe.raw).take(5).map { it.text }
+            snapshot += "${probe.kind}\t${probe.raw}\t${probe.target}\t${top.joinToString("|")}"
+            val st = stats.getOrPut(probe.kind) { IntArray(4) }
+            st[0]++
+            if (top.firstOrNull() == probe.target) st[1]++
+            if (probe.target in top.take(3)) st[2]++
+            if (probe.target in top) st[3]++
+            if (probe.target !in top && (shown[probe.kind] ?: 0) < 12) {
+                shown[probe.kind] = (shown[probe.kind] ?: 0) + 1
+                report += "[${probe.kind}] '${probe.raw}' -> want '${probe.target}', got $top"
+            }
+        }
+        for ((kind, st) in stats) {
+            report += "R7_$kind : Top1=${st[1]}/${st[0]}, Top3=${st[2]}/${st[0]}, Top5=${st[3]}/${st[0]}"
+        }
+        val exactMisses = words.mapNotNull { (word, _) ->
+            val actual = latin.suggest(word).firstOrNull()?.text
+            if (actual == word) null else "$word -> $actual"
+        }
+        report += "R7_EXACT : ${words.size - exactMisses.size}/${words.size} ($exactMisses)"
+        val out = File("build/reports/round7-english-mine.txt")
+        out.parentFile?.mkdirs()
+        out.writeText(report.joinToString("\n"), StandardCharsets.UTF_8)
+        File("build/reports/round7-snapshot.tsv").writeText(snapshot.joinToString("\n"), StandardCharsets.UTF_8)
+        report.forEach { println(it) }
+        assertEquals("all common exact English words must retain precedence", emptyList<String>(), exactMisses)
+        assertTrue("English mining should cover at least 2,000 slips", probes.size >= 2_000)
+        for ((kind, minimum) in mapOf("HOLDOUT_TRANSPOSE" to 0.99, "HOLDOUT_DELETE" to 0.92, "HOLDOUT_DUPLICATE" to 0.995)) {
+            val st = stats.getValue(kind)
+            assertTrue("$kind recovery regressed: Top5=${st[3]}/${st[0]}", st[3].toDouble() / st[0] >= minimum)
+        }
+    }
+
+    @Test
+    fun round8RecoveryLookupAudit() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val counts = linkedMapOf<String, Int>()
+        val counting = java.lang.reflect.Proxy.newProxyInstance(
+            Lexicon::class.java.classLoader,
+            arrayOf(Lexicon::class.java),
+        ) { _, method, args ->
+            counts[method.name] = (counts[method.name] ?: 0) + 1
+            method.invoke(lexicon, *(args ?: emptyArray()))
+        } as Lexicon
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = counting
+            it.latin = latin
+        }
+        val report = listOf(
+            "nihao", "women", "shijian", "zhongguo", "shijie", "jintian", "wangzhan",
+            "shij", "zhongg", "niha", "beij", "xians", "sh", "bj", "ni'hao",
+            "woen", "baoao", "moen", "zheang", "dianua", "shihangjingji",
+            "meyiou", "hubiao", "ninuai", "buneeng", "xiwaang", "menhuwaangzhan",
+        ).mapIndexed { index, raw ->
+            counts.clear()
+            val top = decoder.decode(raw, fuzzy = false).candidates.take(3).joinToString("|") { it.text }
+            if (index < 15) {
+                assertTrue("common clean input must avoid expensive recovery: $raw -> $counts", counts.values.sum() <= 20)
+            }
+            "$raw\t${counts.values.sum()}\t$top\t${counts.entries.joinToString { "${it.key}=${it.value}" }}"
+        }
+        val out = File("build/reports/round8-lookup-audit.tsv")
+        out.parentFile?.mkdirs()
+        out.writeText(report.joinToString("\n"), StandardCharsets.UTF_8)
+        report.forEach { println(it) }
+        assertEquals(27, report.size)
+    }
+
+    @Test
+    fun round9UnseenLowerFrequencyRecovery() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = lexicon
+            it.latin = latin
+        }
+        val entries = lexicon.allEntries.asSequence()
+            .filter { it.nsy in 2..4 && it.row.letters.length in 5..16 && it.row.letters.all { c -> c in 'a'..'z' } && 'v' !in it.row.letters }
+            .sortedWith(compareByDescending<FullEntry> { it.row.freq }.thenBy { it.row.letters }.thenBy { it.row.text })
+            .distinctBy { it.row.letters }.drop(1_600).take(800).toList()
+        val stats = linkedMapOf<String, IntArray>()
+        val snapshot = ArrayList<String>()
+        for (entry in entries) {
+            val letters = entry.row.letters
+            val parts = entry.row.syllables.split(' ')
+            if (parts.size != entry.nsy || parts.any { it.isEmpty() }) continue
+            val boundary = parts.first().length
+            val mid = letters.length / 2
+            val chars = letters.toCharArray()
+            val previous = chars[boundary - 1]
+            chars[boundary - 1] = chars[boundary]
+            chars[boundary] = previous
+            val probes = linkedMapOf(
+                "MISSING_INITIAL" to letters.removeRange(boundary, boundary + 1),
+                "BOUNDARY_SWAP" to String(chars),
+                "DUPLICATE_MIDDLE" to (letters.substring(0, mid) + letters[mid] + letters.substring(mid)),
+            )
+            for ((kind, raw) in probes) {
+                if (raw == letters || lexicon.exact(raw, 1).isNotEmpty()) continue
+                val top = decoder.decode(raw, fuzzy = false).candidates.take(5).map { it.text }
+                val st = stats.getOrPut(kind) { IntArray(4) }
+                st[0]++
+                if (top.firstOrNull() == entry.row.text) st[1]++
+                if (entry.row.text in top.take(3)) st[2]++
+                if (entry.row.text in top) st[3]++
+                snapshot += "$kind\t$raw\t${entry.row.text}\t${top.joinToString("|")}"
+            }
+        }
+        val report = stats.map { (kind, st) -> "R9_$kind : Top1=${st[1]}/${st[0]}, Top3=${st[2]}/${st[0]}, Top5=${st[3]}/${st[0]}" }
+        val out = File("build/reports/round9-unseen-mine.txt")
+        out.parentFile?.mkdirs()
+        out.writeText(report.joinToString("\n"), StandardCharsets.UTF_8)
+        File("build/reports/round9-snapshot.tsv").writeText(snapshot.joinToString("\n"), StandardCharsets.UTF_8)
+        report.forEach { println(it) }
+        assertTrue("unseen mining must cover at least 2,000 slips", snapshot.size >= 2_000)
+        for ((kind, minimum) in mapOf("MISSING_INITIAL" to 0.80, "BOUNDARY_SWAP" to 0.95, "DUPLICATE_MIDDLE" to 0.82)) {
+            val st = stats.getValue(kind)
+            assertTrue("unseen $kind recovery regressed: Top5=${st[3]}/${st[0]}", st[3].toDouble() / st[0] >= minimum)
+        }
+    }
+
+    @Test
+    fun recoveredPinyinCandidatesCommitAndLearnOriginalSpellingSafely() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = lexicon
+            it.latin = latin
+        }
+        val engine = InputEngine(latin)
+        for ((raw, target) in listOf("woen" to "我们", "baoao" to "报告", "meyiou" to "没有", "buneeng" to "不能")) {
+            val decoded = decoder.decode(raw, fuzzy = false)
+            val index = decoded.candidates.indexOfFirst { it.text == target }
+            assertTrue("$raw must expose $target in its first five candidates", index in 0..4)
+            val candidate = decoded.candidates[index]
+            assertEquals("recovery must consume the original typed letters", raw.length, candidate.consumed)
+            assertTrue("learning must use recovered full syllables", candidate.syllables.replace(" ", "") != raw)
+            for (noLearn in listOf(false, true)) {
+                val state = EngineState(raw = raw, preedit = decoded.preedit, candidates = decoded.candidates, noLearn = noLearn)
+                val step = engine.reduce(state, EngineAct.Pick(index), EnterKind.Newline)
+                assertEquals(target, step.cmds.filterIsInstance<Cmd.Commit>().joinToString("") { it.text })
+                assertTrue("recovery must leave no inserted or unconsumed letters", step.state.raw.isEmpty())
+                val learned = step.cmds.filterIsInstance<Cmd.LearnZh>()
+                if (noLearn) {
+                    assertTrue("private input must not learn recovery", learned.isEmpty())
+                } else {
+                    assertEquals(candidate.syllables, learned.single().syllables)
+                    assertEquals(target, learned.single().text)
+                }
+            }
+        }
     }
 
     private fun fuzzyShrink(syllable: String): String = when {

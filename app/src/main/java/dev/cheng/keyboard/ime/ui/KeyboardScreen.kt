@@ -29,8 +29,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -55,7 +53,9 @@ import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -64,7 +64,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import dev.cheng.keyboard.ai.PolishTone
-import dev.cheng.keyboard.data.MAX_RECENT_CLIPS
+import dev.cheng.keyboard.data.clipboardPreviewText
 import dev.cheng.keyboard.engine.applyCase
 import dev.cheng.keyboard.ime.KeyboardController
 import dev.cheng.keyboard.ime.Overlay
@@ -313,14 +313,15 @@ private fun displayCandidateText(state: UiState, candidate: Candidate): String {
 
 @Composable
 private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardController) {
-    val enabled = !state.engine.password
-    val freshClip = state.freshClip?.takeIf { enabled }
+    val aiEnabled = !state.engine.password
+    val clipboardEnabled = aiEnabled && !state.engine.noLearn
+    val freshClip = state.freshClip?.takeIf { clipboardEnabled }
     Row(
         Modifier.fillMaxWidth().height(ToolbarHeight).padding(horizontal = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         ToolButton(palette, active = state.menu, onClick = controller::toggleMenu) {
-            GridIcon(if (state.menu) palette.accent else palette.icon, Modifier.size(20.dp))
+            ClipboardIcon(if (state.menu) palette.accent else palette.icon, Modifier.size(20.dp))
         }
         Box(
             Modifier.weight(1f).padding(horizontal = 4.dp),
@@ -382,7 +383,7 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
                     ) {
                         ClipboardIcon(palette.accent, Modifier.size(14.dp))
                         Text(
-                            freshClip.replace('\n', ' ').take(16),
+                            clipboardPreviewText(freshClip, maxCharacters = 5),
                             color = palette.label,
                             fontSize = 12.5.sp,
                             maxLines = 1,
@@ -408,20 +409,26 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
                 .clip(aiClusterShape)
                 .background(palette.sheet)
                 .border(0.8.dp, palette.divider, aiClusterShape)
-                .alpha(if (enabled) 1f else 0.38f)
+                .alpha(if (aiEnabled) 1f else 0.38f)
                 .padding(horizontal = 2.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             val askActive = state.overlay == Overlay.Ask
             val translateActive = (state.overlay as? Overlay.Result)?.kind == ResultKind.Translate
             val polishActive = (state.overlay as? Overlay.Result)?.kind == ResultKind.Polish
-            ToolButton(palette, enabled = enabled, active = askActive, compact = true, onClick = controller::ask) {
+            ToolButton(palette, enabled = aiEnabled, active = askActive, compact = true, onClick = controller::ask) {
                 AskIcon(if (askActive) palette.accent else palette.icon, Modifier.size(18.dp))
             }
-            ToolButton(palette, enabled = enabled, active = translateActive, compact = true, onClick = controller::translate) {
+            ToolButton(
+                palette,
+                enabled = aiEnabled,
+                active = translateActive,
+                compact = true,
+                onClick = controller::translate,
+            ) {
                 TranslateIcon(if (translateActive) palette.accent else palette.icon, Modifier.size(18.dp))
             }
-            ToolButton(palette, enabled = enabled, active = polishActive, compact = true, onClick = controller::polish) {
+            ToolButton(palette, enabled = aiEnabled, active = polishActive, compact = true, onClick = controller::polish) {
                 PolishIcon(if (polishActive) palette.accent else palette.icon, Modifier.size(18.dp))
             }
         }
@@ -456,160 +463,7 @@ private fun ToolButton(
 
 @Composable
 private fun MenuPanel(state: UiState, palette: Palette, controller: KeyboardController) {
-    Column(
-        Modifier
-            .sheet(palette)
-            .heightIn(max = 204.dp)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        val clips = (if (state.recentClips.isNotEmpty()) state.recentClips else listOfNotNull(state.clip))
-            .take(MAX_RECENT_CLIPS)
-        if (clips.isNotEmpty() && !state.engine.password) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-            ) {
-                ClipboardIcon(palette.subtle, Modifier.size(13.dp))
-                Text("最近剪贴板", color = palette.subtle, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-            }
-            Row(
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                clips.forEach { item ->
-                    val chipShape = RoundedCornerShape(10.dp)
-                    val preview = item.replace(Regex("\\s+"), " ").trim().take(80)
-                    Text(
-                        preview,
-                        color = palette.label,
-                        fontSize = 13.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier
-                            .widthIn(max = 176.dp)
-                            .clip(chipShape)
-                            .background(palette.key)
-                            .border(0.6.dp, palette.keyBorder, chipShape)
-                            .clickable { controller.pasteText(item) }
-                            .padding(horizontal = 10.dp, vertical = 5.dp),
-                    )
-                }
-            }
-        }
-        Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("键盘高度", color = palette.subtle, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-            Spacer(Modifier.weight(1f))
-            Text(
-                "${(state.heightScale * 100).toInt()}%",
-                color = palette.accent,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
-        Slider(
-            value = state.heightScale,
-            onValueChange = controller::setHeight,
-            valueRange = 0.8f..1.25f,
-            modifier = Modifier.height(26.dp),
-            colors = SliderDefaults.colors(
-                thumbColor = palette.accent,
-                activeTrackColor = palette.accent,
-                inactiveTrackColor = palette.funcKey,
-            ),
-        )
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .background(palette.board)
-                .padding(3.dp),
-            horizontalArrangement = Arrangement.spacedBy(3.dp),
-        ) {
-            ThemeMode.entries.forEach { mode ->
-                val selected = state.theme == mode
-                Text(
-                    when (mode) {
-                        ThemeMode.System -> "跟随系统"
-                        ThemeMode.Dark -> "深色"
-                        ThemeMode.Light -> "浅色"
-                    },
-                    color = if (selected) palette.accent else palette.subtle,
-                    fontSize = 12.5.sp,
-                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(if (selected) palette.key else Color.Transparent)
-                        .clickable { controller.setTheme(mode) }
-                        .padding(vertical = 5.dp),
-                )
-            }
-        }
-        Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            QuickToggleChip(
-                "模糊音",
-                checked = state.fuzzy,
-                palette = palette,
-                onClick = { controller.setFuzzy(!state.fuzzy) },
-            )
-            QuickToggleChip(
-                "按键振动",
-                checked = state.haptic,
-                palette = palette,
-                onClick = { controller.setHaptic(!state.haptic) },
-            )
-            Spacer(Modifier.weight(1f))
-            Row(
-                Modifier
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable(onClick = controller::openSettings)
-                    .padding(horizontal = 8.dp, vertical = 5.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                SettingsIcon(palette.accent, Modifier.size(15.dp))
-                Text("更多设置", color = palette.accent, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-            }
-        }
-    }
-}
-
-@Composable
-private fun QuickToggleChip(
-    label: String,
-    checked: Boolean,
-    palette: Palette,
-    onClick: () -> Unit,
-) {
-    val shape = RoundedCornerShape(10.dp)
-    Box(
-        Modifier
-            .clip(shape)
-            .background(if (checked) palette.accentSoft else palette.key)
-            .border(
-                width = 0.8.dp,
-                color = if (checked) palette.accent.copy(alpha = 0.4f) else palette.keyBorder,
-                shape = shape,
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 5.dp),
-    ) {
-        Text(
-            label,
-            color = if (checked) palette.accent else palette.label,
-            fontSize = 12.5.sp,
-            fontWeight = if (checked) FontWeight.SemiBold else FontWeight.Normal,
-        )
-    }
+    ClipboardPanel(state, palette, controller)
 }
 
 @Composable
@@ -733,6 +587,13 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
                     }
                 },
         ) {
+            if (state.engine.page == KeyboardPage.Letters) {
+                val numberKey = placement.keys.firstOrNull { it.model.id == "to-number" }
+                val symbolsKey = placement.keys.firstOrNull { it.model.id == "to-symbols" }
+                if (numberKey != null && symbolsKey != null) {
+                    LetterBottomPairBackground(numberKey, symbolsKey, palette, density)
+                }
+            }
             placement.keys.forEach { key ->
                 KeyCap(key, state, palette, keyHeight)
             }
@@ -755,6 +616,45 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
 }
 
 @Composable
+private fun LetterBottomPairBackground(
+    numberKey: PlacedKey,
+    symbolsKey: PlacedKey,
+    palette: Palette,
+    density: androidx.compose.ui.unit.Density,
+) {
+    val startX = minOf(numberKey.x, symbolsKey.x)
+    val startY = minOf(numberKey.y, symbolsKey.y)
+    val endX = maxOf(numberKey.x + numberKey.w, symbolsKey.x + symbolsKey.w)
+    val endY = maxOf(numberKey.y + numberKey.h, symbolsKey.y + symbolsKey.h)
+    val widthPx = (endX - startX).coerceAtLeast(1f)
+    val heightPx = (endY - startY).coerceAtLeast(1f)
+    val dividerWidthPx = with(density) { 1.dp.toPx() }
+    val dividerHeightPx = with(density) { 14.dp.toPx() }
+    val shape = RoundedCornerShape(10.dp)
+    Box(
+        Modifier
+            .offset { IntOffset(startX.toInt(), startY.toInt()) }
+            .width(with(density) { widthPx.toDp() })
+            .height(with(density) { heightPx.toDp() })
+            .clip(shape)
+            .background(palette.funcKey),
+    ) {
+        Box(
+            Modifier
+                .offset {
+                    IntOffset(
+                        ((widthPx - dividerWidthPx) * 0.5f).roundToInt(),
+                        ((heightPx - dividerHeightPx) * 0.5f).roundToInt(),
+                    )
+                }
+                .width(with(density) { dividerWidthPx.toDp() })
+                .height(with(density) { dividerHeightPx.toDp() })
+                .background(palette.divider),
+        )
+    }
+}
+
+@Composable
 private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: Dp) {
     val density = LocalDensity.current
     val pressed = state.pressedId == key.model.id
@@ -765,7 +665,20 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
     val shiftActive = key.model.kind == KeyKind.Shift &&
         !separating &&
         state.engine.shift != ShiftState.Off
+    val onLettersPage = state.engine.page == KeyboardPage.Letters
     val onNumberPage = state.engine.page == KeyboardPage.Number
+    val isLettersBottomPairKey = onLettersPage &&
+        (key.model.id == "to-number" || key.model.id == "to-symbols")
+    val isLettersBottomFlatKey = onLettersPage &&
+        (key.model.id == "comma" || key.model.id == "period" || key.model.id == "lang")
+    val isLettersBottomSpace = onLettersPage && key.model.kind == KeyKind.Space && key.model.id == "space"
+    val isLettersBottomLanguage = onLettersPage && key.model.kind == KeyKind.Language && key.model.id == "lang"
+    val isLettersBottomEnter = onLettersPage && key.model.kind == KeyKind.Enter && key.model.id == "enter"
+    val isNumberInput = onNumberPage && (
+        key.model.id.startsWith("num-") ||
+            key.model.id == "comma" ||
+            key.model.id == "period"
+        )
     val isPrimaryDigit = onNumberPage && key.model.id.startsWith("num-")
     val isFunction = when (key.model.kind) {
         KeyKind.Shift,
@@ -775,12 +688,15 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
         KeyKind.PageNumber,
         KeyKind.PageSymbols,
         KeyKind.PageMore -> true
-        KeyKind.Char -> onNumberPage && !isPrimaryDigit
+        KeyKind.Char -> onNumberPage && !isNumberInput
         KeyKind.Space -> onNumberPage
         else -> false
     }
     val fill = when {
         key.model.accent -> if (pressed) palette.accentPressed else palette.accent
+        isLettersBottomPairKey -> if (pressed) palette.funcPressed else Color.Transparent
+        isLettersBottomFlatKey -> if (pressed) palette.funcPressed.copy(alpha = 0.72f) else Color.Transparent
+        isLettersBottomSpace -> if (pressed) palette.pressed else palette.key
         shiftActive -> if (pressed) palette.pressed else palette.key
         isFunction -> if (pressed) palette.funcPressed else palette.funcKey
         else -> if (pressed) palette.pressed else palette.key
@@ -788,12 +704,34 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
     val showUpper = state.engine.language == Language.English &&
         state.engine.shift != ShiftState.Off &&
         key.model.kind == KeyKind.Letter
-    val corner = RoundedCornerShape(if (key.model.kind == KeyKind.Enter) 11.dp else 8.5.dp)
-    Box(
-        Modifier
-            .offset { IntOffset(key.x.toInt(), key.y.toInt()) }
-            .width(with(density) { key.w.toDp() })
-            .height(with(density) { key.h.toDp() })
+    val corner = RoundedCornerShape(
+        when {
+            isLettersBottomEnter -> 10.dp
+            key.model.kind == KeyKind.Enter -> 11.dp
+            onNumberPage && isNumberInput -> 11.dp
+            onNumberPage && isFunction -> 10.dp
+            isLettersBottomPairKey || isLettersBottomFlatKey || isLettersBottomSpace -> 10.dp
+            else -> 8.5.dp
+        },
+    )
+    val keyWidth = with(density) { key.w.toDp() }
+    val actualKeyHeight = with(density) { key.h.toDp() }
+    val surfaceModifier = when {
+        onNumberPage -> Modifier
+            .clip(corner)
+            .background(if (pressed) fill else palette.keyShadow)
+            .padding(bottom = if (pressed) 0.dp else 1.dp)
+            .clip(corner)
+            .background(fill)
+        isLettersBottomPairKey || isLettersBottomFlatKey -> if (pressed) {
+            Modifier.clip(corner).background(fill)
+        } else {
+            Modifier
+        }
+        isLettersBottomSpace || isLettersBottomEnter -> Modifier
+            .clip(corner)
+            .background(fill)
+        else -> Modifier
             .clip(corner)
             .background(if (pressed) fill else palette.keyShadow)
             .padding(bottom = if (pressed) 0.dp else 1.dp)
@@ -801,9 +739,20 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
             .background(fill)
             .border(
                 width = 0.5.dp,
-                color = if (shiftActive && state.engine.shift == ShiftState.Caps) palette.accent.copy(alpha = 0.45f) else palette.keyBorder,
+                color = if (shiftActive && state.engine.shift == ShiftState.Caps) {
+                    palette.accent.copy(alpha = 0.45f)
+                } else {
+                    palette.keyBorder
+                },
                 shape = corner,
-            ),
+            )
+    }
+    Box(
+        Modifier
+            .offset { IntOffset(key.x.toInt(), key.y.toInt()) }
+            .width(with(density) { key.w.toDp() })
+            .height(with(density) { key.h.toDp() })
+            .then(surfaceModifier),
         contentAlignment = Alignment.Center,
     ) {
         when (key.model.kind) {
@@ -833,53 +782,204 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
                     ShiftIcon(shiftColor, state.engine.shift, Modifier.size(20.dp))
                 }
             }
-            KeyKind.Backspace -> BackspaceIcon(palette.icon, Modifier.size(21.dp))
+            KeyKind.Backspace -> BackspaceIcon(
+                palette.icon,
+                Modifier.size(if (onNumberPage) 22.dp else 21.dp),
+            )
             KeyKind.Enter -> {
                 val effectiveEnter = when (state.overlay) {
                     Overlay.Ask -> EnterKind.Send
                     Overlay.NeedKey -> EnterKind.Done
                     else -> state.enter
                 }
-                EnterIcon(palette.onAccent, Modifier.size(21.dp), kind = effectiveEnter)
+                EnterIcon(
+                    palette.onAccent,
+                    Modifier.size(if (onNumberPage) 22.dp else 21.dp),
+                    kind = effectiveEnter,
+                )
             }
             KeyKind.Space -> {
                 val spaceLabel = when {
                     onNumberPage -> "空格"
+                    isLettersBottomSpace && state.engine.language == Language.Chinese -> "空格"
+                    isLettersBottomSpace -> "English"
                     state.engine.language == Language.Chinese -> "中文"
                     else -> "English"
                 }
-                Text(
-                    spaceLabel,
+                FittedKeyLabel(
+                    text = spaceLabel,
+                    maxWidth = keyWidth,
+                    maxHeight = actualKeyHeight,
+                    maxFontSize = if (onNumberPage) 14f else 12f,
                     color = palette.subtle,
-                    fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
-                    maxLines = 1,
                 )
-                Box(
-                    Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 4.dp)
-                        .width(if (onNumberPage) 16.dp else 26.dp)
-                        .height(2.dp)
-                        .clip(CircleShape)
-                        .background(palette.divider),
-                )
+                if (!onNumberPage && !isLettersBottomSpace) {
+                    Box(
+                        Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 4.dp)
+                            .width(26.dp)
+                            .height(2.dp)
+                            .clip(CircleShape)
+                            .background(palette.divider),
+                    )
+                }
             }
-            KeyKind.Language -> LanguageMark(state.engine.language, palette)
-            else -> Text(
-                key.model.label,
-                color = if (key.model.accent) palette.onAccent else palette.label,
-                fontSize = when {
-                    isPrimaryDigit -> 22.sp
-                    key.model.label.length > 1 -> 13.sp
-                    else -> 19.sp
-                },
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                softWrap = false,
-            )
+            KeyKind.Language -> {
+                if (isLettersBottomLanguage) {
+                    FittedKeyLabel(
+                        text = "中英",
+                        maxWidth = keyWidth,
+                        maxHeight = actualKeyHeight,
+                        maxFontSize = 14f,
+                        color = palette.label,
+                        fontWeight = FontWeight.Medium,
+                    )
+                } else {
+                    LanguageMark(state.engine.language, palette)
+                }
+            }
+            else -> {
+                val numberDigitSize = numberDigitFontSize(actualKeyHeight, density.fontScale)
+                val numberPunctuationSize = numberPunctuationFontSize(actualKeyHeight, density.fontScale)
+                val isLettersPunctuation = onLettersPage &&
+                    key.model.kind == KeyKind.Char &&
+                    (key.model.id == "comma" || key.model.id == "period")
+                when {
+                    isPrimaryDigit -> Text(
+                        key.model.label,
+                        color = palette.label,
+                        fontSize = numberDigitSize.sp,
+                        lineHeight = numberDigitSize.sp,
+                        fontWeight = FontWeight.Normal,
+                        maxLines = 1,
+                        softWrap = false,
+                        textAlign = TextAlign.Center,
+                    )
+                    onNumberPage && isNumberInput -> Text(
+                        key.model.label,
+                        color = palette.label,
+                        fontSize = numberPunctuationSize.sp,
+                        lineHeight = numberPunctuationSize.sp,
+                        fontWeight = FontWeight.Normal,
+                        maxLines = 1,
+                        softWrap = false,
+                        textAlign = TextAlign.Center,
+                    )
+                    onNumberPage && key.model.kind == KeyKind.Char -> FittedKeyLabel(
+                        text = key.model.label,
+                        maxWidth = keyWidth,
+                        maxHeight = actualKeyHeight,
+                        maxFontSize = 20f,
+                        color = palette.label,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    onNumberPage && key.model.kind == KeyKind.PageLetters -> FittedKeyLabel(
+                        text = key.model.label,
+                        maxWidth = keyWidth,
+                        maxHeight = actualKeyHeight,
+                        maxFontSize = 14f,
+                        color = palette.label,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    onNumberPage && key.model.kind == KeyKind.PageSymbols -> FittedKeyLabel(
+                        text = key.model.label,
+                        maxWidth = keyWidth,
+                        maxHeight = actualKeyHeight,
+                        maxFontSize = 14f,
+                        color = palette.label,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    isLettersBottomPairKey -> FittedKeyLabel(
+                        text = key.model.label,
+                        maxWidth = keyWidth,
+                        maxHeight = actualKeyHeight,
+                        maxFontSize = 14f,
+                        color = palette.label,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    isLettersPunctuation -> FittedKeyLabel(
+                        text = key.model.label,
+                        maxWidth = keyWidth,
+                        maxHeight = actualKeyHeight,
+                        maxFontSize = 19f,
+                        color = palette.label,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    else -> Text(
+                        key.model.label,
+                        color = if (key.model.accent) palette.onAccent else palette.label,
+                        fontSize = when {
+                            key.model.label.length > 1 -> 13.sp
+                            else -> 19.sp
+                        },
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        softWrap = false,
+                    )
+                }
+            }
         }
     }
+}
+
+private fun numberDigitFontSize(keyHeight: Dp, fontScale: Float): Float {
+    val baseSize = when {
+        keyHeight <= 40.dp -> 22f
+        keyHeight < 46.dp -> 24f
+        else -> 26f
+    }
+    val scaledHeightLimit = (keyHeight.value - 10f).coerceAtLeast(18f) /
+        fontScale.coerceAtLeast(1f)
+    return minOf(baseSize, scaledHeightLimit)
+}
+
+private fun numberPunctuationFontSize(keyHeight: Dp, fontScale: Float): Float {
+    val scaledHeightLimit = (keyHeight.value - 10f).coerceAtLeast(18f) /
+        fontScale.coerceAtLeast(1f)
+    return minOf(20f, scaledHeightLimit)
+}
+
+@Composable
+private fun FittedKeyLabel(
+    text: String,
+    maxWidth: Dp,
+    maxHeight: Dp,
+    maxFontSize: Float,
+    color: Color,
+    fontWeight: FontWeight,
+) {
+    val density = LocalDensity.current
+    val measurer = rememberTextMeasurer()
+    val availableWidth = (maxWidth - 6.dp).coerceAtLeast(1.dp)
+    val availableWidthPx = with(density) { availableWidth.toPx() }
+    val measuredWidthPx = remember(text, maxFontSize, fontWeight, density, measurer) {
+        measurer.measure(
+            text = text,
+            style = TextStyle(fontSize = maxFontSize.sp, fontWeight = fontWeight),
+            maxLines = 1,
+            softWrap = false,
+        ).size.width.toFloat()
+    }
+    val widthFittedSize = if (measuredWidthPx <= availableWidthPx) {
+        maxFontSize
+    } else {
+        maxFontSize * availableWidthPx / measuredWidthPx.coerceAtLeast(1f)
+    }
+    val heightFittedSize = (maxHeight.value - 8f).coerceAtLeast(1f) /
+        density.fontScale.coerceAtLeast(0.01f)
+    val fittedSize = minOf(maxFontSize, widthFittedSize, heightFittedSize)
+    Text(
+        text,
+        color = color,
+        fontSize = fittedSize.sp,
+        lineHeight = fittedSize.sp,
+        fontWeight = fontWeight,
+        maxLines = 1,
+        softWrap = false,
+        textAlign = TextAlign.Center,
+    )
 }
 
 @Composable

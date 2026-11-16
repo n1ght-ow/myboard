@@ -17,8 +17,9 @@ import dev.cheng.keyboard.model.ThemeMode
 import org.json.JSONArray
 import java.io.File
 
-const val MAX_RECENT_CLIPS = 5
+const val MAX_RECENT_CLIPS = 12
 private const val MAX_CLIP_CHARS = 4096
+private val GRAPHEME_CLUSTER = Regex("\\X")
 
 val Context.settingsStore by preferencesDataStore(name = "keyboard")
 
@@ -43,12 +44,7 @@ fun mergeRecentClips(
 ): List<String> {
     val normalized = current?.takeIf { it.isNotBlank() }?.take(MAX_CLIP_CHARS)
     val cleaned = existing.mapNotNull { item -> item.takeIf { it.isNotBlank() }?.take(MAX_CLIP_CHARS) }
-    val combined = if (normalized != null) {
-        listOf(normalized) + cleaned.filter { it != normalized }
-    } else {
-        cleaned.distinct()
-    }
-    return combined.take(limit.coerceAtLeast(0))
+    return (listOfNotNull(normalized) + cleaned).distinct().take(limit.coerceAtLeast(0))
 }
 
 fun mergeRecentClipLists(
@@ -56,6 +52,7 @@ fun mergeRecentClipLists(
     secondary: List<String>,
     limit: Int = MAX_RECENT_CLIPS,
 ): List<String> {
+    if (limit <= 0) return emptyList()
     val out = ArrayList<String>(limit.coerceAtLeast(0))
     for (item in primary.asSequence() + secondary.asSequence()) {
         val normalized = item.takeIf { it.isNotBlank() }?.take(MAX_CLIP_CHARS) ?: continue
@@ -65,6 +62,31 @@ fun mergeRecentClipLists(
         }
     }
     return out
+}
+
+fun clipboardPreviewText(text: String, maxCharacters: Int = 5): String {
+    val builder = StringBuilder(text.length)
+    var pendingSpace = false
+    for (char in text) {
+        if (char.isWhitespace()) {
+            pendingSpace = builder.isNotEmpty()
+        } else {
+            if (pendingSpace) builder.append(' ')
+            builder.append(char)
+            pendingSpace = false
+        }
+    }
+    if (builder.isEmpty()) return ""
+    if (maxCharacters <= 0) return "…"
+
+    val preview = StringBuilder()
+    var count = 0
+    for (match in GRAPHEME_CLUSTER.findAll(builder)) {
+        if (count == maxCharacters) return preview.append('…').toString()
+        preview.append(match.value)
+        count++
+    }
+    return preview.toString()
 }
 
 fun encodeRecentClips(clips: List<String>, limit: Int = MAX_RECENT_CLIPS): String {

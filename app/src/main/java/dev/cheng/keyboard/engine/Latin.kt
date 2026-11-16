@@ -123,6 +123,21 @@ class LatinDecoder {
                 exactWord.freq >= 5_000 ||
                 (exactWord.freq >= minCredibleFreq && bestCompletionFreq < exactWord.freq.toLong() * 40L)
             )
+        val oneEditRecovery = if (
+            !verbatimFirst &&
+            exactWord == null &&
+            prefix.length >= 4 &&
+            completions.size >= 3 &&
+            completions.any { it.first != prefix && it.second >= 500 }
+        ) {
+            val recoveryFloor = maxOf(
+                if (largeCorpus) 10_000L else 1L,
+                bestCompletionFreq.toLong() * 4L,
+            )
+            bestOneEditRecovery(prefix, recoveryFloor)
+        } else {
+            null
+        }
         if (exactWord != null) {
             val word = exactWord.word!!
             val boost = when {
@@ -173,6 +188,21 @@ class LatinDecoder {
             .sortedByDescending { it.value.second }
             .map { Candidate(it.key, it.key, it.value.first) }
             .toMutableList()
+
+        if (oneEditRecovery != null) {
+            val existingIndex = ranked.indexOfFirst { it.text == oneEditRecovery.word }
+            when {
+                existingIndex in 0..2 -> Unit
+                existingIndex > 2 -> {
+                    val candidate = ranked.removeAt(existingIndex)
+                    ranked.add(1, candidate)
+                }
+                else -> ranked.add(
+                    1.coerceAtMost(ranked.size),
+                    Candidate(oneEditRecovery.word, oneEditRecovery.word, oneEditRecovery.freq),
+                )
+            }
+        }
 
         if (verbatimFirst) {
             ranked.removeAll { it.text == prefix }
@@ -437,6 +467,64 @@ class LatinDecoder {
         return hits.values
             .sortedByDescending { ln(it.freq.coerceAtLeast(1).toDouble()) - it.cost * 3.2 }
             .take(8)
+    }
+
+    private fun bestOneEditRecovery(typed: String, minFrequency: Long): FuzzyHit? {
+        if (typed.length < 4 || typed.any { it !in 'a'..'z' }) return null
+
+        val path = arrayOfNulls<Node>(typed.length + 1)
+        var node: Node? = root
+        path[0] = node
+        for (index in typed.indices) {
+            node = node?.next?.get(indexOf(typed[index]) ?: return null)
+            path[index + 1] = node
+        }
+
+        var best: FuzzyHit? = null
+
+        fun walkFromIndex(start: Node?, from: Int): Node? {
+            var current = start ?: return null
+            for (index in from until typed.length) {
+                current = current.next[indexOf(typed[index]) ?: return null] ?: return null
+            }
+            return current
+        }
+
+        fun consider(candidateNode: Node?, cost: Double) {
+            val word = candidateNode?.word ?: return
+            val freq = candidateNode.freq
+            if (freq <= 0 || freq.toLong() < minFrequency || word == typed) return
+            val current = best
+            if (
+                current == null ||
+                freq > current.freq ||
+                (freq == current.freq && cost < current.cost)
+            ) {
+                best = FuzzyHit(word, freq, cost)
+            }
+        }
+
+        for (index in 1 until typed.length) {
+            if (typed[index] == typed[index - 1]) {
+                consider(walkFromIndex(path[index], index + 1), 1.15)
+            }
+        }
+
+        for (index in 0 until typed.lastIndex) {
+            if (typed[index] == typed[index + 1]) continue
+            val first = path[index]?.next?.get(indexOf(typed[index + 1]) ?: continue) ?: continue
+            val second = first.next[indexOf(typed[index]) ?: continue] ?: continue
+            consider(walkFromIndex(second, index + 2), 1.05)
+        }
+
+        for (index in 0..typed.length) {
+            val prefixNode = path[index] ?: continue
+            for (letter in 0 until 26) {
+                consider(walkFromIndex(prefixNode.next[letter], index), 1.65)
+            }
+        }
+
+        return best
     }
 
     private fun insert(root: Node, word: String, freq: Int, isBase: Boolean) {

@@ -247,7 +247,8 @@ class KeyboardController(
         gesture.cancel()
         tapClearJob?.cancel()
         lastPolishUndo = null
-        val syncedClips = if (traits.password) {
+        val isPrivateInput = traits.password || traits.noLearn
+        val syncedClips = if (isPrivateInput) {
             state.recentClips
         } else {
             mergeRecentClips(readClip(skipSensitive = true), state.recentClips).also { merged ->
@@ -262,6 +263,9 @@ class KeyboardController(
                 expanded = false,
                 enter = enter,
                 canUndoPolish = false,
+                menu = false,
+                clip = null,
+                freshClip = null,
                 recentClips = syncedClips,
             )
         }
@@ -494,10 +498,19 @@ class KeyboardController(
         if (state.menu) {
             update { it.copy(menu = false, clip = null) }
         } else {
-            val current = if (engineState.password) null else readClip(skipSensitive = true)
+            val isPrivate = engineState.password || engineState.noLearn
+            val current = if (isPrivate) null else readClip(skipSensitive = true)
             val merged = mergeRecentClips(current, state.recentClips)
-            if (merged != state.recentClips) saveRecentClips(merged)
-            update { it.copy(menu = true, clip = current, recentClips = merged, overlay = Overlay.None) }
+            if (!isPrivate && merged != state.recentClips) saveRecentClips(merged)
+            update {
+                it.copy(
+                    menu = true,
+                    clip = current,
+                    freshClip = if (isPrivate) null else it.freshClip,
+                    recentClips = merged,
+                    overlay = Overlay.None,
+                )
+            }
         }
     }
 
@@ -1276,6 +1289,11 @@ class KeyboardController(
     }
 
     private fun onClipboardChanged() {
+        if (engineState.password || engineState.noLearn) {
+            clipExpireJob?.cancel()
+            update { it.copy(freshClip = null) }
+            return
+        }
         val text = readClip(skipSensitive = true) ?: return
         clipExpireJob?.cancel()
         val merged = mergeRecentClips(text, state.recentClips)

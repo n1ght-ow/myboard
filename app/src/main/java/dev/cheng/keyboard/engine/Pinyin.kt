@@ -546,7 +546,7 @@ class PinyinDecoder(syllables: Set<String>) {
             it.consumed == letters.length && !it.opened && it.pieces == 1
         }
         val weakSolidWord = solid && solidExactWord != null && solidExactWord.freq < 500
-        val highConfidenceSolidRepair = solid && solidExactWord != null && solidExactWord.freq < 30_000
+        val highConfidenceSolidRepair = solid && solidExactWord != null && solidExactWord.freq < 20_000
         val topSolidText = rankedPinyin.firstOrNull()?.text.orEmpty()
         val cleanOpenCompletion = open.any { seg ->
             seg.parts.size >= 2 &&
@@ -619,6 +619,26 @@ class PinyinDecoder(syllables: Set<String>) {
             topBodyFreq <= 5_000_000 &&
             !cleanOpenCompletion
         val strongFuzzyRepair = fuzzy && book.strongFuzzyRepair(body, letters)
+        val weakBoundaryComposition = !keepWritten &&
+            !fuzzy &&
+            touchHints.isEmpty() &&
+            touchSamples.isEmpty() &&
+            solid &&
+            solidExactWord == null &&
+            !cleanOpenCompletion &&
+            letters.length in 4..18 &&
+            (body.firstOrNull()?.pieces ?: 1) >= 2 &&
+            topBodyFreq <= 5_000_000
+        val highFrequencyBoundaryComposition = !keepWritten &&
+            !fuzzy &&
+            touchHints.isEmpty() &&
+            touchSamples.isEmpty() &&
+            solidExactWord == null &&
+            !cleanOpenCompletion &&
+            letters.length in 4..18 &&
+            (body.firstOrNull()?.pieces ?: 1) >= 2 &&
+            topBodyFreq > 5_000_000
+        val canUseStructuralRepairs = weakBoundaryComposition || highFrequencyBoundaryComposition
         val shouldTryTypos = when {
             letters.length !in 2..22 -> false
             strongFuzzyRepair -> false
@@ -632,7 +652,23 @@ class PinyinDecoder(syllables: Set<String>) {
             !solid && letters.length >= 3 && !book.hasMultiAbbrevInitials(letters, wholeAbbrev) -> true
             else -> false
         }
-        if (shouldTryTypos) {
+        val structuralRepairs = if (canUseStructuralRepairs) {
+            book.weakStructuralRepairs(letters, 400_000)
+        } else {
+            emptyList()
+        }
+        val structuralBest = structuralRepairs.firstOrNull()
+        if (structuralBest != null) {
+            val withoutStructural = body.filter { it.text != structuralBest.text }
+            body = if (highFrequencyBoundaryComposition && !weakBoundaryComposition) {
+                withoutStructural.toMutableList().also { items ->
+                    items.add(minOf(1, items.size), structuralBest)
+                }
+            } else {
+                listOf(structuralBest) + withoutStructural
+            }
+        }
+        if (shouldTryTypos && structuralBest == null) {
             val typoItems = book.typos(letters, touchHints, touchSamples).let { items ->
                 if (weakSolidWord) {
                     items.filter {
@@ -1679,6 +1715,64 @@ class PinyinDecoder(syllables: Set<String>) {
             return rank(items)
         }
 
+        fun weakStructuralRepairs(letters: String, minFreq: Int): List<Scored> {
+            val duplicate = interiorDuplicateRepairs(letters, minFreq)
+            if (duplicate.isNotEmpty()) return duplicate
+
+            val swaps = boundarySwapRepairs(letters, minFreq)
+            if (swaps.isNotEmpty()) return swaps
+
+            return boundaryInitialRepairs(letters, minFreq)
+        }
+
+        private fun boundaryInitialRepairs(letters: String, minFreq: Int): List<Scored> {
+            if (letters.length !in 4..18) return emptyList()
+            val lattice = buildLattice(letters, trie)
+            val positions = (2 until letters.lastIndex)
+                .filter { index ->
+                    lattice[index].any { path -> path.parts.isNotEmpty() && path.parts.all { it.length >= 2 } } &&
+                        canAddInitialAt(letters, index)
+                }
+                .take(5)
+            if (positions.isEmpty()) return emptyList()
+
+            val items = ArrayList<Scored>()
+            val seen = HashSet<String>()
+            for (pos in positions) {
+                for (row in lexicon.prefixed(letters.substring(0, pos), 64)) {
+                    if (row.freq < minFreq || row.letters.length != letters.length + 1) continue
+                    if (row.letters.removeRange(pos, pos + 1) != letters) continue
+                    if (row.letters[pos] in "aeiouv" || !seen.add(row.text)) continue
+                    val parts = row.syllables.split(' ')
+                    if (parts.size !in 2..6 || parts.any { it.length < 2 }) continue
+                    if (parts.joinToString("") != row.letters) continue
+
+                    var syllableStart = 0
+                    var startsInsertedSyllable = false
+                    for (part in parts) {
+                        if (syllableStart == pos) {
+                            startsInsertedSyllable = true
+                            break
+                        }
+                        syllableStart += part.length
+                    }
+                    if (!startsInsertedSyllable) continue
+
+                    val count = row.text.codePointCount(0, row.text.length)
+                    if (count !in 2..6) continue
+                    val rawPenalty = parts.size * 3.6
+                    items += scored(
+                        row,
+                        wordScore(row.text, row.freq) - rawPenalty,
+                        letters,
+                        true,
+                        letters.length,
+                    )
+                }
+            }
+            return rank(items).take(4)
+        }
+
         fun insertionRepairs(letters: String, minFreq: Int = 10_000): List<Scored> {
             if (letters.length !in 3..18) return emptyList()
             val items = ArrayList<Scored>()
@@ -1705,6 +1799,55 @@ class PinyinDecoder(syllables: Set<String>) {
             }
             val repaired = rank(items).take(6)
             return repaired
+        }
+
+        private fun boundarySwapRepairs(letters: String, minFreq: Int): List<Scored> {
+            if (letters.length !in 4..18) return emptyList()
+            val items = ArrayList<Scored>()
+            val seen = HashSet<String>()
+            for (index in 0 until letters.lastIndex) {
+                if (letters[index] == letters[index + 1]) continue
+                val chars = letters.toCharArray()
+                val tmp = chars[index]
+                chars[index] = chars[index + 1]
+                chars[index + 1] = tmp
+                val candidate = String(chars)
+                if (!seen.add(candidate) || !hasCleanSyllablePath(candidate)) continue
+
+                for (row in lexicon.exact(candidate, 2)) {
+                    if (row.freq < minFreq) continue
+                    val count = row.text.codePointCount(0, row.text.length)
+                    val parts = row.syllables.split(' ')
+                    if (count !in 2..6 || parts.size !in 2..6 || parts.any { it.length < 2 }) continue
+                    if (parts.joinToString("") != row.letters) continue
+                    val rawPenalty = parts.size * 2.8
+                    items += scored(
+                        row,
+                        wordScore(row.text, row.freq) - rawPenalty,
+                        letters,
+                        true,
+                        letters.length,
+                    )
+                }
+            }
+            return rank(items).take(4)
+        }
+
+        private fun canAddInitialAt(text: String, pos: Int): Boolean {
+            for (initial in "bcdfghjklmnpqrstwxyz") {
+                val maxEnd = minOf(text.length, pos + 6)
+                for (end in (pos + 1)..maxEnd) {
+                    if (trie.canonicalOf(initial + text.substring(pos, end)) != null) return true
+                }
+            }
+            return false
+        }
+
+        private fun hasCleanSyllablePath(text: String): Boolean {
+            val paths = buildLattice(text, trie)
+            return paths[text.length].any { path ->
+                path.parts.size >= 2 && path.parts.all { it.length >= 2 }
+            }
         }
 
         fun doubleLeadRepairs(letters: String, minFreq: Int): List<Scored> {
