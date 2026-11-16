@@ -19,6 +19,7 @@ import java.io.File
 
 const val MAX_RECENT_CLIPS = 12
 private const val MAX_CLIP_CHARS = 4096
+private const val CLIP_GRAPHEME_WINDOW = 256
 private val GRAPHEME_CLUSTER = Regex("\\X")
 
 val Context.settingsStore by preferencesDataStore(name = "keyboard")
@@ -42,8 +43,8 @@ fun mergeRecentClips(
     existing: List<String>,
     limit: Int = MAX_RECENT_CLIPS,
 ): List<String> {
-    val normalized = current?.takeIf { it.isNotBlank() }?.take(MAX_CLIP_CHARS)
-    val cleaned = existing.mapNotNull { item -> item.takeIf { it.isNotBlank() }?.take(MAX_CLIP_CHARS) }
+    val normalized = current?.let(::normalizeRecentClip)
+    val cleaned = existing.mapNotNull(::normalizeRecentClip)
     return (listOfNotNull(normalized) + cleaned).distinct().take(limit.coerceAtLeast(0))
 }
 
@@ -55,13 +56,65 @@ fun mergeRecentClipLists(
     if (limit <= 0) return emptyList()
     val out = ArrayList<String>(limit.coerceAtLeast(0))
     for (item in primary.asSequence() + secondary.asSequence()) {
-        val normalized = item.takeIf { it.isNotBlank() }?.take(MAX_CLIP_CHARS) ?: continue
+        val normalized = normalizeRecentClip(item) ?: continue
         if (normalized !in out) {
             out += normalized
             if (out.size >= limit) break
         }
     }
     return out
+}
+
+fun clipboardItemsForDisplay(
+    current: String?,
+    history: List<String>,
+    limit: Int = MAX_RECENT_CLIPS,
+): List<String> {
+    if (limit <= 0) return emptyList()
+
+    val boundedHistory = mergeRecentClipLists(emptyList(), history, limit)
+    val fullCurrent = current?.takeIf { it.isNotBlank() } ?: return boundedHistory
+    if (boundedHistory.isEmpty()) return listOf(fullCurrent)
+
+    val storedCurrent = truncateRecentClip(fullCurrent, MAX_CLIP_CHARS)
+    val currentIndex = boundedHistory.indexOf(storedCurrent)
+    if (currentIndex < 0) return boundedHistory
+    return boundedHistory.toMutableList().also { it[currentIndex] = fullCurrent }
+}
+
+private fun normalizeRecentClip(text: String): String? {
+    if (text.isBlank()) return null
+    return truncateRecentClip(text, MAX_CLIP_CHARS).takeIf { it.isNotBlank() }
+}
+
+private fun truncateRecentClip(text: String, maxChars: Int): String {
+    if (maxChars <= 0) return ""
+    if (text.length <= maxChars) {
+        return if (text.lastOrNull()?.isHighSurrogate() == true) text.dropLast(1) else text
+    }
+
+    var end = maxChars
+    if (text[end - 1].isHighSurrogate() && text[end].isLowSurrogate()) end--
+    return text.substring(0, graphemeSafeEnd(text, end))
+}
+
+private fun graphemeSafeEnd(text: String, target: Int): Int {
+    var windowStart = (target - CLIP_GRAPHEME_WINDOW).coerceAtLeast(0)
+    var windowEnd = (target + CLIP_GRAPHEME_WINDOW).coerceAtMost(text.length)
+    if (windowStart > 0 && text[windowStart - 1].isHighSurrogate() && text[windowStart].isLowSurrogate()) {
+        windowStart--
+    }
+    if (windowEnd < text.length && text[windowEnd - 1].isHighSurrogate() && text[windowEnd].isLowSurrogate()) {
+        windowEnd++
+    }
+
+    for (match in GRAPHEME_CLUSTER.findAll(text.substring(windowStart, windowEnd))) {
+        val start = windowStart + match.range.first
+        val end = windowStart + match.range.last + 1
+        if (target > start && target < end) return start
+        if (end >= target) break
+    }
+    return target
 }
 
 fun clipboardPreviewText(text: String, maxCharacters: Int = 5): String {
@@ -114,7 +167,8 @@ fun Preferences.themeMode(): ThemeMode =
 class Secrets(context: Context) {
     private val app = context.applicationContext
     private val plain = app.getSharedPreferences("keyboard_secret_plain", Context.MODE_PRIVATE)
-    private val encrypted = runCatching { openEncrypted(app) }.getOrNull()
+    private val encryptedResult = runCatching { openEncrypted(app) }
+    private val encrypted = encryptedResult.getOrNull()
 
     fun get(): String? = read(KEY)
 
@@ -129,14 +183,67 @@ class Secrets(context: Context) {
     }
 
     private fun read(name: String): String? {
-        val fromEncrypted = encrypted?.getString(name, null)?.trim().orEmpty()
-        if (fromEncrypted.isNotEmpty()) return fromEncrypted
-        return plain.getString(name, null)?.trim()?.takeIf { it.isNotEmpty() }
+        val encryptedPreferences = encrypted ?: return readPlain(name)
+        val fromEncrypted = runCatching {
+            encryptedPreferences.getString(name, null)?.trim()?.takeIf { it.isNotEmpty() }
+        }.getOrNull()
+        if (fromEncrypted != null) {
+            runCatching { removePlainIfPresent(name) }
+            return fromEncrypted
+        }
+
+        val fromPlain = readPlain(name) ?: return null
+        runCatching {
+            putEncrypted(encryptedPreferences, name, fromPlain)
+            removePlainIfPresent(name)
+        }
+        return fromPlain
     }
 
     private fun write(name: String, value: String) {
-        plain.edit().putString(name, value).commit()
-        encrypted?.edit()?.putString(name, value)?.commit()
+        val encryptedPreferences = encrypted ?: throw IllegalStateException(
+            "Encrypted secret storage is unavailable",
+            encryptedResult.exceptionOrNull(),
+        )
+        if (value.isEmpty()) {
+            removePlainIfPresent(name)
+            commitOrThrow(
+                encryptedPreferences.edit().remove(name),
+                "Unable to clear the encrypted secret",
+            )
+            return
+        }
+
+        putEncrypted(encryptedPreferences, name, value)
+        removePlainIfPresent(name)
+    }
+
+    private fun readPlain(name: String): String? = runCatching {
+        plain.getString(name, null)?.trim()?.takeIf { it.isNotEmpty() }
+    }.getOrNull()
+
+    private fun putEncrypted(preferences: android.content.SharedPreferences, name: String, value: String) {
+        commitOrThrow(
+            preferences.edit().putString(name, value),
+            "Unable to write the encrypted secret",
+        )
+    }
+
+    private fun removePlainIfPresent(name: String) {
+        if (runCatching { !plain.contains(name) }.getOrDefault(false)) return
+        commitOrThrow(
+            plain.edit().remove(name),
+            "Unable to remove the legacy plaintext secret",
+        )
+    }
+
+    private fun commitOrThrow(editor: android.content.SharedPreferences.Editor, message: String) {
+        val committed = try {
+            editor.commit()
+        } catch (error: Exception) {
+            throw IllegalStateException(message, error)
+        }
+        if (!committed) throw IllegalStateException(message)
     }
 
     private fun openEncrypted(context: Context) = EncryptedSharedPreferences.create(

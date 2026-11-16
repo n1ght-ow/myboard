@@ -29,6 +29,7 @@ data class EngineState(
     val touchHints: List<String> = emptyList(),
     val touchSamples: List<TouchSample?> = emptyList(),
     val uriOrEmail: Boolean = false,
+    val literalContext: Boolean = false,
 )
 
 sealed interface Cmd {
@@ -112,7 +113,20 @@ class InputEngine(private val latin: LatinDecoder) {
             val shift = if (act.force == null && state.shift == ShiftState.Once) ShiftState.Off else state.shift
             return EngineStep(state.copy(shift = shift), listOf(Cmd.Commit(text)))
         }
+        if (act.force == Choice.Symbol && act.symbol == "@") return commitAddressSeparator(state)
+        if (state.literalContext) return literalLetter(state, base, act)
         return if (state.language == Language.Chinese) chineseLetter(state, base, act) else englishLetter(state, base, act)
+    }
+
+    private fun literalLetter(state: EngineState, base: Char, act: EngineAct.Letter): EngineStep {
+        val text = when (act.force) {
+            Choice.Symbol -> act.symbol
+            Choice.Upper -> base.uppercaseChar().toString()
+            Choice.Lower -> base.toString()
+            null -> if (state.shift == ShiftState.Off) base.toString() else base.uppercaseChar().toString()
+        }
+        val shift = if (act.force == null && state.shift == ShiftState.Once) ShiftState.Off else state.shift
+        return commitLiteral(state, normalizeLiteralAddressText(text), shift)
     }
 
     private fun chineseLetter(state: EngineState, base: Char, act: EngineAct.Letter): EngineStep {
@@ -197,6 +211,8 @@ class InputEngine(private val latin: LatinDecoder) {
 
     private fun direct(state: EngineState, text: String): EngineStep {
         if (state.password) return EngineStep(state, listOf(Cmd.Commit(text)))
+        if (text == "@") return commitAddressSeparator(state)
+        if (state.literalContext) return commitLiteral(state, normalizeLiteralAddressText(text))
         if (state.language == Language.English) {
             return commitEnglishSymbolOrPunctuation(state, text)
         }
@@ -216,6 +232,46 @@ class InputEngine(private val latin: LatinDecoder) {
             ),
             pending.second + Cmd.Commit(text),
         )
+    }
+
+    private fun commitAddressSeparator(state: EngineState): EngineStep {
+        val shift = if (state.language == Language.English && state.shift != ShiftState.Caps) ShiftState.Off else state.shift
+        return commitLiteral(state, "@", shift)
+    }
+
+    private fun normalizeLiteralAddressText(text: String): String = if (text == "。") "." else text
+
+    private fun literalFinishedState(state: EngineState, shift: ShiftState): EngineState {
+        return state.copy(
+            raw = "",
+            preedit = "",
+            candidates = emptyList(),
+            associating = false,
+            shift = shift,
+            partialText = "",
+            partialSyllables = "",
+            autoSpace = false,
+            lastEnglishWord = null,
+            undoAutocorrect = null,
+            verbatimFirst = false,
+            lastChineseContext = "",
+            touchHints = emptyList(),
+            touchSamples = emptyList(),
+        )
+    }
+
+    private fun commitLiteral(
+        state: EngineState,
+        text: String,
+        shift: ShiftState = state.shift,
+        following: List<Cmd> = emptyList(),
+    ): EngineStep {
+        val cmds = mutableListOf<Cmd>()
+        // partialText is already on screen; only raw still needs literal confirmation.
+        if (state.raw.isNotEmpty()) cmds += Cmd.Commit(state.raw)
+        if (text.isNotEmpty()) cmds += Cmd.Commit(text)
+        cmds += following
+        return EngineStep(literalFinishedState(state, shift), cmds)
     }
 
     private fun commitEnglishSymbolOrPunctuation(state: EngineState, text: String): EngineStep {
@@ -278,6 +334,14 @@ class InputEngine(private val latin: LatinDecoder) {
 
     private fun space(state: EngineState): EngineStep {
         if (state.password) return EngineStep(state, listOf(Cmd.Commit(" ")))
+        if (state.literalContext) {
+            val shift = if (state.language == Language.English && state.shift != ShiftState.Caps) {
+                ShiftState.Off
+            } else {
+                state.shift
+            }
+            return commitLiteral(state, " ", shift)
+        }
         if (state.language == Language.Chinese) {
             if (state.raw.isNotEmpty()) {
                 val chosen = state.candidates.firstOrNull()
@@ -388,6 +452,7 @@ class InputEngine(private val latin: LatinDecoder) {
     }
 
     private fun backspace(state: EngineState): EngineStep {
+        if (state.literalContext) return backspaceLiteral(state)
         if (state.raw.isEmpty()) {
             // Undo English Spacebar autocorrect on immediate Backspace
             val undo = state.undoAutocorrect
@@ -484,6 +549,20 @@ class InputEngine(private val latin: LatinDecoder) {
         )
     }
 
+    private fun backspaceLiteral(state: EngineState): EngineStep {
+        if (state.raw.isEmpty()) {
+            return commitLiteral(state, "", state.shift, listOf(Cmd.DeleteOne))
+        }
+        val raw = state.raw.dropLast(1)
+        if (raw.isEmpty()) {
+            return EngineStep(literalFinishedState(state, state.shift), listOf(Cmd.ClearCompose))
+        }
+        return EngineStep(
+            literalFinishedState(state, state.shift).copy(raw = raw, preedit = raw),
+            listOf(Cmd.Compose(raw)),
+        )
+    }
+
     private fun backspaceWord(state: EngineState): EngineStep {
         if (state.raw.isNotEmpty()) {
             return EngineStep(
@@ -522,6 +601,9 @@ class InputEngine(private val latin: LatinDecoder) {
 
     private fun moveCursor(state: EngineState, delta: Int): EngineStep {
         if (delta == 0) return EngineStep(state)
+        if (state.literalContext) {
+            return commitLiteral(state, "", state.shift, listOf(Cmd.MoveCursor(delta)))
+        }
         if (state.raw.isNotEmpty()) return EngineStep(state)
         return EngineStep(
             state.copy(
@@ -548,6 +630,7 @@ class InputEngine(private val latin: LatinDecoder) {
                 EngineStep(state, listOf(Cmd.EditorAction(kind)))
             }
         }
+        if (state.literalContext) return literalEnter(state, kind)
         if (state.language == Language.Chinese && state.raw.any { it in 'a'..'z' || it in 'A'..'Z' }) {
             val spelling = buildString(state.raw.length) {
                 for (ch in state.raw) if (ch in 'a'..'z' || ch in 'A'..'Z') append(ch)
@@ -599,6 +682,17 @@ class InputEngine(private val latin: LatinDecoder) {
             ),
             cmds,
         )
+    }
+
+    private fun literalEnter(state: EngineState, kind: EnterKind): EngineStep {
+        val shift = when {
+            state.language == Language.English && state.shift == ShiftState.Caps -> ShiftState.Caps
+            state.language == Language.English && kind == EnterKind.Newline -> ShiftState.Once
+            state.language == Language.English -> ShiftState.Off
+            else -> state.shift
+        }
+        val action = if (kind == EnterKind.Newline) Cmd.Commit("\n") else Cmd.EditorAction(kind)
+        return commitLiteral(state, "", shift, listOf(action))
     }
 
     private fun switchLanguage(state: EngineState): EngineStep {

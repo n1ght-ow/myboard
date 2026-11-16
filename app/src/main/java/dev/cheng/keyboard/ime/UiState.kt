@@ -5,6 +5,7 @@ import dev.cheng.keyboard.ai.PolishTone
 import dev.cheng.keyboard.engine.EngineState
 import dev.cheng.keyboard.ime.gesture.PopupPreview
 import dev.cheng.keyboard.ime.gesture.TapPreview
+import dev.cheng.keyboard.ime.assist.TypingSuggestion
 import dev.cheng.keyboard.model.EnterKind
 import dev.cheng.keyboard.model.ThemeMode
 
@@ -19,6 +20,7 @@ sealed interface Overlay {
 
 data class UiState(
     val engine: EngineState = EngineState(),
+    val typingSuggestions: List<TypingSuggestion> = emptyList(),
     val theme: ThemeMode = ThemeMode.System,
     val heightScale: Float = 1f,
     val haptic: Boolean = true,

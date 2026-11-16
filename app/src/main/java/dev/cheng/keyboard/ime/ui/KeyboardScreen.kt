@@ -52,6 +52,13 @@ import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -69,6 +76,8 @@ import dev.cheng.keyboard.ime.KeyboardController
 import dev.cheng.keyboard.ime.Overlay
 import dev.cheng.keyboard.ime.ResultKind
 import dev.cheng.keyboard.ime.UiState
+import dev.cheng.keyboard.ime.assist.TypingAssistKind
+import dev.cheng.keyboard.ime.assist.TypingSuggestion
 import dev.cheng.keyboard.ime.gesture.PopupPreview
 import dev.cheng.keyboard.ime.gesture.TapPreview
 import dev.cheng.keyboard.ime.gesture.KeyPointerChange
@@ -177,22 +186,20 @@ fun KeyboardRoot(controller: KeyboardController) {
     ) {
         Box(Modifier.fillMaxWidth().height(0.6.dp).background(palette.divider))
         Toolbar(state, palette, controller)
-        if (state.menu) MenuPanel(state, palette, controller)
-        when (val overlay = state.overlay) {
-            Overlay.None -> KeyArea(state, palette, controller, keyHeight)
-            Overlay.Ask -> {
-                AskPanel(state, palette, controller)
-                KeyArea(state, palette, controller, keyHeight)
-            }
-            Overlay.NeedKey -> {
-                NeedKeyPanel(state, palette, controller)
-                KeyArea(state, palette, controller, keyHeight)
-            }
-            is Overlay.Result -> {
-                ResultPanel(overlay.kind, state, palette, controller)
-                KeyArea(state, palette, controller, keyHeight)
+        if (state.menu || state.overlay != Overlay.None) {
+            val panelScroll = rememberScrollState()
+            LaunchedEffect(state.menu, state.overlay) { panelScroll.scrollTo(0) }
+            Column(Modifier.weight(1f, fill = false).verticalScroll(panelScroll)) {
+                if (state.menu) MenuPanel(state, palette, controller)
+                when (val overlay = state.overlay) {
+                    Overlay.None -> Unit
+                    Overlay.Ask -> AskPanel(state, palette, controller)
+                    Overlay.NeedKey -> NeedKeyPanel(state, palette, controller)
+                    is Overlay.Result -> ResultPanel(overlay.kind, state, palette, controller)
+                }
             }
         }
+        KeyArea(state, palette, controller, keyHeight)
     }
 }
 
@@ -225,11 +232,18 @@ private fun keyHeight(widthDp: Int, smallestDp: Int, orientation: Int, scale: Fl
 private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardController) {
     val composing = state.engine.raw.isNotEmpty() || state.engine.candidates.isNotEmpty()
     if (!composing) {
-        FunctionRow(state, palette, controller)
+        if (state.typingSuggestions.isEmpty()) {
+            FunctionRow(state, palette, controller)
+        } else {
+            TypingSuggestionFunctionRow(state.typingSuggestions, palette, controller)
+        }
         return
     }
     val preedit = state.engine.preedit.ifBlank { state.engine.raw }
-    Column(Modifier.fillMaxWidth().height(ToolbarHeight).padding(horizontal = 8.dp)) {
+    val toolbarHeight = with(LocalDensity.current) {
+        maxOf(ToolbarHeight, 13.sp.toDp() + 20.sp.toDp() + 10.dp)
+    }
+    Column(Modifier.fillMaxWidth().height(toolbarHeight).padding(horizontal = 8.dp)) {
         if (preedit.isNotEmpty()) {
             Text(
                 preedit,
@@ -242,7 +256,16 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
             )
         }
         val candidateScroll = rememberScrollState()
-        LaunchedEffect(state.engine.raw, state.engine.candidates.firstOrNull()?.text) {
+        val suggestionScrollKey = if (state.typingSuggestions.isEmpty()) {
+            null
+        } else {
+            typingSuggestionScrollKey(state.engine.raw, state.engine.preedit, state.typingSuggestions)
+        }
+        LaunchedEffect(
+            state.engine.raw,
+            state.engine.candidates.firstOrNull()?.text,
+            suggestionScrollKey,
+        ) {
             candidateScroll.scrollTo(0)
         }
         Row(
@@ -254,7 +277,37 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
+                val primaryCandidateFirst =
+                    state.engine.candidates.isNotEmpty() &&
+                        state.typingSuggestions.any { it.kind == TypingAssistKind.DateTime }
+                if (primaryCandidateFirst) {
+                    val candidate = state.engine.candidates.first()
+                    val shown = displayCandidateText(state, candidate)
+                    val primary = !state.engine.associating
+                    val pillShape = RoundedCornerShape(10.dp)
+                    Text(
+                        shown,
+                        color = if (primary) palette.accent else palette.label,
+                        fontSize = 16.sp,
+                        lineHeight = 20.sp,
+                        fontWeight = if (primary) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .clip(pillShape)
+                            .background(if (primary) palette.accentSoft else Color.Transparent)
+                            .candidateTap(
+                                onClick = { controller.pick(0) },
+                                onLongClick = { controller.forgetCandidate(0) },
+                            )
+                            .padding(horizontal = 10.dp, vertical = 3.dp),
+                    )
+                }
+                state.typingSuggestions.forEach { suggestion ->
+                    TypingSuggestionChip(suggestion, palette, controller)
+                }
+                val candidateOffset = if (primaryCandidateFirst) 1 else 0
                 state.engine.candidates.forEachIndexed { index, candidate ->
+                    if (index < candidateOffset) return@forEachIndexed
                     val shown = displayCandidateText(state, candidate)
                     val primary = index == 0 && !state.engine.associating
                     val pillShape = RoundedCornerShape(10.dp)
@@ -262,6 +315,7 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                         shown,
                         color = if (primary) palette.accent else palette.label,
                         fontSize = 16.sp,
+                        lineHeight = 20.sp,
                         fontWeight = if (primary) FontWeight.SemiBold else FontWeight.Normal,
                         maxLines = 1,
                         modifier = Modifier
@@ -275,23 +329,148 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                     )
                 }
             }
-            Box(
-                Modifier
-                    .padding(start = 4.dp)
-                    .size(width = 34.dp, height = 30.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(if (state.expanded) palette.accentSoft else palette.funcKey.copy(alpha = 0.7f))
-                    .clickable(onClick = controller::toggleExpanded)
-                    .padding(horizontal = 6.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                DismissIcon(
-                    if (state.expanded) palette.accent else palette.icon,
-                    Modifier.size(16.dp).rotate(if (state.expanded) 180f else 0f),
-                )
+            if (state.engine.candidates.isNotEmpty()) {
+                Box(
+                    Modifier
+                        .padding(start = 4.dp)
+                        .size(width = 34.dp, height = 30.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (state.expanded) palette.accentSoft else palette.funcKey.copy(alpha = 0.7f))
+                        .semantics {
+                            contentDescription = if (state.expanded) "收起候选词" else "展开候选词"
+                            role = Role.Button
+                        }
+                        .clickable(onClick = controller::toggleExpanded)
+                        .padding(horizontal = 6.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    DismissIcon(
+                        if (state.expanded) palette.accent else palette.icon,
+                        Modifier.size(16.dp).rotate(if (state.expanded) 180f else 0f),
+                    )
+                }
             }
         }
     }
+}
+
+@Composable
+private fun TypingSuggestionFunctionRow(
+    suggestions: List<TypingSuggestion>,
+    palette: Palette,
+    controller: KeyboardController,
+) {
+    val suggestionScroll = rememberScrollState()
+    LaunchedEffect(typingSuggestionScrollKey("", "", suggestions)) {
+        suggestionScroll.scrollTo(0)
+    }
+    Row(
+        Modifier.fillMaxWidth().height(ToolbarHeight).padding(horizontal = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            Modifier
+                .weight(1f)
+                .horizontalScroll(suggestionScroll)
+                .padding(horizontal = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            suggestions.forEach { suggestion ->
+                TypingSuggestionChip(suggestion, palette, controller)
+            }
+        }
+        ToolButton(palette, label = "收起键盘", onClick = controller::dismiss) {
+            HideKeyboardIcon(palette.subtle, Modifier.size(20.dp))
+        }
+    }
+}
+
+@Composable
+private fun TypingSuggestionChip(
+    suggestion: TypingSuggestion,
+    palette: Palette,
+    controller: KeyboardController,
+) {
+    val shape = RoundedCornerShape(11.dp)
+    val shown = when (suggestion.kind) {
+        TypingAssistKind.DateTime -> suggestion.replacement
+        else -> suggestion.label.ifBlank { suggestion.replacement }
+    }
+    val description = typingSuggestionDescription(suggestion, shown)
+    Row(
+        Modifier
+            .heightIn(min = 30.dp, max = 42.dp)
+            .clip(shape)
+            .background(palette.funcKey.copy(alpha = 0.82f))
+            .border(0.7.dp, palette.divider, shape)
+            .semantics {
+                contentDescription = description
+                role = Role.Button
+            }
+            .clickable { controller.pickTypingSuggestion(suggestion) }
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Text(
+            typingSuggestionKindLabel(suggestion),
+            color = palette.accent,
+            fontSize = 10.sp,
+            lineHeight = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+        )
+        Text(
+            shown,
+            color = palette.label,
+            fontSize = 13.5.sp,
+            lineHeight = 18.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+        )
+    }
+}
+
+private data class TypingSuggestionScrollKey(
+    val raw: String,
+    val preedit: String,
+    val suggestions: List<TypingSuggestion>,
+)
+
+private fun typingSuggestionScrollKey(
+    raw: String,
+    preedit: String,
+    suggestions: List<TypingSuggestion>,
+): TypingSuggestionScrollKey = TypingSuggestionScrollKey(
+    raw = raw,
+    preedit = preedit,
+    suggestions = suggestions,
+)
+
+private fun typingSuggestionKindLabel(suggestion: TypingSuggestion): String = when (suggestion.kind) {
+    TypingAssistKind.Email -> "邮箱"
+    TypingAssistKind.Url -> "网址"
+    TypingAssistKind.DateTime -> when {
+        suggestion.replacement.startsWith("星期") -> "今日"
+        ':' in suggestion.replacement -> "时间"
+        else -> "日期"
+    }
+    TypingAssistKind.Calculator -> "计算"
+}
+
+private fun typingSuggestionDescription(suggestion: TypingSuggestion, shown: String): String {
+    val action = when (suggestion.kind) {
+        TypingAssistKind.Email -> "邮箱补全"
+        TypingAssistKind.Url -> "网址补全"
+        TypingAssistKind.DateTime -> when {
+            suggestion.replacement.startsWith("星期") -> "插入星期"
+            ':' in suggestion.replacement -> "插入时间"
+            else -> "插入日期"
+        }
+        TypingAssistKind.Calculator -> "插入计算结果"
+    }
+    return "$action $shown"
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -324,6 +503,7 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
     ) {
         ToolButton(
             palette,
+            label = "剪贴板",
             active = state.menu,
             showActiveBackground = false,
             onClick = controller::toggleMenu,
@@ -402,6 +582,7 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
                             .padding(start = 2.dp)
                             .size(22.dp)
                             .clip(CircleShape)
+                            .semantics { contentDescription = "忽略剪贴板建议" }
                             .clickable(onClick = controller::dismissFreshClip),
                         contentAlignment = Alignment.Center,
                     ) {
@@ -419,11 +600,12 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
             val askActive = state.overlay == Overlay.Ask
             val translateActive = (state.overlay as? Overlay.Result)?.kind == ResultKind.Translate
             val polishActive = (state.overlay as? Overlay.Result)?.kind == ResultKind.Polish
-            ToolButton(palette, enabled = aiEnabled, active = askActive, compact = true, onClick = controller::ask) {
+            ToolButton(palette, label = "AI 询问", enabled = aiEnabled, active = askActive, compact = true, onClick = controller::ask) {
                 AskIcon(if (askActive) palette.accent else palette.icon, Modifier.size(18.dp))
             }
             ToolButton(
                 palette,
+                label = "翻译",
                 enabled = aiEnabled,
                 active = translateActive,
                 compact = true,
@@ -431,11 +613,11 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
             ) {
                 TranslateIcon(if (translateActive) palette.accent else palette.icon, Modifier.size(18.dp))
             }
-            ToolButton(palette, enabled = aiEnabled, active = polishActive, compact = true, onClick = controller::polish) {
+            ToolButton(palette, label = "润色", enabled = aiEnabled, active = polishActive, compact = true, onClick = controller::polish) {
                 PolishIcon(if (polishActive) palette.accent else palette.icon, Modifier.size(18.dp))
             }
         }
-        ToolButton(palette, onClick = controller::dismiss) {
+        ToolButton(palette, label = "收起键盘", onClick = controller::dismiss) {
             HideKeyboardIcon(palette.subtle, Modifier.size(20.dp))
         }
     }
@@ -444,6 +626,7 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
 @Composable
 private fun ToolButton(
     palette: Palette,
+    label: String,
     enabled: Boolean = true,
     active: Boolean = false,
     showActiveBackground: Boolean = true,
@@ -457,6 +640,10 @@ private fun ToolButton(
             .widthIn(min = if (compact) 36.dp else 38.dp)
             .clip(RoundedCornerShape(10.dp))
             .background(if (active && showActiveBackground) palette.accentSoft else Color.Transparent)
+            .semantics {
+                contentDescription = label
+                role = Role.Button
+            }
             .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 4.dp),
         contentAlignment = Alignment.Center,
@@ -476,7 +663,7 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
         SymbolPad(state, palette, controller, keyHeight)
         return
     }
-    if (state.expanded) {
+    if (state.expanded && state.engine.candidates.isNotEmpty()) {
         CandidateGrid(state, palette, controller, keyHeight)
         return
     }
@@ -569,7 +756,11 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
                 }
             }
             placement.keys.forEach { key ->
-                KeyCap(key, state, palette, keyHeight)
+                KeyCap(key, state, palette, keyHeight) {
+                    val time = SystemClock.uptimeMillis()
+                    controller.onDown(key.model, key.x + key.w / 2, key.y + key.h / 2, time)
+                    controller.onUp(time + 1)
+                }
             }
             val tapPreview = state.tapPreview
             if (tapPreview != null && state.popup == null && !state.engine.password) {
@@ -629,7 +820,7 @@ private fun LetterBottomPairBackground(
 }
 
 @Composable
-private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: Dp) {
+private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: Dp, onActivate: () -> Unit) {
     val density = LocalDensity.current
     val pressed = state.pressedId == key.model.id
     val separating = key.model.kind == KeyKind.Shift &&
@@ -678,6 +869,26 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
     val showUpper = state.engine.language == Language.English &&
         state.engine.shift != ShiftState.Off &&
         key.model.kind == KeyKind.Letter
+    val accessibleLabel = when (key.model.kind) {
+        KeyKind.Letter -> if (showUpper) key.model.label.uppercase() else key.model.label
+        KeyKind.Shift -> if (separating) "分词" else "切换大小写"
+        KeyKind.Backspace -> "删除"
+        KeyKind.Enter -> when {
+            state.overlay == Overlay.Ask -> "发送"
+            state.overlay == Overlay.NeedKey -> "完成"
+            else -> when (state.enter) {
+                EnterKind.Newline -> "换行"
+                EnterKind.Go -> "前往"
+                EnterKind.Search -> "搜索"
+                EnterKind.Send -> "发送"
+                EnterKind.Next -> "下一项"
+                EnterKind.Done -> "完成"
+            }
+        }
+        KeyKind.Space -> "空格"
+        KeyKind.Language -> "切换中英文"
+        else -> key.model.label
+    }
     val corner = RoundedCornerShape(
         when {
             isLettersBottomEnter -> 10.dp
@@ -726,6 +937,20 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
             .offset { IntOffset(key.x.toInt(), key.y.toInt()) }
             .width(with(density) { key.w.toDp() })
             .height(with(density) { key.h.toDp() })
+            .clearAndSetSemantics {
+                contentDescription = accessibleLabel
+                role = Role.Button
+                if (key.model.kind == KeyKind.Language) {
+                    stateDescription = if (state.engine.language == Language.Chinese) "中文" else "英文"
+                } else if (key.model.kind == KeyKind.Shift && !separating) {
+                    stateDescription = when (state.engine.shift) {
+                        ShiftState.Off -> "小写"
+                        ShiftState.Once -> "下次大写"
+                        ShiftState.Caps -> "大写锁定"
+                    }
+                }
+                onClick { onActivate(); true }
+            }
             .then(surfaceModifier),
         contentAlignment = Alignment.Center,
     ) {
@@ -1331,7 +1556,7 @@ private fun NeedKeyPanel(state: UiState, palette: Palette, controller: KeyboardC
                 .padding(horizontal = 11.dp, vertical = 9.dp),
         ) {
             Text(
-                state.keyDraft.ifBlank { "用下方键盘输入或粘贴 sk-…" },
+                if (state.keyDraft.isBlank()) "用下方键盘输入或粘贴 sk-…" else "•".repeat(state.keyDraft.length),
                 color = if (state.keyDraft.isBlank()) palette.subtle else palette.label,
                 fontSize = 14.sp,
                 maxLines = 2,

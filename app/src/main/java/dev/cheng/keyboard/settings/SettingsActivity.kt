@@ -36,6 +36,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
@@ -53,6 +54,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,9 +65,12 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -104,10 +109,12 @@ import dev.cheng.keyboard.update.markDownloaded
 import dev.cheng.keyboard.update.openInstallPermission
 import dev.cheng.keyboard.update.prepareInstall
 import dev.cheng.keyboard.update.updateApk
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
 
 private data class SettingsColors(
@@ -167,16 +174,33 @@ private val LightSettingsColors = SettingsColors(
 private data class ImeStatus(val enabled: Boolean, val selected: Boolean)
 
 private fun queryImeStatus(context: Context): ImeStatus {
+    val manager = context.getSystemService(InputMethodManager::class.java)
     val enabled = runCatching {
-        val manager = context.getSystemService(InputMethodManager::class.java)
         manager?.enabledInputMethodList?.any { it.packageName == context.packageName } == true
     }.getOrDefault(false)
     val selected = runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            manager?.currentInputMethodInfo?.let { return@runCatching it.packageName == context.packageName }
+        }
         val current = Settings.Secure.getString(context.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
         current?.startsWith("${context.packageName}/") == true
     }.getOrDefault(false)
     return ImeStatus(enabled = enabled, selected = selected)
 }
+
+private fun Context.tryOpenInputMethodSettings(): Boolean = runCatching {
+    startActivity(
+        Intent(Settings.ACTION_INPUT_METHOD_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+    )
+}.isSuccess
+
+private fun Context.tryShowInputMethodPicker(): Boolean = runCatching {
+    val manager = getSystemService(InputMethodManager::class.java) ?: return@runCatching false
+    manager.showInputMethodPicker()
+    true
+}.getOrDefault(false)
+
+private fun Secrets.readApiKeySafely(): String = runCatching { get().orEmpty() }.getOrDefault("")
 
 class SettingsActivity : ComponentActivity() {
     private val focusTick = mutableIntStateOf(0)
@@ -236,7 +260,7 @@ private fun SettingsRoot(refreshTick: Int) {
     }
 
     val secrets = remember { Secrets(context) }
-    val key = remember { mutableStateOf(secrets.get().orEmpty()) }
+    val key = remember { mutableStateOf(secrets.readApiKeySafely()) }
     val imeStatus = remember(refreshTick) { queryImeStatus(context) }
     val version = remember { installedVersionName(context) }
     val scope = rememberCoroutineScope()
@@ -353,6 +377,21 @@ private fun BrandHeader(version: String, imeStatus: ImeStatus, colors: SettingsC
 
 @Composable
 private fun SetupCard(context: Context, imeStatus: ImeStatus, colors: SettingsColors) {
+    var actionError by remember { mutableStateOf<String?>(null) }
+    val openSettings: () -> Unit = {
+        actionError = if (context.tryOpenInputMethodSettings()) {
+            null
+        } else {
+            "无法打开系统输入法设置，请从系统设置中手动进入。"
+        }
+    }
+    val chooseKeyboard: () -> Unit = {
+        actionError = if (context.tryShowInputMethodPicker()) {
+            null
+        } else {
+            "无法打开输入法选择器，请从系统设置中切换当前键盘。"
+        }
+    }
     SettingsCard(colors) {
         CardHeader(
             title = "启用与切换",
@@ -374,11 +413,7 @@ private fun SetupCard(context: Context, imeStatus: ImeStatus, colors: SettingsCo
                 todoLabel = "去开启",
                 colors = colors,
                 modifier = Modifier.weight(1f),
-                onClick = {
-                    context.startActivity(
-                        Intent(Settings.ACTION_INPUT_METHOD_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                    )
-                },
+                onClick = openSettings,
             )
             StepStatusPill(
                 step = "2",
@@ -388,9 +423,7 @@ private fun SetupCard(context: Context, imeStatus: ImeStatus, colors: SettingsCo
                 todoLabel = "去选择",
                 colors = colors,
                 modifier = Modifier.weight(1f),
-                onClick = {
-                    context.getSystemService(InputMethodManager::class.java)?.showInputMethodPicker()
-                },
+                onClick = chooseKeyboard,
             )
         }
         Spacer(Modifier.height(12.dp))
@@ -403,19 +436,18 @@ private fun SetupCard(context: Context, imeStatus: ImeStatus, colors: SettingsCo
                 primary = !imeStatus.enabled,
                 colors = colors,
                 modifier = Modifier.weight(1f),
-            ) {
-                context.startActivity(
-                    Intent(Settings.ACTION_INPUT_METHOD_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                )
-            }
+                onClick = openSettings,
+            )
             ActionButton(
                 label = "选择当前输入法",
                 primary = imeStatus.enabled && !imeStatus.selected,
                 colors = colors,
                 modifier = Modifier.weight(1f),
-            ) {
-                context.getSystemService(InputMethodManager::class.java)?.showInputMethodPicker()
-            }
+                onClick = chooseKeyboard,
+            )
+        }
+        actionError?.let {
+            StatusNote(it, colors.danger)
         }
     }
 }
@@ -468,7 +500,16 @@ private fun StepStatusPill(
 
 @Composable
 private fun TryFieldCard(colors: SettingsColors) {
-    val scratch = remember { mutableStateOf("") }
+    var scratch by rememberSaveable(stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue())
+    }
+    val view = LocalView.current
+    var clearGeneration by remember { mutableIntStateOf(0) }
+    LaunchedEffect(clearGeneration) {
+        if (clearGeneration > 0) {
+            view.context.getSystemService(InputMethodManager::class.java)?.restartInput(view)
+        }
+    }
     SettingsCard(colors) {
         Row(
             Modifier.fillMaxWidth(),
@@ -483,14 +524,18 @@ private fun TryFieldCard(colors: SettingsColors) {
                     modifier = Modifier.padding(top = 2.dp),
                 )
             }
-            if (scratch.value.isNotEmpty()) {
-                SmallChipButton("清空", colors) { scratch.value = "" }
+            if (scratch.text.isNotEmpty()) {
+                SmallChipButton("清空", colors) {
+                    scratch = TextFieldValue(text = "", selection = TextRange.Zero)
+                    clearGeneration++
+                }
             }
         }
         val fieldShape = RoundedCornerShape(13.dp)
         BasicTextField(
-            value = scratch.value,
-            onValueChange = { scratch.value = it },
+            value = scratch,
+            onValueChange = { scratch = it },
+            maxLines = 8,
             textStyle = TextStyle(color = colors.text, fontSize = 16.sp, lineHeight = 23.sp),
             cursorBrush = SolidColor(colors.accent),
             modifier = Modifier
@@ -503,7 +548,7 @@ private fun TryFieldCard(colors: SettingsColors) {
                 .padding(14.dp),
             decorationBox = { inner ->
                 Box(Modifier.fillMaxWidth()) {
-                    if (scratch.value.isEmpty()) {
+                    if (scratch.text.isEmpty()) {
                         Text("点这里唤起键盘体验输入…", color = colors.subtle, fontSize = 15.5.sp)
                     }
                     inner()
@@ -522,6 +567,7 @@ private fun AppearanceAndInputSection(
 ) {
     if (current == null) return
     var calibResetNotice by remember { mutableStateOf(false) }
+    var calibResetError by remember { mutableStateOf(false) }
     SettingsCard(colors) {
         CardHeader(
             title = "外观与手感",
@@ -606,26 +652,33 @@ private fun AppearanceAndInputSection(
             Column(Modifier.weight(1f)) {
                 Text("触控校准", color = colors.text, fontSize = 15.5.sp, fontWeight = FontWeight.Medium)
                 Text(
-                    if (calibResetNotice) {
+                    if (calibResetError) {
+                        "重置触控校准失败，请稍后重试"
+                    } else if (calibResetNotice) {
                         "已恢复默认触控落点偏移基线"
                     } else {
                         "自适应修正双拇指落点偏移，更换握姿后可重置"
                     },
-                    color = if (calibResetNotice) colors.accent else colors.subtle,
+                    color = if (calibResetError) colors.danger else if (calibResetNotice) colors.accent else colors.subtle,
                     fontSize = 12.5.sp,
                     lineHeight = 18.sp,
                     modifier = Modifier.padding(top = 2.dp),
                 )
             }
             SmallChipButton("重置触控校准", colors) {
-                calibResetNotice = true
+                calibResetNotice = false
+                calibResetError = false
                 scope.launch {
-                    context.settingsStore.edit { prefs ->
-                        prefs[PrefKeys.calibLeft] = 0f
-                        prefs[PrefKeys.calibRight] = 0f
-                        prefs[PrefKeys.calibDy] = 0f
-                        prefs[PrefKeys.calibEpoch] = (prefs[PrefKeys.calibEpoch] ?: 0L) + 1L
-                    }
+                    val reset = runCatching {
+                        context.settingsStore.edit { prefs ->
+                            prefs[PrefKeys.calibLeft] = 0f
+                            prefs[PrefKeys.calibRight] = 0f
+                            prefs[PrefKeys.calibDy] = 0f
+                            prefs[PrefKeys.calibEpoch] = (prefs[PrefKeys.calibEpoch] ?: 0L) + 1L
+                        }
+                    }.isSuccess
+                    calibResetNotice = reset
+                    calibResetError = !reset
                 }
             }
         }
@@ -643,8 +696,9 @@ private fun AiConfigCard(
 ) {
     if (current == null) return
     var revealKey by remember { mutableStateOf(false) }
-    var savedState by remember { mutableStateOf(!secrets.get().isNullOrBlank()) }
+    var savedState by remember { mutableStateOf(secrets.readApiKeySafely().isNotEmpty()) }
     var feedback by remember { mutableStateOf<String?>(null) }
+    var feedbackError by remember { mutableStateOf(false) }
 
     SettingsCard(colors) {
         Row(
@@ -662,7 +716,7 @@ private fun AiConfigCard(
             }
             Column(Modifier.weight(1f).padding(start = 10.dp)) {
                 Text("DeepSeek AI", color = colors.text, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold)
-                Text("密钥仅加密存储在本机，用于询问、翻译与润色", color = colors.subtle, fontSize = 12.5.sp)
+                Text("密钥仅保存在本机，用于询问、翻译与润色", color = colors.subtle, fontSize = 12.5.sp)
             }
             StatusBadge(
                 label = if (savedState) "已配置" else "未配置",
@@ -688,9 +742,12 @@ private fun AiConfigCard(
                 value = key.value,
                 onValueChange = {
                     key.value = it
+                    if (it.isEmpty()) revealKey = false
                     feedback = null
+                    feedbackError = false
                 },
                 singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                 visualTransformation = if (revealKey) VisualTransformation.None else PasswordVisualTransformation(),
                 textStyle = TextStyle(color = colors.text, fontSize = 15.sp),
                 cursorBrush = SolidColor(colors.accent),
@@ -721,25 +778,54 @@ private fun AiConfigCard(
         feedback?.let { msg ->
             Text(
                 msg,
-                color = colors.accent,
+                color = if (feedbackError) colors.danger else colors.accent,
                 fontSize = 12.5.sp,
                 modifier = Modifier.padding(top = 6.dp),
             )
         }
 
         Spacer(Modifier.height(10.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            ActionButton("保存密钥", primary = true, colors = colors) {
-                secrets.set(key.value)
-                savedState = key.value.trim().isNotEmpty()
-                feedback = if (savedState) "密钥已安全保存" else "已清除保存的密钥"
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            ActionButton(
+                "保存密钥",
+                primary = true,
+                colors = colors,
+                modifier = Modifier.weight(1f),
+            ) {
+                val normalized = key.value.trim()
+                val saved = runCatching { secrets.set(normalized) }.isSuccess
+                if (saved) {
+                    key.value = normalized
+                    savedState = normalized.isNotEmpty()
+                    revealKey = false
+                    feedback = if (savedState) "密钥已保存" else "已清除保存的密钥"
+                    feedbackError = false
+                } else {
+                    feedback = "密钥保存失败，请稍后重试"
+                    feedbackError = true
+                }
             }
             if (key.value.isNotEmpty() || savedState) {
-                ActionButton("清除", primary = false, colors = colors) {
-                    key.value = ""
-                    secrets.set("")
-                    savedState = false
-                    feedback = "密钥已清除"
+                ActionButton(
+                    "清除",
+                    primary = false,
+                    colors = colors,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    val cleared = runCatching { secrets.set("") }.isSuccess
+                    if (cleared) {
+                        key.value = ""
+                        revealKey = false
+                        savedState = false
+                        feedback = "密钥已清除"
+                        feedbackError = false
+                    } else {
+                        feedback = "密钥清除失败，请稍后重试"
+                        feedbackError = true
+                    }
                 }
             }
         }
@@ -768,6 +854,7 @@ private fun LexiconAndUpdateSection(
     scope: CoroutineScope,
 ) {
     var clearedNotice by remember { mutableStateOf(false) }
+    var clearError by remember { mutableStateOf<String?>(null) }
     SettingsCard(colors) {
         Row(
             Modifier.fillMaxWidth(),
@@ -785,8 +872,12 @@ private fun LexiconAndUpdateSection(
             Column(Modifier.weight(1f).padding(start = 10.dp)) {
                 Text("本机词库", color = colors.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 Text(
-                    if (clearedNotice) "已清空本机自学习词频与联想记录" else "清除输入过程中自动记忆的中英文个人词频",
-                    color = if (clearedNotice) colors.accent else colors.subtle,
+                    clearError ?: if (clearedNotice) {
+                        "已清空本机自学习词频与联想记录"
+                    } else {
+                        "清除输入过程中自动记忆的中英文个人词频"
+                    },
+                    color = if (clearError != null) colors.danger else if (clearedNotice) colors.accent else colors.subtle,
                     fontSize = 12.5.sp,
                 )
             }
@@ -796,11 +887,23 @@ private fun LexiconAndUpdateSection(
                     .background(colors.field)
                     .border(0.8.dp, colors.fieldBorder, RoundedCornerShape(10.dp))
                     .clickable {
-                        UserStore(context).clear()
-                        clearedNotice = true
+                        clearError = null
                         scope.launch {
-                            context.settingsStore.edit { prefs ->
-                                prefs[PrefKeys.userEpoch] = (prefs[PrefKeys.userEpoch] ?: 0L) + 1L
+                            val cleared = withContext(Dispatchers.IO) {
+                                runCatching { UserStore(context).clear() }.isSuccess
+                            }
+                            if (cleared) {
+                                clearedNotice = true
+                                val refreshed = runCatching {
+                                    context.settingsStore.edit { prefs ->
+                                        prefs[PrefKeys.userEpoch] = (prefs[PrefKeys.userEpoch] ?: 0L) + 1L
+                                    }
+                                }.isSuccess
+                                if (!refreshed) {
+                                    clearError = "词库已清空，但键盘刷新状态保存失败，请重新打开输入法。"
+                                }
+                            } else {
+                                clearError = "清空用户词失败，请稍后重试。"
                             }
                         }
                     }
@@ -850,7 +953,20 @@ private fun UpdateSection(
     fun run(block: suspend (Int) -> Unit) {
         val current = ++ticket[0]
         client.cancel()
-        scope.launch { block(current) }
+        scope.launch {
+            try {
+                block(current)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                publish(current, UpdatePhase.Failed("更新操作失败，请稍后重试。"))
+            }
+        }
+    }
+
+    fun install(file: File) {
+        phase = runCatching { prepareInstall(context, file) }
+            .getOrElse { UpdatePhase.Failed("无法启动安装，请稍后重试。") }
     }
 
     fun check() {
@@ -879,7 +995,7 @@ private fun UpdateSection(
     LaunchedEffect(refreshTick) {
         val current = phase
         if (current is UpdatePhase.NeedsPermission && context.packageManager.canRequestPackageInstalls()) {
-            phase = prepareInstall(context, current.file)
+            install(current.file)
         }
     }
 
@@ -1006,7 +1122,7 @@ private fun UpdateSection(
                     colors = colors,
                 ) {
                     if (current.downloaded) {
-                        phase = prepareInstall(context, updateApk(context, current.release.version))
+                        install(updateApk(context, current.release.version))
                     } else {
                         val release = current.release
                         run { ticketId ->
@@ -1031,12 +1147,12 @@ private fun UpdateSection(
             is UpdatePhase.NeedsPermission -> {
                 ActionButton("去允许权限", primary = true, colors = colors) { openInstallPermission(context) }
                 ActionButton("继续安装", primary = false, colors = colors) {
-                    phase = prepareInstall(context, current.file)
+                    install(current.file)
                 }
             }
             is UpdatePhase.Ready -> {
                 ActionButton("立即安装", primary = true, colors = colors) {
-                    phase = prepareInstall(context, current.file)
+                    install(current.file)
                 }
                 SmallChipButton("重新检查", colors) { check() }
             }

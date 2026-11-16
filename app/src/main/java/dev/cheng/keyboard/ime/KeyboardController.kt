@@ -43,6 +43,11 @@ import dev.cheng.keyboard.engine.applyAskDraft
 import dev.cheng.keyboard.engine.extractTrailingCjk
 import dev.cheng.keyboard.engine.stripWrapped
 import dev.cheng.keyboard.ime.gesture.HapticKind
+import dev.cheng.keyboard.ime.assist.TypingAssistContext
+import dev.cheng.keyboard.ime.assist.TypingAssistKind
+import dev.cheng.keyboard.ime.assist.TypingSuggestion
+import dev.cheng.keyboard.ime.assist.typingSuggestions
+import dev.cheng.keyboard.ime.assist.isLiteralAddressContext
 import dev.cheng.keyboard.ime.gesture.KeyGesture
 import dev.cheng.keyboard.ime.gesture.TapPreview
 import dev.cheng.keyboard.ime.layout.HitContext
@@ -96,6 +101,9 @@ class KeyboardController(
     private var engineState = EngineState()
     private var preferredLanguage = Language.Chinese
     private var activeInfo: EditorInfo? = null
+    private var activeSession: EditorSessionKey? = null
+    private var inputActive = false
+    private var typingSnapshot: TypingEditorSnapshot? = null
     private var lastComposingSpan: EditorTextSpan? = null
     private var enter = dev.cheng.keyboard.model.EnterKind.Newline
     private var fuzzy = false
@@ -170,9 +178,9 @@ class KeyboardController(
 
     fun hitContext(widthPx: Float, refKeyWidthPx: Float, refKeyHeightPx: Float): HitContext {
         val isPrivate = engineState.password || engineState.noLearn
-        val adaptive = !isPrivate && !engineState.uriOrEmail
+        val adaptive = !isPrivate && !engineState.uriOrEmail && !engineState.literalContext
         val priors = when {
-            isPrivate || engineState.uriOrEmail -> NoPriors
+            isPrivate || engineState.uriOrEmail || engineState.literalContext -> NoPriors
             engineState.language == Language.English ->
                 latin.nextLetterPriors(engineState.raw, engineState.lastEnglishWord).toList()
             else ->
@@ -203,10 +211,15 @@ class KeyboardController(
     }
 
     fun startInput(info: EditorInfo, restarting: Boolean) {
+        inputActive = true
+        typingSnapshot = null
+        val session = editorSessionKeyOf(info)
+        val resetSession = shouldResetEditorSession(restarting, activeSession, session)
+        activeSession = session
         activeInfo = info
         val traits = fieldTraitsOf(info)
         enter = enterKindOf(info)
-        if (!restarting) {
+        if (resetSession) {
             val targetLanguage = if (traits.uriOrEmail) Language.English else preferredLanguage
             val targetPage = if (traits.numeric) KeyboardPage.Number else KeyboardPage.Letters
             val before = if (traits.password) "" else connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
@@ -225,6 +238,7 @@ class KeyboardController(
                 password = traits.password,
                 noLearn = traits.noLearn,
                 uriOrEmail = traits.uriOrEmail,
+                literalContext = false,
                 shift = shift,
                 partialText = "",
                 partialSyllables = "",
@@ -239,17 +253,25 @@ class KeyboardController(
             bridge.reset()
             lastComposingSpan = null
             candidateRaw = ""
+            token++
             calibrator.discardPending()
         } else {
             engineState = engineState.copy(
                 password = traits.password,
                 noLearn = traits.noLearn,
                 uriOrEmail = traits.uriOrEmail,
+                literalContext = false,
             )
+            synchronizeComposition()
         }
         gesture.cancel()
         tapClearJob?.cancel()
         lastPolishUndo = null
+        if (resetSession) {
+            aiToken++
+            client.cancel()
+            source = null
+        }
         val isPrivateInput = traits.password || traits.noLearn
         val syncedClips = if (isPrivateInput) {
             state.recentClips
@@ -270,6 +292,19 @@ class KeyboardController(
                 clip = null,
                 freshClip = null,
                 recentClips = syncedClips,
+                overlay = if (resetSession) Overlay.None else it.overlay,
+                askDraft = if (resetSession) "" else it.askDraft,
+                askAnswer = if (resetSession) "" else it.askAnswer,
+                askReason = if (resetSession) "" else it.askReason,
+                askAttached = if (resetSession) null else it.askAttached,
+                resultText = if (resetSession) "" else it.resultText,
+                resultSource = if (resetSession) "" else it.resultSource,
+                polishTone = if (resetSession) PolishTone.Auto else it.polishTone,
+                polishCandidates = if (resetSession) emptyList() else it.polishCandidates,
+                polishSelected = if (resetSession) 0 else it.polishSelected,
+                busy = if (resetSession) false else it.busy,
+                keyDraft = if (resetSession) "" else it.keyDraft,
+                note = if (resetSession) null else it.note,
             )
         }
         publish()
@@ -284,6 +319,7 @@ class KeyboardController(
         candidatesEnd: Int,
     ) {
         if (state.overlay == Overlay.Ask || state.overlay == Overlay.NeedKey) return
+        refreshLiteralAddressContext()
         val currentComposition = if (candidatesStart >= 0 && candidatesEnd > candidatesStart) {
             EditorTextSpan(candidatesStart, candidatesEnd).also { lastComposingSpan = it }
         } else {
@@ -301,12 +337,15 @@ class KeyboardController(
             detachComposition(detachTarget, tapSelection)
             return
         }
-        if (currentComposition != null) return
+        if (currentComposition != null) {
+            refreshTypingSuggestions()
+            return
+        }
         if (engineState.raw.isEmpty()) lastComposingSpan = null
         val selectionMoved = newSelStart != oldSelStart || newSelEnd != oldSelEnd
         if (engineState.raw.isEmpty() && selectionMoved && !engineState.password) {
             val before = connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
-            val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps) {
+            val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps && !engineState.literalContext) {
                 activeInfo?.let { resolveAutoShift(it, before) } ?: engineState.shift
             } else {
                 engineState.shift
@@ -324,6 +363,7 @@ class KeyboardController(
                 publish()
             }
         }
+        refreshTypingSuggestions()
     }
 
     private fun detachComposition(composition: EditorTextSpan, selection: EditorTextSpan) {
@@ -357,7 +397,7 @@ class KeyboardController(
         bridge.detachComposition(composition, selection, composedText, candidate)
         bridge.reset()
         val before = if (engineState.password) "" else connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
-        val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps) {
+        val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps && !engineState.literalContext) {
             activeInfo?.let { resolveAutoShift(it, before) } ?: ShiftState.Off
         } else {
             engineState.shift
@@ -371,6 +411,9 @@ class KeyboardController(
     }
 
     fun onHidden() {
+        inputActive = false
+        typingSnapshot = null
+        engineState = engineState.copy(literalContext = false)
         aiToken++
         client.cancel()
         gesture.cancel()
@@ -397,6 +440,7 @@ class KeyboardController(
                 polishSelected = 0,
                 busy = false,
                 note = null,
+                typingSuggestions = emptyList(),
             )
         }
     }
@@ -455,6 +499,56 @@ class KeyboardController(
 
     fun pick(index: Int) = dispatch(EngineAct.Pick(index))
 
+    fun pickTypingSuggestion(suggestion: TypingSuggestion) {
+        val expected = typingSnapshot ?: return
+        if (suggestion !in state.typingSuggestions || !canShowTypingSuggestions()) return
+        val fresh = bridge.readTypingSnapshot()
+        if (fresh != expected || typingReplacementRange(expected, suggestion) == null) {
+            refreshTypingSuggestions()
+            return
+        }
+        val input = connection() ?: return
+        val result = bridge.replaceTypingSuggestionWithResult(expected, suggestion)
+        if (result == TypingSuggestionEditResult.Unchanged) {
+            flashNote("当前输入框暂不支持补全")
+            refreshTypingSuggestions()
+            return
+        }
+        val accepted = result == TypingSuggestionEditResult.Applied
+        token++
+        candidateRaw = ""
+        lastComposingSpan = null
+        lastPolishUndo = null
+        calibrator.discardPending()
+        bridge.reset()
+        val before = runCatching { input.getTextBeforeCursor(64, 0)?.toString().orEmpty() }.getOrDefault("")
+        engineState = engineState.copy(
+            raw = "",
+            preedit = "",
+            candidates = emptyList(),
+            associating = false,
+            partialText = "",
+            partialSyllables = "",
+            autoSpace = false,
+            undoAutocorrect = null,
+            verbatimFirst = false,
+            lastEnglishWord = null,
+            lastChineseContext = extractTrailingCjk(before),
+            touchHints = emptyList(),
+            touchSamples = emptyList(),
+        )
+        update {
+            it.copy(
+                expanded = false,
+                menu = false,
+                canUndoPolish = false,
+                typingSuggestions = emptyList(),
+            )
+        }
+        if (!accepted) flashNote("当前输入框暂不支持补全")
+        publish()
+    }
+
     fun forgetCandidate(index: Int) {
         val item = state.engine.candidates.getOrNull(index) ?: return
         val text = item.text
@@ -510,6 +604,7 @@ class KeyboardController(
                 )
             }
         }
+        refreshTypingSuggestions()
     }
 
     fun paste() {
@@ -638,6 +733,9 @@ class KeyboardController(
         if (engineState.raw.isNotEmpty()) {
             input?.setComposingText("", 1)
             input?.finishComposingText()
+            bridge.reset()
+            lastComposingSpan = null
+            candidateRaw = ""
             engineState = engineState.copy(
                 raw = "",
                 preedit = "",
@@ -767,6 +865,7 @@ class KeyboardController(
                 engine = engineState,
             )
         }
+        refreshTypingSuggestions()
     }
 
     fun toggleThinking() = update { it.copy(askThinking = !it.askThinking) }
@@ -776,7 +875,10 @@ class KeyboardController(
     fun saveKey() {
         val value = state.keyDraft.trim()
         if (value.isEmpty()) return
-        secrets.set(value)
+        if (runCatching { secrets.set(value) }.isFailure) {
+            update { it.copy(note = "密钥保存失败，请稍后重试") }
+            return
+        }
         update { it.copy(overlay = Overlay.None, keyDraft = "") }
     }
 
@@ -825,6 +927,9 @@ class KeyboardController(
         val text = currentOutput() ?: return
         val input = connection() ?: return
         input.finishComposingText()
+        bridge.reset()
+        lastComposingSpan = null
+        candidateRaw = ""
         engineState = engineState.copy(
             raw = "",
             preedit = "",
@@ -842,6 +947,17 @@ class KeyboardController(
         val text = currentOutput() ?: return
         val input = connection() ?: return
         input.finishComposingText()
+        bridge.reset()
+        lastComposingSpan = null
+        candidateRaw = ""
+        engineState = engineState.copy(
+            raw = "",
+            preedit = "",
+            candidates = emptyList(),
+            associating = false,
+            touchHints = emptyList(),
+            touchSamples = emptyList(),
+        )
         val target = source
         if (target != null && target.start >= 0) {
             val current = input.getExtractedText(
@@ -850,10 +966,19 @@ class KeyboardController(
                     hintMaxLines = 200
                 },
                 0,
-            )?.text?.toString()
-            if (current != null && target.end <= current.length && current.substring(target.start, target.end) == target.text) {
-                input.setSelection(target.start, target.end)
-                input.commitText(text, 1)
+            )
+            val original = current?.text?.toString()?.let {
+                textAtDocumentRange(it, current.startOffset, target.start, target.end)
+            }
+            if (original == null) {
+                update { it.copy(note = "无法定位原文，请重新选择后替换") }
+                return
+            }
+            if (original == target.text) {
+                if (!input.setSelection(target.start, target.end) || !input.commitText(text, 1)) {
+                    update { it.copy(note = "当前输入框未接受替换，请重试") }
+                    return
+                }
                 if ((state.overlay as? Overlay.Result)?.kind == ResultKind.Polish) {
                     lastPolishUndo = PolishUndo(target.start, target.start + text.length, target.text, text)
                     finishOverlay("已替换")
@@ -863,13 +988,19 @@ class KeyboardController(
                 closeOverlay()
                 return
             }
+            update { it.copy(note = "原文已变化，请重新选择后替换") }
+            return
         }
-        input.commitText(text, 1)
-        finishOverlay("原文有变化，已改为插入")
+        update { it.copy(note = "当前输入框不支持定位替换，请使用插入") }
     }
 
     fun undoPolish() {
         val undo = lastPolishUndo ?: return
+        if (engineState.raw.isNotEmpty()) {
+            lastPolishUndo = null
+            update { it.copy(canUndoPolish = false, note = "当前输入未完成，无法撤回") }
+            return
+        }
         val input = connection() ?: return
         val current = input.getExtractedText(
             android.view.inputmethod.ExtractedTextRequest().apply {
@@ -877,14 +1008,23 @@ class KeyboardController(
                 hintMaxLines = 200
             },
             0,
-        )?.text?.toString() ?: return
-        if (undo.start < 0 || undo.start > undo.end || undo.end > current.length || current.substring(undo.start, undo.end) != undo.replaced) {
+        ) ?: return
+        val replaced = current.text?.toString()?.let {
+            textAtDocumentRange(it, current.startOffset, undo.start, undo.end)
+        }
+        if (replaced == null) {
+            update { it.copy(note = "当前无法定位替换位置，不能撤回") }
+            return
+        }
+        if (undo.start < 0 || undo.start > undo.end || replaced != undo.replaced) {
             lastPolishUndo = null
             update { it.copy(canUndoPolish = false, note = "原文已变化，无法撤回") }
             return
         }
-        input.setSelection(undo.start, undo.end)
-        input.commitText(undo.original, 1)
+        if (!input.setSelection(undo.start, undo.end) || !input.commitText(undo.original, 1)) {
+            update { it.copy(note = "当前输入框未接受撤回，请重试") }
+            return
+        }
         lastPolishUndo = null
         update { it.copy(canUndoPolish = false, note = "已撤回") }
     }
@@ -1068,10 +1208,16 @@ class KeyboardController(
 
     private fun dispatch(act: EngineAct) {
         if (interceptAsk(act)) return
+        synchronizeComposition()
+        refreshLiteralAddressContext()
         if (needsChineseNow(act)) refreshChinese()
         val step = engine.reduce(engineState, act, enter)
         updateCalibrationForAction(act, step)
         engineState = step.state
+        if (engineState.raw.isNotEmpty() && lastPolishUndo != null) {
+            lastPolishUndo = null
+            update { it.copy(canUndoPolish = false) }
+        }
         if (act == EngineAct.Language && !engineState.uriOrEmail) {
             preferredLanguage = engineState.language
         }
@@ -1109,7 +1255,10 @@ class KeyboardController(
                     }
                 }
             }
-            bridge.apply(step.cmds)
+            bridge.apply(
+                step.cmds,
+                smartCommit = shouldUseSmartCommit(engineState.password, engineState.uriOrEmail || engineState.literalContext),
+            )
             if (engineState.raw.isEmpty()) lastComposingSpan = null
         } else {
             val draft = applyAskDraft(state.askDraft, step.cmds)
@@ -1124,8 +1273,42 @@ class KeyboardController(
         publish()
     }
 
+    private fun synchronizeComposition() {
+        val raw = engineState.raw
+        if (raw.isEmpty() || state.overlay == Overlay.Ask) return
+        val input = connection() ?: return
+        val before = input.getTextBeforeCursor(raw.length, 0)?.toString() ?: return
+        if (before == raw) return
+        val extracted = input.getExtractedText(
+            android.view.inputmethod.ExtractedTextRequest().apply { hintMaxChars = raw.length + 64 },
+            0,
+        ) ?: return
+        if (!compositionMissingFromEditor(raw, lastComposingSpan, extracted.text?.toString(), extracted.startOffset, extracted.selectionEnd)) return
+        input.finishComposingText()
+        bridge.reset()
+        token++
+        lastComposingSpan = null
+        candidateRaw = ""
+        calibrator.discardPending()
+        engineState = engineState.copy(
+            raw = "",
+            preedit = "",
+            candidates = emptyList(),
+            associating = false,
+            partialText = "",
+            partialSyllables = "",
+            autoSpace = false,
+            undoAutocorrect = null,
+            verbatimFirst = false,
+            lastEnglishWord = null,
+            lastChineseContext = extractTrailingCjk(before),
+            touchHints = emptyList(),
+            touchSamples = emptyList(),
+        )
+    }
+
     private fun updateCalibrationForAction(act: EngineAct, step: dev.cheng.keyboard.engine.EngineStep) {
-        val isPrivate = engineState.password || engineState.noLearn || engineState.uriOrEmail
+        val isPrivate = engineState.password || engineState.noLearn || engineState.uriOrEmail || engineState.literalContext
         if (isPrivate) {
             calibrator.discardPending()
             return
@@ -1209,7 +1392,7 @@ class KeyboardController(
     }
 
     private fun needsChineseNow(act: EngineAct): Boolean {
-        if (engineState.language != Language.Chinese || engineState.raw.isEmpty() || engineState.password) return false
+        if (engineState.language != Language.Chinese || engineState.raw.isEmpty() || engineState.password || engineState.literalContext) return false
         return when (act) {
             EngineAct.Space, EngineAct.Enter, is EngineAct.Direct, is EngineAct.Pick -> true
             is EngineAct.Letter -> act.force == Choice.Symbol || act.force == Choice.Upper ||
@@ -1232,6 +1415,7 @@ class KeyboardController(
     }
 
     private fun requestPinyin(raw: String) {
+        if (engineState.literalContext) return
         val current = ++token
         val useFuzzy = fuzzy
         val ctx = engineState.lastChineseContext + engineState.partialText
@@ -1242,7 +1426,7 @@ class KeyboardController(
             val decoded = pinyin.decode(raw, useFuzzy, ctx, hints, samples)
             if (current != token) return@launch
             withContext(Dispatchers.Main) {
-                if (current != token || engineState.raw != raw || engineState.language != Language.Chinese) return@withContext
+                if (current != token || engineState.raw != raw || engineState.language != Language.Chinese || engineState.literalContext) return@withContext
                 candidateRaw = raw
                 dispatch(EngineAct.Candidates(decoded.preedit, decoded.candidates))
             }
@@ -1305,11 +1489,15 @@ class KeyboardController(
             update { it.copy(freshClip = null) }
             return
         }
-        val text = readClip(skipSensitive = true) ?: return
         clipExpireJob?.cancel()
+        val text = readClip(skipSensitive = true)
+        if (text == null) {
+            update { it.copy(freshClip = null, clip = null) }
+            return
+        }
         val merged = mergeRecentClips(text, state.recentClips)
         saveRecentClips(merged)
-        update { it.copy(freshClip = text, recentClips = merged) }
+        update { it.copy(freshClip = text, clip = if (it.menu) text else it.clip, recentClips = merged) }
         clipExpireJob = scope.launch {
             delay(45_000)
             update { it.copy(freshClip = null) }
@@ -1346,6 +1534,7 @@ class KeyboardController(
     }
 
     private fun publish() {
+        refreshLiteralAddressContext()
         if (engineState.raw.isEmpty()) candidateRaw = ""
         update { prev ->
             val shownEngine = if (
@@ -1363,9 +1552,66 @@ class KeyboardController(
             }
             prev.copy(engine = shownEngine, enter = enter, fuzzy = fuzzy)
         }
+        refreshTypingSuggestions()
+    }
+
+    private fun refreshLiteralAddressContext() {
+        val traits = activeInfo?.let(::fieldTraitsOf)
+        val allowed = inputActive && traits != null && !traits.password && !traits.noLearn &&
+            !traits.numeric && !traits.uriOrEmail && state.overlay == Overlay.None
+        val before = if (allowed) {
+            runCatching { connection()?.getTextBeforeCursor(320, 0)?.toString() }.getOrNull()
+        } else {
+            null
+        }
+        val literal = before?.let(::isLiteralAddressContext) == true
+        if (engineState.literalContext != literal) {
+            engineState = engineState.copy(
+                literalContext = literal,
+                shift = if (literal && engineState.shift != ShiftState.Caps) ShiftState.Off else engineState.shift,
+            )
+        }
+    }
+
+    private fun canShowTypingSuggestions(): Boolean = inputActive &&
+        !engineState.password && !engineState.noLearn && state.overlay == Overlay.None && !state.menu
+
+    private fun refreshTypingSuggestions() {
+        val current = if (canShowTypingSuggestions()) bridge.readTypingSnapshot() else null
+        typingSnapshot = current
+        val suggestions = if (current == null) {
+            emptyList()
+        } else {
+            val info = activeInfo
+            val inputClass = info?.inputType?.and(EditorInfo.TYPE_MASK_CLASS)
+            val variation = info?.inputType?.and(EditorInfo.TYPE_MASK_VARIATION)
+            typingSuggestions(
+                TypingAssistContext(
+                    before = current.before,
+                    after = current.after,
+                    composing = engineState.raw.takeIf { current.before.endsWith(it) }.orEmpty(),
+                    emailField = inputClass == EditorInfo.TYPE_CLASS_TEXT && (
+                        variation == EditorInfo.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
+                            variation == EditorInfo.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
+                        ),
+                    uriField = inputClass == EditorInfo.TYPE_CLASS_TEXT && variation == EditorInfo.TYPE_TEXT_VARIATION_URI,
+                    numeric = info?.let(::fieldTraitsOf)?.numeric == true,
+                    hasSelection = current.selection.start != current.selection.end,
+                ),
+            ).filterNot { suggestion ->
+                suggestion.kind == TypingAssistKind.DateTime &&
+                    state.engine.candidates.any { it.text == suggestion.replacement }
+            }
+        }
+        if (state.typingSuggestions != suggestions) update { it.copy(typingSuggestions = suggestions) }
     }
 
     private fun update(block: (UiState) -> UiState) {
-        snapshot.value = block(snapshot.value)
+        val next = block(snapshot.value)
+        snapshot.value = if (next.overlay != Overlay.None || next.menu || next.engine.password || next.engine.noLearn) {
+            next.copy(typingSuggestions = emptyList())
+        } else {
+            next
+        }
     }
 }

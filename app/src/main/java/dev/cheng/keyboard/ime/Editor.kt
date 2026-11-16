@@ -1,5 +1,6 @@
 package dev.cheng.keyboard.ime
 
+import android.os.Build
 import android.view.KeyEvent
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.ExtractedTextRequest
@@ -12,6 +13,7 @@ import dev.cheng.keyboard.engine.resolveSmartCommit
 import dev.cheng.keyboard.engine.shouldAutoCap
 import dev.cheng.keyboard.model.EnterKind
 import dev.cheng.keyboard.model.ShiftState
+import dev.cheng.keyboard.ime.assist.TypingSuggestion
 import kotlin.math.abs
 
 data class FieldTraits(
@@ -21,16 +23,39 @@ data class FieldTraits(
     val uriOrEmail: Boolean,
 )
 
+data class EditorSessionKey(
+    val packageName: String?,
+    val fieldId: Int,
+    val inputType: Int,
+    val imeOptions: Int,
+)
+
+fun editorSessionKeyOf(info: EditorInfo): EditorSessionKey = EditorSessionKey(
+    packageName = info.packageName,
+    fieldId = info.fieldId,
+    inputType = info.inputType,
+    imeOptions = info.imeOptions,
+)
+
+fun shouldResetEditorSession(
+    restarting: Boolean,
+    previous: EditorSessionKey?,
+    current: EditorSessionKey,
+): Boolean = !restarting || previous == null || previous != current
+
 fun fieldTraitsOf(info: EditorInfo): FieldTraits {
-    val password = isPasswordField(info)
-    val noLearn = info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING != 0
-    val inputClass = info.inputType and EditorInfo.TYPE_MASK_CLASS
-    val variation = info.inputType and EditorInfo.TYPE_MASK_VARIATION
-    val numeric = !password && (
+    return fieldTraitsOf(info.inputType, info.imeOptions)
+}
+
+fun fieldTraitsOf(inputType: Int, imeOptions: Int): FieldTraits {
+    val password = isPasswordInputType(inputType)
+    val noLearn = imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING != 0
+    val inputClass = inputType and EditorInfo.TYPE_MASK_CLASS
+    val variation = inputType and EditorInfo.TYPE_MASK_VARIATION
+    val numeric =
         inputClass == EditorInfo.TYPE_CLASS_NUMBER ||
             inputClass == EditorInfo.TYPE_CLASS_PHONE ||
             inputClass == EditorInfo.TYPE_CLASS_DATETIME
-        )
     val uriOrEmail = !password && inputClass == EditorInfo.TYPE_CLASS_TEXT && (
         variation == EditorInfo.TYPE_TEXT_VARIATION_URI ||
             variation == EditorInfo.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
@@ -60,11 +85,18 @@ fun resolveAutoShift(info: EditorInfo, before: String): ShiftState {
 }
 
 fun isPasswordField(info: EditorInfo): Boolean {
-    val variation = info.inputType and EditorInfo.TYPE_MASK_VARIATION
-    return variation == EditorInfo.TYPE_TEXT_VARIATION_PASSWORD ||
-        variation == EditorInfo.TYPE_TEXT_VARIATION_WEB_PASSWORD ||
-        variation == EditorInfo.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
-        variation == EditorInfo.TYPE_NUMBER_VARIATION_PASSWORD
+    return isPasswordInputType(info.inputType)
+}
+
+fun isPasswordInputType(inputType: Int): Boolean {
+    val variation = inputType and EditorInfo.TYPE_MASK_VARIATION
+    return when (inputType and EditorInfo.TYPE_MASK_CLASS) {
+        EditorInfo.TYPE_CLASS_TEXT -> variation == EditorInfo.TYPE_TEXT_VARIATION_PASSWORD ||
+            variation == EditorInfo.TYPE_TEXT_VARIATION_WEB_PASSWORD ||
+            variation == EditorInfo.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+        EditorInfo.TYPE_CLASS_NUMBER -> variation == EditorInfo.TYPE_NUMBER_VARIATION_PASSWORD
+        else -> false
+    }
 }
 
 fun enterKindOf(info: EditorInfo): EnterKind {
@@ -105,6 +137,125 @@ data class EditorTextSpan(val start: Int, val end: Int) {
     fun ordered(): EditorTextSpan = if (start <= end) this else EditorTextSpan(end, start)
 }
 
+data class TypingEditorSnapshot(
+    val before: String,
+    val after: String,
+    val selection: EditorTextSpan,
+)
+
+enum class TypingSuggestionEditResult {
+    Applied,
+    Unchanged,
+    CompositionFinalizedWithoutReplacement,
+}
+
+fun isUtf16Boundary(text: String, index: Int): Boolean {
+    if (index !in 0..text.length) return false
+    return index == 0 ||
+        index == text.length ||
+        !(text[index - 1].isHighSurrogate() && text[index].isLowSurrogate())
+}
+
+fun typingEditorSnapshot(
+    text: String,
+    selectionStart: Int,
+    selectionEnd: Int,
+    startOffset: Int,
+): TypingEditorSnapshot? {
+    if (startOffset < 0 || selectionStart !in 0..text.length || selectionEnd !in selectionStart..text.length) return null
+    if (hasSplitUtf16Boundary(text, startOffset)) return null
+    if (!isUtf16Boundary(text, selectionStart) || !isUtf16Boundary(text, selectionEnd)) return null
+    val absoluteEnd = absoluteEditorPosition(selectionEnd, startOffset) ?: return null
+    var beforeStart = (selectionStart - 160).coerceAtLeast(0)
+    if (!isUtf16Boundary(text, beforeStart)) beforeStart--
+    var afterEnd = (selectionEnd + 80).coerceAtMost(text.length)
+    if (!isUtf16Boundary(text, afterEnd)) afterEnd++
+    return TypingEditorSnapshot(
+        before = text.substring(beforeStart, selectionStart),
+        after = text.substring(selectionEnd, afterEnd),
+        selection = EditorTextSpan(absoluteEnd - (selectionEnd - selectionStart), absoluteEnd),
+    )
+}
+
+fun typingReplacementRange(snapshot: TypingEditorSnapshot, suggestion: TypingSuggestion): EditorTextSpan? {
+    if (snapshot.selection.start < 0 || snapshot.selection.start != snapshot.selection.end) return null
+    if (suggestion.expectedBefore != snapshot.before || suggestion.expectedAfter != snapshot.after) return null
+    if (suggestion.replaceBefore !in 0..snapshot.before.length || suggestion.replaceAfter !in 0..snapshot.after.length) return null
+    if (suggestion.replacement.isEmpty()) return null
+    val start = snapshot.selection.start - suggestion.replaceBefore
+    if (start < 0 || snapshot.selection.end > Int.MAX_VALUE - suggestion.replaceAfter) return null
+    return EditorTextSpan(start, snapshot.selection.end + suggestion.replaceAfter)
+}
+
+fun compositionMissingFromEditor(
+    raw: String,
+    remembered: EditorTextSpan?,
+    document: String?,
+    startOffset: Int,
+    selectionEnd: Int,
+): Boolean {
+    if (raw.isEmpty() || document == null || startOffset < 0 || selectionEnd < 0) return false
+    if (document.isEmpty() && startOffset == 0) return true
+    val relativeStart = if (remembered != null) {
+        if (remembered.start < startOffset) return false
+        remembered.start - startOffset
+    } else {
+        selectionEnd - raw.length
+    }
+    if (relativeStart < 0) return false
+    return relativeStart > document.length ||
+        raw.length > document.length - relativeStart ||
+        !document.regionMatches(relativeStart, raw, 0, raw.length)
+}
+
+fun fieldSourceFromExtractedText(
+    text: String,
+    selectionStart: Int,
+    selectionEnd: Int,
+    startOffset: Int,
+): FieldSource? {
+    if (startOffset < 0) return null
+    if (selectionStart !in 0..text.length || selectionEnd !in 0..text.length) return null
+    val start = selectionStart
+    val end = selectionEnd
+    if (hasSplitUtf16Boundary(text, startOffset)) return null
+    if (!isUtf16Boundary(text, start) || !isUtf16Boundary(text, end)) return null
+    if (start != end) {
+        val from = minOf(start, end)
+        val to = maxOf(start, end)
+        return FieldSource(
+            text = text.substring(from, to).take(4000),
+            selection = true,
+            start = absoluteEditorPosition(from, startOffset) ?: return null,
+            end = absoluteEditorPosition(to, startOffset) ?: return null,
+            contextBefore = contextBeforeOf(text, from),
+            contextAfter = contextAfterOf(text, to),
+        )
+    }
+    return paragraphSource(text, start, startOffset)
+}
+
+fun textAtDocumentRange(
+    text: String,
+    startOffset: Int,
+    start: Int,
+    end: Int,
+): String? {
+    if (startOffset < 0) return null
+    val range = EditorTextSpan(start, end).ordered()
+    if (range.start < startOffset || range.end < startOffset) return null
+    val localStart = range.start - startOffset
+    val localEnd = range.end - startOffset
+    if (localEnd > text.length) return null
+    if ((localStart == 0 && startOffset > 0 && text.firstOrNull()?.isLowSurrogate() == true) ||
+        (localEnd == text.length && text.lastOrNull()?.isHighSurrogate() == true)
+    ) {
+        return null
+    }
+    if (!isUtf16Boundary(text, localStart) || !isUtf16Boundary(text, localEnd)) return null
+    return text.substring(localStart, localEnd)
+}
+
 fun compositionDetachTarget(
     compositionLength: Int,
     remembered: EditorTextSpan?,
@@ -115,7 +266,7 @@ fun compositionDetachTarget(
     if (compositionLength <= 0) return null
     val old = oldSelection.ordered()
     val next = newSelection.ordered()
-    if (old.start < 0 || old.end < 0 || next.start < 0 || next.end < 0) return null
+    if (next.start < 0 || next.end < 0) return null
     if (old == next) return null
     val composition = candidates?.takeIf { it.start >= 0 && it.end > it.start }
         ?: remembered?.takeIf {
@@ -129,7 +280,12 @@ fun compositionDetachTarget(
             }
         }
         ?: return null
-    return composition.takeUnless { next.start >= it.start && next.end <= it.end }
+    val staysInside = if (next.start == next.end) {
+        next.start > composition.start && next.start <= composition.end
+    } else {
+        next.start >= composition.start && next.end <= composition.end
+    }
+    return composition.takeUnless { staysInside }
 }
 
 fun remapSelectionAfterReplacement(
@@ -149,25 +305,78 @@ fun remapSelectionAfterReplacement(
     return if (selection.start <= selection.end) EditorTextSpan(start, end) else EditorTextSpan(end, start)
 }
 
+fun smartCommitNeedsContext(
+    hasSelection: Boolean,
+    composing: Boolean,
+    text: String,
+): Boolean = !hasSelection && !composing && (
+    (text.isNotEmpty() && text[0] in '0'..'9') ||
+        text == "“" ||
+        text == "‘" ||
+        text.length == 2
+    )
+
+fun shouldUseSmartCommit(password: Boolean, uriOrEmail: Boolean): Boolean =
+    !password && !uriOrEmail
+
+fun cursorPositionAfterMove(
+    text: String,
+    selectionEnd: Int,
+    startOffset: Int,
+    delta: Int,
+): Int? {
+    if (startOffset < 0 || selectionEnd !in 0..text.length) return null
+    if (hasSplitUtf16Boundary(text, startOffset)) return null
+    if (!isUtf16Boundary(text, selectionEnd)) return null
+    if (delta == Int.MIN_VALUE) return null
+    var local = selectionEnd
+    val direction = if (delta > 0) 1 else -1
+    repeat(abs(delta)) {
+        local = runCatching { text.offsetByCodePoints(local, direction) }.getOrNull() ?: return null
+    }
+    return absoluteEditorPosition(local, startOffset)
+}
+
+fun safeUtf16Suffix(text: String, maxUnits: Int): String? {
+    if (maxUnits < 0) return null
+    if (maxUnits == 0) return ""
+    if (text.length <= maxUnits) return text.takeIf { !hasUnpairedSurrogate(it) }
+    var start = text.length - maxUnits
+    if (!isUtf16Boundary(text, start)) start++
+    return text.substring(start).takeIf { !hasUnpairedSurrogate(it) }
+}
+
+fun codePointDeleteCount(text: String, maxUtf16Units: Int): Int? {
+    val suffix = safeUtf16Suffix(text, maxUtf16Units) ?: return null
+    return suffix.codePointCount(0, suffix.length)
+}
+
+fun lastCompleteGraphemeBeforeCursor(text: String, maxUtf16Units: Int): String? {
+    if (text.isEmpty() || maxUtf16Units <= 0) return null
+    val window = text.takeLast(maxUtf16Units)
+    val mayBeTruncated = window.length == maxUtf16Units
+    val analysis = if (window.first().isLowSurrogate()) window.substring(1) else window
+    if (analysis.isEmpty()) return null
+    var last: MatchResult? = null
+    for (match in GRAPHEME_CLUSTER.findAll(analysis)) {
+        last = match
+    }
+    val match = last ?: return null
+    if (match.range.last != analysis.lastIndex) return null
+    if (mayBeTruncated && match.range.first == 0) return null
+    return match.value.takeUnless(::hasUnpairedSurrogate)
+}
+
 fun readField(connection: InputConnection): FieldSource? {
     val extracted = connection.getExtractedText(extractedRequest(), 0)
-    if (extracted?.text != null) {
-        val all = extracted.text.toString()
-        val start = if (extracted.selectionStart < 0) all.length else extracted.selectionStart.coerceIn(0, all.length)
-        val end = if (extracted.selectionEnd < 0) start else extracted.selectionEnd.coerceIn(0, all.length)
-        if (start != end) {
-            val from = minOf(start, end)
-            val to = maxOf(start, end)
-            return FieldSource(
-                text = all.substring(from, to).take(4000),
-                selection = true,
-                start = from,
-                end = to,
-                contextBefore = contextBeforeOf(all, from),
-                contextAfter = contextAfterOf(all, to),
-            )
-        }
-        return paragraphSource(all, start)
+    if (extracted?.text != null && extracted.startOffset >= 0) {
+        val source = fieldSourceFromExtractedText(
+            text = extracted.text.toString(),
+            selectionStart = extracted.selectionStart,
+            selectionEnd = extracted.selectionEnd,
+            startOffset = extracted.startOffset,
+        )
+        if (source != null) return source
     }
     val selected = connection.getSelectedText(0)?.toString()
     if (!selected.isNullOrEmpty()) {
@@ -183,8 +392,36 @@ fun readField(connection: InputConnection): FieldSource? {
     val before = connection.getTextBeforeCursor(4000, 0)?.toString()
     val after = connection.getTextAfterCursor(4000, 0)?.toString()
     if (before == null && after == null) return null
-    return paragraphSource(before.orEmpty() + after.orEmpty(), before.orEmpty().length).copy(start = -1, end = -1)
+    return paragraphSource(before.orEmpty() + after.orEmpty(), before.orEmpty().length, 0)
+        ?.copy(start = -1, end = -1)
 }
+
+private fun absoluteEditorPosition(local: Int, startOffset: Int): Int? {
+    if (local < 0 || startOffset < 0 || local > Int.MAX_VALUE - startOffset) return null
+    return startOffset + local
+}
+
+private fun hasUnpairedSurrogate(text: String): Boolean {
+    var index = 0
+    while (index < text.length) {
+        val character = text[index]
+        if (character.isHighSurrogate()) {
+            if (index + 1 >= text.length || !text[index + 1].isLowSurrogate()) return true
+            index += 2
+        } else if (character.isLowSurrogate()) {
+            return true
+        } else {
+            index++
+        }
+    }
+    return false
+}
+
+private fun hasSplitUtf16Boundary(text: String, startOffset: Int): Boolean =
+    (startOffset > 0 && text.firstOrNull()?.isLowSurrogate() == true) ||
+        text.lastOrNull()?.isHighSurrogate() == true
+
+private val GRAPHEME_CLUSTER = Regex("\\X")
 
 private fun contextBeforeOf(all: String, start: Int, limit: Int = 200): String =
     if (start <= 0) "" else all.substring(maxOf(0, start - limit), start)
@@ -197,7 +434,7 @@ private fun extractedRequest() = ExtractedTextRequest().apply {
     hintMaxLines = 200
 }
 
-private fun paragraphSource(all: String, cursor: Int): FieldSource {
+private fun paragraphSource(all: String, cursor: Int, startOffset: Int): FieldSource? {
     val safeCursor = cursor.coerceIn(0, all.length)
     val head = all.substring(0, safeCursor)
     val tail = all.substring(safeCursor)
@@ -207,10 +444,12 @@ private fun paragraphSource(all: String, cursor: Int): FieldSource {
     val paragraph = paragraphHead + paragraphTail
     val useAll = paragraph.isBlank()
     val text = (if (useAll) all else paragraph).take(4000)
-    val start = if (useAll) 0 else safeCursor - paragraphHead.length
-    val end = (start + text.length).coerceAtMost(all.length)
-    val contextBefore = if (useAll) "" else contextBeforeOf(all, start)
-    val contextAfter = if (useAll) "" else contextAfterOf(all, end)
+    val localStart = if (useAll) 0 else safeCursor - paragraphHead.length
+    val localEnd = (localStart + text.length).coerceAtMost(all.length)
+    val start = absoluteEditorPosition(localStart, startOffset) ?: return null
+    val end = absoluteEditorPosition(localEnd, startOffset) ?: return null
+    val contextBefore = if (useAll) "" else contextBeforeOf(all, localStart)
+    val contextAfter = if (useAll) "" else contextAfterOf(all, localEnd)
     return FieldSource(
         text = text,
         selection = false,
@@ -224,6 +463,86 @@ private fun paragraphSource(all: String, cursor: Int): FieldSource {
 class EditorBridge(private val connection: () -> InputConnection?) {
     private var composing = false
 
+    fun readTypingSnapshot(): TypingEditorSnapshot? {
+        val input = connection() ?: return null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val surrounding = runCatching { input.getSurroundingText(160, 80, 0) }.getOrNull()
+            if (surrounding != null && surrounding.offset >= 0) {
+                return typingEditorSnapshot(
+                    surrounding.text.toString(),
+                    surrounding.selectionStart,
+                    surrounding.selectionEnd,
+                    surrounding.offset,
+                )
+            }
+        }
+        return runCatching {
+            val extracted = input.getExtractedText(
+                ExtractedTextRequest().apply { hintMaxChars = 240 },
+                0,
+            ) ?: return@runCatching null
+            if (extracted.partialStartOffset >= 0) return@runCatching null
+            if (extracted.startOffset < 0) return@runCatching null
+            typingEditorSnapshot(
+                extracted.text?.toString() ?: return@runCatching null,
+                extracted.selectionStart,
+                extracted.selectionEnd,
+                extracted.startOffset,
+            )
+        }.getOrNull()
+    }
+
+    fun replaceTypingSuggestion(
+        expected: TypingEditorSnapshot,
+        suggestion: TypingSuggestion,
+    ): Boolean = replaceTypingSuggestionWithResult(expected, suggestion) == TypingSuggestionEditResult.Applied
+
+    fun replaceTypingSuggestionWithResult(
+        expected: TypingEditorSnapshot,
+        suggestion: TypingSuggestion,
+    ): TypingSuggestionEditResult {
+        val input = connection() ?: return TypingSuggestionEditResult.Unchanged
+        val current = runCatching { readTypingSnapshot() }.getOrNull()
+            ?: return TypingSuggestionEditResult.Unchanged
+        if (current != expected) return TypingSuggestionEditResult.Unchanged
+        val target = typingReplacementRange(current, suggestion)
+            ?: return TypingSuggestionEditResult.Unchanged
+        if (runCatching { input.beginBatchEdit() }.isFailure) {
+            return TypingSuggestionEditResult.Unchanged
+        }
+
+        try {
+            val finished = runCatching { input.finishComposingText() }.getOrDefault(false)
+            if (!finished) {
+                val after = runCatching { readTypingSnapshot() }.getOrNull()
+                if (after == null || after == current) return TypingSuggestionEditResult.Unchanged
+                composing = false
+                restoreTypingSelection(input, current.selection)
+                return TypingSuggestionEditResult.CompositionFinalizedWithoutReplacement
+            }
+            composing = false
+
+            val selected = runCatching {
+                input.setSelection(target.start, target.end)
+            }.getOrDefault(false)
+            if (!selected) {
+                restoreTypingSelection(input, current.selection)
+                return TypingSuggestionEditResult.CompositionFinalizedWithoutReplacement
+            }
+
+            val committed = runCatching {
+                input.commitText(suggestion.replacement, 1)
+            }.getOrDefault(false)
+            if (!committed) {
+                restoreTypingSelection(input, current.selection)
+                return TypingSuggestionEditResult.CompositionFinalizedWithoutReplacement
+            }
+            return TypingSuggestionEditResult.Applied
+        } finally {
+            runCatching { input.endBatchEdit() }
+        }
+    }
+
     fun detachComposition(
         composition: EditorTextSpan,
         selection: EditorTextSpan,
@@ -232,12 +551,21 @@ class EditorBridge(private val connection: () -> InputConnection?) {
     ) {
         val input = connection() ?: return
         val range = composition.ordered()
-        val document = input.getExtractedText(extractedRequest(), 0)?.text?.toString()
+        val extracted = input.getExtractedText(extractedRequest(), 0)
+        val document = extracted?.text?.toString()
         val rangeMatches = range.start >= 0 &&
             range.end > range.start &&
             (
-                document == null ||
-                    (range.end <= document.length && document.substring(range.start, range.end) == composedText)
+                extracted == null ||
+                    (
+                        extracted.startOffset >= 0 &&
+                            textAtDocumentRange(
+                                text = document.orEmpty(),
+                                startOffset = extracted.startOffset,
+                                start = range.start,
+                                end = range.end,
+                            ) == composedText
+                        )
                 )
         var replacementLength = range.end - range.start
         val replacement = candidate?.takeIf { rangeMatches }
@@ -253,12 +581,12 @@ class EditorBridge(private val connection: () -> InputConnection?) {
         input.setSelection(restored.start, restored.end)
     }
 
-    fun apply(cmds: List<Cmd>) {
+    fun apply(cmds: List<Cmd>, smartCommit: Boolean = true) {
         val input = connection() ?: return
         for (cmd in cmds) {
             when (cmd) {
                 is Cmd.Commit -> {
-                    commitSmart(input, cmd.text)
+                    if (smartCommit) commitSmart(input, cmd.text) else input.commitText(cmd.text, 1)
                     composing = false
                 }
                 is Cmd.Compose -> {
@@ -270,7 +598,7 @@ class EditorBridge(private val connection: () -> InputConnection?) {
                     composing = false
                 }
                 Cmd.DeleteOne -> deleteOne(input)
-                is Cmd.DeleteCount -> if (cmd.count > 0) input.deleteSurroundingText(cmd.count, 0)
+                is Cmd.DeleteCount -> deleteBefore(input, cmd.count)
                 Cmd.DeleteWord -> deleteWord(input)
                 is Cmd.MoveCursor -> moveCursor(input, cmd.delta)
                 is Cmd.EditorAction -> input.performEditorAction(cmd.kind.imeAction())
@@ -284,12 +612,13 @@ class EditorBridge(private val connection: () -> InputConnection?) {
     }
 
     private fun commitSmart(input: InputConnection, text: String) {
-        val needContext = !composing && (
-            (text.isNotEmpty() && text[0] in '0'..'9') ||
-                text == "“" ||
-                text == "‘" ||
-                text.length == 2
-            )
+        val mayNeedContext = smartCommitNeedsContext(
+            hasSelection = false,
+            composing = composing,
+            text = text,
+        )
+        val hasSelection = mayNeedContext && hasEditorSelection(input)
+        val needContext = smartCommitNeedsContext(hasSelection, composing, text)
         val before = if (needContext) input.getTextBeforeCursor(120, 0)?.toString().orEmpty() else ""
         val smart = resolveSmartCommit(before, text, composing)
         if (smart.deleteBefore > 0) {
@@ -306,15 +635,16 @@ class EditorBridge(private val connection: () -> InputConnection?) {
         val extracted = input.getExtractedText(ExtractedTextRequest(), 0)
         if (extracted?.text != null && extracted.selectionEnd >= 0) {
             val content = extracted.text.toString()
-            var pos = extracted.selectionEnd.coerceIn(0, content.length)
-            val direction = if (delta > 0) 1 else -1
-            repeat(abs(delta)) {
-                pos = runCatching {
-                    content.offsetByCodePoints(pos, direction)
-                }.getOrDefault((pos + direction).coerceIn(0, content.length))
+            val position = cursorPositionAfterMove(
+                text = content,
+                selectionEnd = extracted.selectionEnd,
+                startOffset = extracted.startOffset,
+                delta = delta,
+            )
+            if (position != null) {
+                input.setSelection(position, position)
+                return
             }
-            input.setSelection(pos, pos)
-            return
         }
         val code = if (delta < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
         repeat(abs(delta)) {
@@ -324,33 +654,59 @@ class EditorBridge(private val connection: () -> InputConnection?) {
     }
 
     private fun deleteOne(input: InputConnection) {
-        val selected = input.getSelectedText(0)
-        if (!selected.isNullOrEmpty()) {
-            input.commitText("", 1)
-            return
-        }
-        val before = input.getTextBeforeCursor(2, 0)?.toString().orEmpty()
-        if (before.isEmpty()) return
-        val count = if (
-            before.length >= 2 &&
-            Character.isSurrogatePair(before[before.length - 2], before[before.length - 1])
-        ) {
-            2
-        } else {
-            1
-        }
-        input.deleteSurroundingText(count, 0)
+        if (deleteSelectionIfPresent(input)) return
+        val before = input.getTextBeforeCursor(DELETE_ONE_WINDOW_UNITS, 0)?.toString().orEmpty()
+        val grapheme = lastCompleteGraphemeBeforeCursor(before, DELETE_ONE_WINDOW_UNITS) ?: return
+        deleteValidatedSuffixBefore(input, grapheme)
     }
 
     private fun deleteWord(input: InputConnection) {
-        val selected = input.getSelectedText(0)
-        if (!selected.isNullOrEmpty()) {
-            input.commitText("", 1)
-            return
+        if (deleteSelectionIfPresent(input)) return
+        val before = input.getTextBeforeCursor(81, 0)?.toString().orEmpty()
+        val safeBefore = safeUtf16Suffix(before, 80) ?: return
+        val units = previousWordUnits(safeBefore)
+        val suffix = safeUtf16Suffix(safeBefore, units) ?: return
+        deleteValidatedSuffixBefore(input, suffix)
+    }
+
+    private fun deleteBefore(input: InputConnection, units: Int) {
+        if (units <= 0 || deleteSelectionIfPresent(input)) return
+        val probeSize = if (units == Int.MAX_VALUE) units else units + 1
+        val before = input.getTextBeforeCursor(probeSize, 0)?.toString().orEmpty()
+        val suffix = safeUtf16Suffix(before, units) ?: return
+        deleteValidatedSuffixBefore(input, suffix)
+    }
+
+    private fun deleteValidatedSuffixBefore(input: InputConnection, suffix: String) {
+        if (suffix.isEmpty() || hasUnpairedSurrogate(suffix)) return
+        val codePointCount = suffix.codePointCount(0, suffix.length)
+        val codePointResult = runCatching {
+            input.deleteSurroundingTextInCodePoints(codePointCount, 0)
         }
-        val before = input.getTextBeforeCursor(80, 0)?.toString().orEmpty()
-        val count = previousWordUnits(before)
-        if (count > 0) input.deleteSurroundingText(count, 0)
+        if (codePointResult.getOrNull() == true || codePointResult.isFailure) return
+        runCatching { input.deleteSurroundingText(suffix.length, 0) }
+    }
+
+    private fun deleteSelectionIfPresent(input: InputConnection): Boolean {
+        if (hasEditorSelection(input)) {
+            input.commitText("", 1)
+            return true
+        }
+        return false
+    }
+
+    private fun hasEditorSelection(input: InputConnection): Boolean {
+        val selected = runCatching { input.getSelectedText(0) }.getOrNull()
+        if (!selected.isNullOrEmpty()) return true
+        val extracted = runCatching { input.getExtractedText(ExtractedTextRequest(), 0) }.getOrNull()
+        return extracted != null &&
+            extracted.selectionStart >= 0 &&
+            extracted.selectionEnd >= 0 &&
+            extracted.selectionStart != extracted.selectionEnd
+    }
+
+    private fun restoreTypingSelection(input: InputConnection, selection: EditorTextSpan) {
+        runCatching { input.setSelection(selection.start, selection.end) }
     }
 }
 
@@ -363,3 +719,5 @@ fun extractHostScene(info: EditorInfo?, enter: EnterKind): HostScene {
     }
     return hostSceneOf(info?.packageName, hint, enter)
 }
+
+private const val DELETE_ONE_WINDOW_UNITS = 256

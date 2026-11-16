@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.cheng.keyboard.data.MAX_RECENT_CLIPS
 import dev.cheng.keyboard.data.clipboardPreviewText
+import dev.cheng.keyboard.data.clipboardItemsForDisplay
 import dev.cheng.keyboard.ime.KeyboardController
 import dev.cheng.keyboard.ime.UiState
 
@@ -59,9 +60,7 @@ internal fun ClipboardPanel(
     val clips = if (privateInput) {
         emptyList()
     } else {
-        (if (state.recentClips.isNotEmpty()) state.recentClips else listOfNotNull(state.clip))
-            .distinct()
-            .take(MAX_RECENT_CLIPS)
+        clipboardItemsForDisplay(state.clip, state.recentClips, MAX_RECENT_CLIPS)
     }
     var preview by remember(state.menu, state.engine.password, state.engine.noLearn) {
         mutableStateOf<String?>(null)
