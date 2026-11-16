@@ -42,9 +42,12 @@ import dev.cheng.keyboard.data.clipboardPreviewText
 import dev.cheng.keyboard.ime.KeyboardController
 import dev.cheng.keyboard.ime.UiState
 
-private val ClipboardPanelHeight = 196.dp
 private val ClipboardTileHeight = 40.dp
-private val ClipboardGridHeight = 132.dp
+private val ClipboardMinimumPanelHeight = 140.dp
+private val ClipboardMinimumContentHeight = ClipboardMinimumPanelHeight - 8.dp - 14.dp
+private val ClipboardEmptyContentHeight = 48.dp
+private val ClipboardTopPadding = 8.dp
+private val ClipboardBottomPadding = 14.dp
 
 @Composable
 internal fun ClipboardPanel(
@@ -78,50 +81,82 @@ internal fun ClipboardPanel(
         if (preview != null && preview !in clips) preview = null
     }
 
-    Box(
+    BoxWithConstraints(
         Modifier
             .fillMaxWidth()
-            .height(ClipboardPanelHeight)
-            .background(palette.sheet)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .background(palette.board)
+            .padding(horizontal = 4.dp, vertical = 0.dp)
+            .padding(top = ClipboardTopPadding, bottom = ClipboardBottomPadding),
     ) {
+        val fontScale = LocalDensity.current.fontScale
+        val minimumCellWidth = 104.dp * fontScale.coerceAtLeast(1f)
+        val columns = ((maxWidth.value + 6f) / (minimumCellWidth.value + 6f))
+            .toInt()
+            .coerceAtLeast(1)
+        val visibleRows = if (clips.isEmpty()) {
+            0
+        } else {
+            ((clips.size + columns - 1) / columns).coerceAtMost(3)
+        }
+        val gridHeight = when (visibleRows) {
+            0 -> ClipboardEmptyContentHeight
+            1 -> ClipboardTileHeight
+            2 -> ClipboardTileHeight * 2 + 6.dp
+            else -> ClipboardTileHeight * 3 + 12.dp
+        }
+        val headerHeight = if (fontScale >= 1.35f) {
+            maxOf(24.dp, 18.dp * fontScale)
+        } else {
+            24.dp
+        }
+        val contentHeight = maxOf(
+            headerHeight + 8.dp + gridHeight,
+            ClipboardMinimumContentHeight,
+        )
         val selected = preview
-        if (selected == null) {
-            Column(Modifier.fillMaxSize()) {
-                ClipboardHeader(
-                    count = clips.size,
-                    privateInput = privateInput,
-                    palette = palette,
-                )
-                Spacer(Modifier.height(8.dp))
-                when {
-                    privateInput || clips.isEmpty() -> Box(
-                        Modifier.fillMaxWidth().height(ClipboardGridHeight),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            if (privateInput) "当前输入不显示剪贴板" else "复制文字后，会显示在这里",
-                            color = palette.subtle,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Normal,
-                            textAlign = TextAlign.Center,
+        Box(Modifier.fillMaxWidth().height(contentHeight)) {
+            if (selected == null) {
+                Column(Modifier.fillMaxSize()) {
+                    ClipboardHeader(
+                        count = clips.size,
+                        privateInput = privateInput,
+                        palette = palette,
+                        height = headerHeight,
+                        fontScale = fontScale,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    when {
+                        privateInput || clips.isEmpty() -> Box(
+                            Modifier.fillMaxWidth().height(gridHeight),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                if (privateInput) "当前输入不显示剪贴板" else "复制文字后，会显示在这里",
+                                color = palette.subtle,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Normal,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                        else -> ClipboardGrid(
+                            clips = clips,
+                            palette = palette,
+                            columns = columns,
+                            height = gridHeight,
+                            onPaste = controller::pasteText,
+                            onPreview = { preview = it },
                         )
                     }
-                    else -> ClipboardGrid(
-                        clips = clips,
-                        palette = palette,
-                        onPaste = controller::pasteText,
-                        onPreview = { preview = it },
-                    )
                 }
+            } else {
+                ClipboardPreview(
+                    text = selected,
+                    palette = palette,
+                    height = contentHeight,
+                    onClose = { preview = null },
+                    onPaste = { controller.pasteText(selected) },
+                )
             }
-        } else {
-            ClipboardPreview(
-                text = selected,
-                palette = palette,
-                onClose = { preview = null },
-                onPaste = { controller.pasteText(selected) },
-            )
         }
     }
 }
@@ -131,64 +166,40 @@ private fun ClipboardHeader(
     count: Int,
     privateInput: Boolean,
     palette: Palette,
+    height: androidx.compose.ui.unit.Dp,
+    fontScale: Float,
 ) {
-    val fontScale = LocalDensity.current.fontScale
-    val hint = when {
+    val countLabel = when {
         privateInput -> "隐藏"
-        count == 0 -> "点按粘贴 · 长按查看"
-        else -> "$count 条 · 点按粘贴 · 长按查看"
+        else -> "${count}条"
     }
-    BoxWithConstraints(Modifier.fillMaxWidth().height(32.dp)) {
-        if (fontScale >= 1.35f) {
-            Text(
-                when {
-                    privateInput -> "最近剪贴板 · 隐藏"
-                    count == 0 -> "最近剪贴板"
-                    else -> "最近剪贴板 · $count 条"
-                },
-                color = palette.label,
-                fontSize = 14.sp,
-                lineHeight = 15.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                modifier = Modifier.align(Alignment.CenterStart),
-            )
-        } else if (maxWidth < 360.dp) {
-            Column(verticalArrangement = Arrangement.Center) {
-                Text(
-                    "最近剪贴板",
-                    color = palette.label,
-                    fontSize = 14.sp,
-                    lineHeight = 16.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                )
-                Text(
-                    hint,
-                    color = palette.subtle,
-                    fontSize = 10.5.sp,
-                    lineHeight = 12.sp,
-                    maxLines = 1,
-                )
-            }
-        } else {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "最近剪贴板",
-                    color = palette.label,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                )
-                Spacer(Modifier.weight(1f))
-                Text(
-                    hint,
-                    color = palette.subtle,
-                    fontSize = 10.5.sp,
-                    maxLines = 1,
-                )
-            }
-        }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(height)
+            .padding(horizontal = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            "最近剪贴板",
+            color = palette.subtle,
+            fontSize = 13.sp,
+            lineHeight = 16.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+        )
+        Spacer(Modifier.weight(1f))
+        Text(
+            if (fontScale >= 1.35f) {
+                countLabel
+            } else {
+                "$countLabel · 长按查看"
+            },
+            color = palette.subtle,
+            fontSize = 10.5.sp,
+            lineHeight = 13.sp,
+            maxLines = 1,
+        )
     }
 }
 
@@ -197,45 +208,40 @@ private fun ClipboardHeader(
 private fun ClipboardGrid(
     clips: List<String>,
     palette: Palette,
+    columns: Int,
+    height: androidx.compose.ui.unit.Dp,
     onPaste: (String) -> Unit,
     onPreview: (String) -> Unit,
 ) {
-    val fontScale = LocalDensity.current.fontScale.coerceAtLeast(1f)
-    BoxWithConstraints(Modifier.fillMaxWidth().height(ClipboardGridHeight)) {
-        val minimumCellWidth = 104.dp * fontScale
-        val columns = ((maxWidth.value + 6f) / (minimumCellWidth.value + 6f))
-            .toInt()
-            .coerceAtLeast(1)
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(columns),
-            modifier = Modifier.fillMaxSize(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            items(clips, key = { it }) { item ->
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(ClipboardTileHeight)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(palette.key)
-                        .combinedClickable(
-                            onClick = { onPaste(item) },
-                            onLongClick = { onPreview(item) },
-                        )
-                        .padding(horizontal = 10.dp),
-                    contentAlignment = Alignment.CenterStart,
-                ) {
-                    Text(
-                        clipboardPreviewText(item, maxCharacters = 5),
-                        color = palette.label,
-                        fontSize = 13.sp,
-                        lineHeight = 16.sp,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        softWrap = false,
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(columns),
+        modifier = Modifier.fillMaxWidth().height(height),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        items(clips, key = { it }) { item ->
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(ClipboardTileHeight)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(palette.key)
+                    .combinedClickable(
+                        onClick = { onPaste(item) },
+                        onLongClick = { onPreview(item) },
                     )
-                }
+                    .padding(horizontal = 10.dp),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                Text(
+                    clipboardPreviewText(item, maxCharacters = 5),
+                    color = palette.label,
+                    fontSize = 13.sp,
+                    lineHeight = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    softWrap = false,
+                )
             }
         }
     }
@@ -245,10 +251,11 @@ private fun ClipboardGrid(
 private fun ClipboardPreview(
     text: String,
     palette: Palette,
+    height: androidx.compose.ui.unit.Dp,
     onClose: () -> Unit,
     onPaste: () -> Unit,
 ) {
-    Column(Modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxWidth().height(height)) {
         Row(Modifier.fillMaxWidth().height(40.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(
                 "完整内容",

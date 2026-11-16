@@ -320,7 +320,12 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
         Modifier.fillMaxWidth().height(ToolbarHeight).padding(horizontal = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        ToolButton(palette, active = state.menu, onClick = controller::toggleMenu) {
+        ToolButton(
+            palette,
+            active = state.menu,
+            showActiveBackground = false,
+            onClick = controller::toggleMenu,
+        ) {
             ClipboardIcon(if (state.menu) palette.accent else palette.icon, Modifier.size(20.dp))
         }
         Box(
@@ -403,12 +408,8 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
                 }
             }
         }
-        val aiClusterShape = RoundedCornerShape(14.dp)
         Row(
             Modifier
-                .clip(aiClusterShape)
-                .background(palette.sheet)
-                .border(0.8.dp, palette.divider, aiClusterShape)
                 .alpha(if (aiEnabled) 1f else 0.38f)
                 .padding(horizontal = 2.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -443,6 +444,7 @@ private fun ToolButton(
     palette: Palette,
     enabled: Boolean = true,
     active: Boolean = false,
+    showActiveBackground: Boolean = true,
     compact: Boolean = false,
     onClick: () -> Unit,
     icon: @Composable () -> Unit,
@@ -452,7 +454,7 @@ private fun ToolButton(
             .height(if (compact) 32.dp else 36.dp)
             .widthIn(min = if (compact) 36.dp else 38.dp)
             .clip(RoundedCornerShape(10.dp))
-            .background(if (active) palette.accentSoft else Color.Transparent)
+            .background(if (active && showActiveBackground) palette.accentSoft else Color.Transparent)
             .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 4.dp),
         contentAlignment = Alignment.Center,
