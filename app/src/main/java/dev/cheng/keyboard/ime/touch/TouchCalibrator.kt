@@ -16,14 +16,16 @@ class TouchCalibrator {
         const val BASE_DY = 0.07f
         private const val ALPHA = 0.12f
         private const val MIN_SAMPLES = 3
+        private const val MAX_SAMPLES = 64
         private const val MAX_RESIDUAL = 0.35f
+        private const val AMBIGUOUS_PENALTY = 0.20f
         private const val PERSIST_EVERY = 20
     }
 
     fun load(left: Float, right: Float, dy: Float) {
-        learnedLeft = left.coerceIn(-0.06f, 0.06f)
-        learnedRight = right.coerceIn(-0.06f, 0.06f)
-        learnedDy = dy.coerceIn(-0.09f, 0.08f)
+        learnedLeft = (left.takeIf { it.isFinite() } ?: 0f).coerceIn(-0.06f, 0.06f)
+        learnedRight = (right.takeIf { it.isFinite() } ?: 0f).coerceIn(-0.06f, 0.06f)
+        learnedDy = (dy.takeIf { it.isFinite() } ?: 0f).coerceIn(-0.09f, 0.08f)
     }
 
     fun bias(isPrivate: Boolean): TouchBias = if (isPrivate) {
@@ -33,12 +35,16 @@ class TouchCalibrator {
     }
 
     fun record(sample: TouchSample) {
-        if (dirty) {
-            if (samples.isNotEmpty()) return
-            dirty = false
-        }
+        if (dirty || samples.size >= MAX_SAMPLES) return
+        val primary = sample.primary?.takeIf { it.isLetter() }?.lowercaseChar() ?: return
+        if (!sample.residualX.isFinite() || !sample.residualY.isFinite()) return
         if (abs(sample.residualX) > MAX_RESIDUAL) return
         if (abs(sample.residualY) > MAX_RESIDUAL) return
+        if (sample.alternatives.any {
+                it.ch.isLetter() && it.ch.lowercaseChar() != primary &&
+                    it.penalty.isFinite() && it.penalty <= AMBIGUOUS_PENALTY
+            }
+        ) return
         samples += sample
     }
 
@@ -47,10 +53,14 @@ class TouchCalibrator {
         samples.clear()
     }
 
+    fun discardPending() {
+        samples.clear()
+        dirty = false
+    }
+
     fun commitIfClean(): Boolean {
         if (dirty || samples.size < MIN_SAMPLES) {
-            samples.clear()
-            dirty = false
+            discardPending()
             return false
         }
         val left = samples.filter { it.leftSide }.map { it.residualX }
@@ -62,8 +72,7 @@ class TouchCalibrator {
         learnedLeft = learnedLeft.coerceIn(-0.06f, 0.06f)
         learnedRight = learnedRight.coerceIn(-0.06f, 0.06f)
         learnedDy = learnedDy.coerceIn(-0.09f, 0.08f)
-        samples.clear()
-        dirty = false
+        discardPending()
         commitsSinceSave++
         return true
     }
@@ -80,8 +89,7 @@ class TouchCalibrator {
         learnedLeft = 0f
         learnedRight = 0f
         learnedDy = 0f
-        samples.clear()
-        dirty = false
+        discardPending()
         commitsSinceSave = 0
     }
 

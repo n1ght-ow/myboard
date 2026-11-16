@@ -247,12 +247,16 @@ fun touchSampleOf(
     candidates.sortBy { it.penalty }
     val residualX = (x - primaryCx) / primaryPlaced.w.coerceAtLeast(1f)
     val residualY = (y - primaryCy) / primaryPlaced.h.coerceAtLeast(1f)
+    val hitResidualX = (px - primaryCx) / primaryPlaced.w.coerceAtLeast(1f)
+    val hitResidualY = (py - primaryCy) / primaryPlaced.h.coerceAtLeast(1f)
     return TouchSample(
         primary = primaryChar,
         alternatives = candidates.take(4),
         residualX = residualX,
         residualY = residualY,
         leftSide = x < boardWidth * 0.5f,
+        hitResidualX = hitResidualX,
+        hitResidualY = hitResidualY,
     )
 }
 

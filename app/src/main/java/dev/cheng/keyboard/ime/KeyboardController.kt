@@ -48,6 +48,7 @@ import dev.cheng.keyboard.ime.gesture.TapPreview
 import dev.cheng.keyboard.ime.layout.HitContext
 import dev.cheng.keyboard.ime.layout.NoPriors
 import dev.cheng.keyboard.ime.touch.TouchCalibrator
+import dev.cheng.keyboard.ime.touch.matchesTouchSpelling
 import dev.cheng.keyboard.model.Choice
 import dev.cheng.keyboard.model.KeyKind
 import dev.cheng.keyboard.model.KeyModel
@@ -169,6 +170,7 @@ class KeyboardController(
 
     fun hitContext(widthPx: Float, refKeyWidthPx: Float, refKeyHeightPx: Float): HitContext {
         val isPrivate = engineState.password || engineState.noLearn
+        val adaptive = !isPrivate && !engineState.uriOrEmail
         val priors = when {
             isPrivate || engineState.uriOrEmail -> NoPriors
             engineState.language == Language.English ->
@@ -178,11 +180,11 @@ class KeyboardController(
         }
         return HitContext(
             priors = priors,
-            composing = !isPrivate && (engineState.raw.isNotEmpty() || engineState.candidates.isNotEmpty()),
-            hasCandidates = !isPrivate && engineState.candidates.isNotEmpty(),
+            composing = adaptive && (engineState.raw.isNotEmpty() || engineState.candidates.isNotEmpty()),
+            hasCandidates = adaptive && engineState.candidates.isNotEmpty(),
             password = isPrivate,
             noLearn = engineState.noLearn,
-            bias = calibrator.bias(isPrivate),
+            bias = calibrator.bias(!adaptive),
             boardWidthPx = widthPx,
             refKeyWidthPx = refKeyWidthPx,
             refKeyHeightPx = refKeyHeightPx,
@@ -194,6 +196,7 @@ class KeyboardController(
         tapClearJob?.cancel()
         clipExpireJob?.cancel()
         noteClearJob?.cancel()
+        calibrator.discardPending()
         runCatching { clipboard?.removePrimaryClipChangedListener(clipListener) }
         client.cancel()
         db.close()
@@ -236,7 +239,7 @@ class KeyboardController(
             bridge.reset()
             lastComposingSpan = null
             candidateRaw = ""
-            calibrator.markDirty()
+            calibrator.discardPending()
         } else {
             engineState = engineState.copy(
                 password = traits.password,
@@ -373,7 +376,7 @@ class KeyboardController(
         gesture.cancel()
         alarmJob?.cancel()
         tapClearJob?.cancel()
-        calibrator.markDirty()
+        calibrator.discardPending()
         source = null
         update {
             it.copy(
@@ -401,9 +404,6 @@ class KeyboardController(
     fun onDown(key: KeyModel, x: Float, y: Float, time: Long, sample: TouchSample? = null) {
         tapClearJob?.cancel()
         update { it.copy(tapPreview = null) }
-        if (key.kind == KeyKind.Letter && !engineState.password && !engineState.noLearn) {
-            sample?.let(calibrator::record)
-        }
         val frame = gesture.down(key, x, y, time, sample?.neighborText.orEmpty(), sample)
         applyFrame(frame)
         schedule(time)
@@ -416,9 +416,6 @@ class KeyboardController(
         tapClearJob?.cancel()
         update { it.copy(tapPreview = null) }
         applyFrame(frames[0])
-        if (key.kind == KeyKind.Letter && !engineState.password && !engineState.noLearn) {
-            sample?.let(calibrator::record)
-        }
         applyFrame(frames[1])
         schedule(time)
         return true
@@ -438,6 +435,7 @@ class KeyboardController(
 
     fun onCancel() {
         alarmJob?.cancel()
+        calibrator.markDirty()
         val activePreview = state.tapPreview
         applyFrame(gesture.cancel())
         scheduleTapClear(activePreview)
@@ -1071,8 +1069,8 @@ class KeyboardController(
     private fun dispatch(act: EngineAct) {
         if (interceptAsk(act)) return
         if (needsChineseNow(act)) refreshChinese()
-        updateCalibrationForAction(act)
         val step = engine.reduce(engineState, act, enter)
+        updateCalibrationForAction(act, step)
         engineState = step.state
         if (act == EngineAct.Language && !engineState.uriOrEmail) {
             preferredLanguage = engineState.language
@@ -1126,8 +1124,12 @@ class KeyboardController(
         publish()
     }
 
-    private fun updateCalibrationForAction(act: EngineAct) {
-        val isPrivate = engineState.password || engineState.noLearn
+    private fun updateCalibrationForAction(act: EngineAct, step: dev.cheng.keyboard.engine.EngineStep) {
+        val isPrivate = engineState.password || engineState.noLearn || engineState.uriOrEmail
+        if (isPrivate) {
+            calibrator.discardPending()
+            return
+        }
         when (act) {
             EngineAct.Backspace,
             EngineAct.BackspaceWord,
@@ -1143,7 +1145,9 @@ class KeyboardController(
             EngineAct.Space,
             is EngineAct.Pick,
             EngineAct.Enter -> {
-                if (!isPrivate && calibrator.commitIfClean() && calibrator.shouldPersist()) {
+                if (!matchesTouchSpelling(engineState, act)) calibrator.markDirty()
+                val committed = step.state.raw.isEmpty() && step.cmds.any { it is Cmd.Commit }
+                if (committed && calibrator.commitIfClean() && calibrator.shouldPersist()) {
                     val (left, right, dy) = calibrator.snapshot()
                     calibrator.markPersisted()
                     scope.launch {
@@ -1155,7 +1159,14 @@ class KeyboardController(
                     }
                 }
             }
-            is EngineAct.Letter, is EngineAct.Candidates -> Unit
+            is EngineAct.Letter -> {
+                if (act.force != null) {
+                    calibrator.markDirty()
+                } else {
+                    act.sample?.takeIf { it.primary == act.ch.lowercaseChar() }?.let(calibrator::record)
+                }
+            }
+            is EngineAct.Candidates -> Unit
         }
     }
 

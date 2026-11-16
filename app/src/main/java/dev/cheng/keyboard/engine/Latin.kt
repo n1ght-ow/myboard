@@ -313,25 +313,29 @@ class LatinDecoder {
         for (bucket in bigrams.values) {
             if (bucket.remove(cleaned) != null) removedBigram = true
         }
-        val node = walk(cleaned)
-        if (node != null && removedExtra) {
-            node.freq = node.baseFreq
-            if (node.baseFreq == 0) node.word = null
+        if (removedExtra) {
+            restoreLearnedWords(listOf(cleaned))
+        }
+        if (removedExtra || removedBigram) {
             published++
         }
         return removedExtra || removedBigram
     }
 
     fun loadUser(words: List<Pair<String, Int>>) {
+        restoreLearnedWords(extra.keys.toList())
         extra.clear()
         extra.putAll(words)
         for ((word, freq) in words) insert(root, word, freq, isBase = false)
+        published++
     }
 
     fun clearUser() {
+        restoreLearnedWords(extra.keys.toList())
         extra.clear()
         bigrams.clear()
         seedDefaultBigrams()
+        published++
     }
 
     fun userWords(): List<Pair<String, Int>> = extra.entries.map { it.key to it.value }
@@ -525,6 +529,51 @@ class LatinDecoder {
         }
 
         return best
+    }
+
+    private fun restoreLearnedWords(words: Collection<String>) {
+        if (words.isEmpty()) return
+        val affectedDepth = HashMap<Node, Int>()
+
+        for (word in words) {
+            val path = ArrayList<Node>()
+            var node = root
+            path += node
+            var found = true
+            for (ch in word) {
+                val index = indexOf(ch)
+                if (index == null) {
+                    found = false
+                    break
+                }
+                val child = node.next[index]
+                if (child == null) {
+                    found = false
+                    break
+                }
+                node = child
+                path += node
+            }
+            if (!found) continue
+
+            val restoredWord = word.takeIf { node.baseFreq > 0 }
+            node.freq = node.baseFreq
+            node.word = restoredWord
+            for ((depth, pathNode) in path.withIndex()) {
+                val currentDepth = affectedDepth[pathNode]
+                if (currentDepth == null || depth > currentDepth) {
+                    affectedDepth[pathNode] = depth
+                }
+            }
+        }
+
+        for ((node, _) in affectedDepth.entries.sortedByDescending { it.value }) {
+            var best = node.freq
+            for (child in node.next) {
+                if (child != null && child.best > best) best = child.best
+            }
+            node.best = best
+        }
     }
 
     private fun insert(root: Node, word: String, freq: Int, isBase: Boolean) {

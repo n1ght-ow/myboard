@@ -42,6 +42,7 @@ class KeyGesture(
     private var downX = 0f
     private var downY = 0f
     private var downAt = 0L
+    private var gestureMoved = false
     private var armed = false
     private var flickChoice: Choice? = null
     private var cancelled = false
@@ -68,6 +69,7 @@ class KeyGesture(
         downX = x
         downY = y
         downAt = time
+        gestureMoved = false
         armed = false
         flickChoice = null
         cancelled = false
@@ -93,7 +95,7 @@ class KeyGesture(
 
     fun canRollover(): Boolean {
         val current = key ?: return false
-        if (!tracking || armed || flickChoice != null || spaceSliding || repeating || swiped) return false
+        if (!tracking || cancelled || armed || flickChoice != null || spaceSliding || repeating || swiped) return false
         return current.kind in setOf(
             KeyKind.Letter,
             KeyKind.Char,
@@ -130,6 +132,7 @@ class KeyGesture(
         if (!tracking) return idle()
         val dx = x - downX
         val dy = y - downY
+        if (abs(dx) > slopPx || abs(dy) > slopPx) gestureMoved = true
 
         if (current.kind == KeyKind.Backspace) {
             if (!swiped && dx <= -swipePx && abs(dy) <= swipePx * 1.4f) {
@@ -196,12 +199,17 @@ class KeyGesture(
                 return frame()
             }
 
-            val moved = abs(dx) > slopPx || abs(dy) > slopPx
-            val withinFastTapLock = elapsed < fastTapLockMs
-            if (moved && hit != null && hit.kind == KeyKind.Letter && hit.id != current.id && !withinFastTapLock) {
-                return down(hit, x, y, time, touchNeighbors, touchSample)
+            if (
+                gestureMoved &&
+                elapsed >= fastTapLockMs &&
+                hit != null &&
+                hit.kind == KeyKind.Letter &&
+                hit.id != current.id &&
+                entersTargetCore(touchSample)
+            ) {
+                return retarget(hit, touchNeighbors, touchSample)
             }
-            if (moved && hit?.id != current.id && abs(dy) > swipePx * 1.5f) cancelled = true
+            if (gestureMoved && hit?.id != current.id && abs(dy) > swipePx * 1.5f) cancelled = true
             if (hit?.id == current.id) cancelled = false
             return frame()
         }
@@ -214,6 +222,7 @@ class KeyGesture(
         val current = key
         if (!tracking || current == null) return idle()
         tracking = false
+        gestureMoved = false
         val flick = flickChoice
         val actions = when {
             cancelled -> emptyList()
@@ -236,6 +245,7 @@ class KeyGesture(
     fun cancel(): GestureFrame {
         tracking = false
         key = null
+        gestureMoved = false
         armed = false
         flickChoice = null
         spaceSliding = false
@@ -295,6 +305,28 @@ class KeyGesture(
             haptic = haptic,
         )
     }
+
+    private fun retarget(
+        target: KeyModel,
+        touchNeighbors: String,
+        touchSample: TouchSample?,
+    ): GestureFrame {
+        key = target
+        cancelled = false
+        choice = Choice.Symbol
+        downNeighbors = touchNeighbors.ifEmpty { touchSample?.neighborText.orEmpty() }
+        downSample = touchSample
+        return GestureFrame(
+            pressedId = target.id,
+            popup = null,
+            haptic = HapticKind.Step,
+            tapPreview = TapPreview(target.id, target.label),
+        )
+    }
+
+    private fun entersTargetCore(touchSample: TouchSample?): Boolean =
+        touchSample == null ||
+            (abs(touchSample.hitResidualX) <= 0.28f && abs(touchSample.hitResidualY) <= 0.30f)
 
     private fun preview(current: KeyModel, selected: Choice) = PopupPreview(
         keyId = current.id,

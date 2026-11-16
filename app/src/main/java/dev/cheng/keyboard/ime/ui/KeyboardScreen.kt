@@ -45,7 +45,6 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerEventPass
-import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.changedToDown
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -72,6 +71,9 @@ import dev.cheng.keyboard.ime.ResultKind
 import dev.cheng.keyboard.ime.UiState
 import dev.cheng.keyboard.ime.gesture.PopupPreview
 import dev.cheng.keyboard.ime.gesture.TapPreview
+import dev.cheng.keyboard.ime.gesture.KeyPointerChange
+import dev.cheng.keyboard.ime.gesture.KeyPointerTracker
+import dev.cheng.keyboard.ime.layout.HitContext
 import dev.cheng.keyboard.ime.layout.PlacedKey
 import dev.cheng.keyboard.ime.layout.hitKey
 import dev.cheng.keyboard.ime.layout.placeFloatingPopup
@@ -507,80 +509,50 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
             Modifier
                 .fillMaxWidth()
                 .height(with(density) { placement.height.toDp() })
-                .pointerInput(Unit) {
+                .pointerInput(controller, state.engine.page, state.engine.language, widthPx, heightPx) {
                     try {
                         awaitPointerEventScope {
-                            var activeId: PointerId? = null
-                            var pendingAdopt = false
+                            val pointers = KeyPointerTracker()
+                            var touchContext: HitContext? = null
+                            val pressContexts = mutableMapOf<Long, HitContext>()
                             while (true) {
                                 val event = awaitPointerEvent(PointerEventPass.Main)
                                 val keysNow = placementState.value.keys
-                                val ctxNow = controller.hitContext(
-                                    widthState.value,
-                                    refWidthState.value,
-                                    heightState.value,
-                                )
-                                val downs = event.changes.filter { it.changedToDown() }
-                                if (activeId == null) {
-                                    val down = downs.firstOrNull()
-                                        ?: if (pendingAdopt) event.changes.firstOrNull { it.pressed } else null
-                                    if (down == null) {
-                                        pendingAdopt = false
-                                        continue
+                                val time = event.changes.firstOrNull()?.uptimeMillis ?: SystemClock.uptimeMillis()
+                                fun press(pointer: KeyPointerChange, rollover: Boolean): Boolean {
+                                    val ctx = pressContexts.getOrPut(pointer.id) {
+                                        controller.hitContext(widthState.value, refWidthState.value, heightState.value)
                                     }
-                                    pendingAdopt = false
-                                    val hit = hitKey(keysNow, down.position.x, down.position.y, ctxNow) ?: continue
-                                    controller.onDown(
-                                        hit.model,
-                                        down.position.x,
-                                        down.position.y,
-                                        SystemClock.uptimeMillis(),
-                                        touchSampleOf(keysNow, down.position.x, down.position.y, hit.model, ctxNow),
-                                    )
-                                    down.consume()
-                                    activeId = down.id
-                                    continue
-                                }
-                                val second = downs.firstOrNull { it.id != activeId && it.pressed }
-                                if (second != null) {
-                                    val hit = hitKey(keysNow, second.position.x, second.position.y, ctxNow)
-                                    if (hit != null) {
-                                        val switched = controller.onRollover(
-                                            hit.model,
-                                            second.position.x,
-                                            second.position.y,
-                                            SystemClock.uptimeMillis(),
-                                            touchSampleOf(keysNow, second.position.x, second.position.y, hit.model, ctxNow),
-                                        )
-                                        if (switched) activeId = second.id
+                                    val hit = hitKey(keysNow, pointer.x, pointer.y, ctx) ?: return false
+                                    val sample = touchSampleOf(keysNow, pointer.x, pointer.y, hit.model, ctx)
+                                    return if (rollover) {
+                                        controller.onRollover(hit.model, pointer.x, pointer.y, pointer.time, sample)
+                                            .also { if (it) touchContext = ctx }
+                                    } else {
+                                        controller.onDown(hit.model, pointer.x, pointer.y, pointer.time, sample)
+                                        touchContext = ctx
+                                        true
                                     }
-                                    second.consume()
                                 }
-                                val active = event.changes.firstOrNull { it.id == activeId }
-                                if (active == null) {
-                                    controller.onCancel()
-                                    activeId = null
-                                    pendingAdopt = false
-                                    continue
-                                }
-                                if (!active.pressed) {
-                                    controller.onUp(SystemClock.uptimeMillis())
-                                    activeId = null
-                                    pendingAdopt = event.changes.any { it.id != active.id && it.pressed }
-                                    active.consume()
-                                    continue
-                                }
-                                val current = hitKey(keysNow, active.position.x, active.position.y, ctxNow)
-                                controller.onMove(
-                                    active.position.x,
-                                    active.position.y,
-                                    SystemClock.uptimeMillis(),
-                                    current?.model,
-                                    current?.let {
-                                        touchSampleOf(keysNow, active.position.x, active.position.y, it.model, ctxNow)
+                                pointers.process(
+                                    changes = event.changes.map {
+                                        KeyPointerChange(it.id.value, it.pressed, it.changedToDown(), it.position.x, it.position.y, it.uptimeMillis)
                                     },
+                                    onDown = { press(it, false) },
+                                    onRollover = { press(it, true) },
+                                    onMove = { pointer ->
+                                        val ctx = touchContext ?: controller.hitContext(widthState.value, refWidthState.value, heightState.value)
+                                        val hit = hitKey(keysNow, pointer.x, pointer.y, ctx)
+                                        controller.onMove(
+                                            pointer.x, pointer.y, pointer.time, hit?.model,
+                                            hit?.let { touchSampleOf(keysNow, pointer.x, pointer.y, it.model, ctx) },
+                                        )
+                                    },
+                                    onUp = { controller.onUp(time); touchContext = null },
+                                    onCancel = { controller.onCancel(); touchContext = null },
                                 )
-                                active.consume()
+                                pressContexts.keys.retainAll(event.changes.filter { it.pressed }.map { it.id.value }.toSet())
+                                event.changes.forEach { it.consume() }
                             }
                         }
                     } catch (cancelled: CancellationException) {

@@ -619,10 +619,10 @@ class PinyinDecoder(syllables: Set<String>) {
             topBodyFreq <= 5_000_000 &&
             !cleanOpenCompletion
         val strongFuzzyRepair = fuzzy && book.strongFuzzyRepair(body, letters)
+        val hasInformativeTouch = hasInformativeTouchCandidates(letters, touchHints, touchSamples)
         val weakBoundaryComposition = !keepWritten &&
             !fuzzy &&
-            touchHints.isEmpty() &&
-            touchSamples.isEmpty() &&
+            !hasInformativeTouch &&
             solid &&
             solidExactWord == null &&
             !cleanOpenCompletion &&
@@ -631,14 +631,12 @@ class PinyinDecoder(syllables: Set<String>) {
             topBodyFreq <= 5_000_000
         val highFrequencyBoundaryComposition = !keepWritten &&
             !fuzzy &&
-            touchHints.isEmpty() &&
-            touchSamples.isEmpty() &&
+            !hasInformativeTouch &&
             solidExactWord == null &&
             !cleanOpenCompletion &&
             letters.length in 4..18 &&
             (body.firstOrNull()?.pieces ?: 1) >= 2 &&
             topBodyFreq > 5_000_000
-        val canUseStructuralRepairs = weakBoundaryComposition || highFrequencyBoundaryComposition
         val shouldTryTypos = when {
             letters.length !in 2..22 -> false
             strongFuzzyRepair -> false
@@ -652,20 +650,41 @@ class PinyinDecoder(syllables: Set<String>) {
             !solid && letters.length >= 3 && !book.hasMultiAbbrevInitials(letters, wholeAbbrev) -> true
             else -> false
         }
-        val structuralRepairs = if (canUseStructuralRepairs) {
-            book.weakStructuralRepairs(letters, 400_000)
-        } else {
-            emptyList()
+        val fragmentedBoundaryComposition = !shouldTryTypos &&
+            !weakBoundaryComposition &&
+            !highFrequencyBoundaryComposition &&
+            !keepWritten &&
+            !fuzzy &&
+            !hasInformativeTouch &&
+            solidExactWord == null &&
+            !solid &&
+            open.any { it.parts.size >= 2 } &&
+            (body.firstOrNull()?.pieces ?: 1) >= 2 &&
+            !hasCleanOpenedCompletion &&
+            !hasStrongExactAbbrev &&
+            letters.length in 4..18
+        val structuralRepairs = when {
+            weakBoundaryComposition || highFrequencyBoundaryComposition ->
+                book.weakStructuralRepairs(letters, 400_000, terminalFallback = false)
+            fragmentedBoundaryComposition ->
+                book.weakStructuralRepairs(letters, 400_000, terminalFallback = true)
+            else -> emptyList()
         }
         val structuralBest = structuralRepairs.firstOrNull()
         if (structuralBest != null) {
-            val withoutStructural = body.filter { it.text != structuralBest.text }
-            body = if (highFrequencyBoundaryComposition && !weakBoundaryComposition) {
-                withoutStructural.toMutableList().also { items ->
-                    items.add(minOf(1, items.size), structuralBest)
+            val alreadyVisibleFragmentRepair = fragmentedBoundaryComposition &&
+                body.take(5).any { it.text == structuralBest.text }
+            if (!alreadyVisibleFragmentRepair) {
+                val withoutStructural = body.filter { it.text != structuralBest.text }
+                val exposeAfterBest = (highFrequencyBoundaryComposition && !weakBoundaryComposition) ||
+                    fragmentedBoundaryComposition
+                body = if (exposeAfterBest) {
+                    withoutStructural.toMutableList().also { items ->
+                        items.add(minOf(1, items.size), structuralBest)
+                    }
+                } else {
+                    listOf(structuralBest) + withoutStructural
                 }
-            } else {
-                listOf(structuralBest) + withoutStructural
             }
         }
         if (shouldTryTypos && structuralBest == null) {
@@ -1715,62 +1734,90 @@ class PinyinDecoder(syllables: Set<String>) {
             return rank(items)
         }
 
-        fun weakStructuralRepairs(letters: String, minFreq: Int): List<Scored> {
+        fun weakStructuralRepairs(
+            letters: String,
+            minFreq: Int,
+            terminalFallback: Boolean = false,
+        ): List<Scored> {
             val duplicate = interiorDuplicateRepairs(letters, minFreq)
             if (duplicate.isNotEmpty()) return duplicate
 
             val swaps = boundarySwapRepairs(letters, minFreq)
             if (swaps.isNotEmpty()) return swaps
 
-            return boundaryInitialRepairs(letters, minFreq)
+            return boundaryInitialRepairs(letters, minFreq, terminalFallback)
         }
 
-        private fun boundaryInitialRepairs(letters: String, minFreq: Int): List<Scored> {
+        private fun boundaryInitialRepairs(
+            letters: String,
+            minFreq: Int,
+            terminalFallback: Boolean,
+        ): List<Scored> {
             if (letters.length !in 4..18) return emptyList()
             val lattice = buildLattice(letters, trie)
-            val positions = (2 until letters.lastIndex)
+            val eligiblePositions = (2..letters.lastIndex)
                 .filter { index ->
                     lattice[index].any { path -> path.parts.isNotEmpty() && path.parts.all { it.length >= 2 } } &&
                         canAddInitialAt(letters, index)
                 }
-                .take(5)
-            if (positions.isEmpty()) return emptyList()
+            val terminalPositions = eligiblePositions.filter { it == letters.lastIndex }
+            val regularPositions = eligiblePositions.filter { it != letters.lastIndex }
+            val positions = when {
+                terminalFallback && terminalPositions.isNotEmpty() -> regularPositions.take(4)
+                else -> regularPositions.take(5)
+            }
+            if (positions.isEmpty() && (!terminalFallback || terminalPositions.isEmpty())) return emptyList()
 
             val items = ArrayList<Scored>()
             val seen = HashSet<String>()
             for (pos in positions) {
-                for (row in lexicon.prefixed(letters.substring(0, pos), 64)) {
-                    if (row.freq < minFreq || row.letters.length != letters.length + 1) continue
-                    if (row.letters.removeRange(pos, pos + 1) != letters) continue
-                    if (row.letters[pos] in "aeiouv" || !seen.add(row.text)) continue
-                    val parts = row.syllables.split(' ')
-                    if (parts.size !in 2..6 || parts.any { it.length < 2 }) continue
-                    if (parts.joinToString("") != row.letters) continue
-
-                    var syllableStart = 0
-                    var startsInsertedSyllable = false
-                    for (part in parts) {
-                        if (syllableStart == pos) {
-                            startsInsertedSyllable = true
-                            break
-                        }
-                        syllableStart += part.length
-                    }
-                    if (!startsInsertedSyllable) continue
-
-                    val count = row.text.codePointCount(0, row.text.length)
-                    if (count !in 2..6) continue
-                    val rawPenalty = parts.size * 3.6
-                    items += scored(
-                        row,
-                        wordScore(row.text, row.freq) - rawPenalty,
-                        letters,
-                        true,
-                        letters.length,
-                    )
+                addInitialInsertionsAt(letters, pos, minFreq, seen, items)
+            }
+            if (items.isEmpty() && terminalFallback) {
+                for (pos in terminalPositions) {
+                    addInitialInsertionsAt(letters, pos, minFreq, seen, items)
                 }
             }
             return rank(items).take(4)
+        }
+
+        private fun addInitialInsertionsAt(
+            letters: String,
+            pos: Int,
+            minFreq: Int,
+            seen: MutableSet<String>,
+            items: MutableList<Scored>,
+        ) {
+            for (row in lexicon.prefixed(letters.substring(0, pos), 64)) {
+                if (row.freq < minFreq || row.letters.length != letters.length + 1) continue
+                if (row.letters.removeRange(pos, pos + 1) != letters) continue
+                if (row.letters[pos] in "aeiouv" || !seen.add(row.text)) continue
+                val parts = row.syllables.split(' ')
+                if (parts.size !in 2..6 || parts.any { it.length < 2 }) continue
+                if (parts.joinToString("") != row.letters) continue
+
+                var syllableStart = 0
+                var startsInsertedSyllable = false
+                for (part in parts) {
+                    if (syllableStart == pos) {
+                        startsInsertedSyllable = true
+                        break
+                    }
+                    syllableStart += part.length
+                }
+                if (!startsInsertedSyllable) continue
+
+                val count = row.text.codePointCount(0, row.text.length)
+                if (count !in 2..6) continue
+                val rawPenalty = parts.size * 3.6
+                items += scored(
+                    row,
+                    wordScore(row.text, row.freq) - rawPenalty,
+                    letters,
+                    true,
+                    letters.length,
+                )
+            }
         }
 
         fun insertionRepairs(letters: String, minFreq: Int = 10_000): List<Scored> {
@@ -2794,6 +2841,24 @@ private fun editCost(
     if (!skipped && leftover == 1) return 1 to 1f
     if (skipped && leftover == 0) return 1 to 1f
     return null
+}
+
+private fun hasInformativeTouchCandidates(
+    letters: String,
+    touchHints: List<String>,
+    touchSamples: List<TouchSample?>,
+): Boolean {
+    for (index in letters.indices) {
+        val typed = letters[index]
+        val legacyAlternative = touchHints.getOrNull(index).orEmpty()
+            .any { it.lowercaseChar() in 'a'..'z' && it.lowercaseChar() != typed }
+        if (legacyAlternative) return true
+
+        val sampleAlternative = touchSamples.getOrNull(index)?.alternatives.orEmpty()
+            .any { it.ch.lowercaseChar() in 'a'..'z' && it.ch.lowercaseChar() != typed }
+        if (sampleAlternative) return true
+    }
+    return false
 }
 
 private fun adjacentKey(left: Char, right: Char): Boolean {

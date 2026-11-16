@@ -53,6 +53,8 @@ data class TouchSample(
     val residualX: Float = 0f,
     val residualY: Float = 0f,
     val leftSide: Boolean = false,
+    val hitResidualX: Float = residualX,
+    val hitResidualY: Float = residualY,
 ) {
     val neighborText: String get() = alternatives.joinToString("") { it.ch.toString() }
 
