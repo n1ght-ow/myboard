@@ -615,7 +615,7 @@ class KeyboardController(
     fun pasteText(text: String) {
         if (text.isEmpty()) return
         clipExpireJob?.cancel()
-        dispatch(EngineAct.Direct(text))
+        dispatch(EngineAct.Paste(text))
         update { it.copy(menu = false, freshClip = null) }
     }
 
@@ -1257,7 +1257,8 @@ class KeyboardController(
             }
             bridge.apply(
                 step.cmds,
-                smartCommit = shouldUseSmartCommit(engineState.password, engineState.uriOrEmail || engineState.literalContext),
+                smartCommit = act !is EngineAct.Paste &&
+                    shouldUseSmartCommit(engineState.password, engineState.uriOrEmail || engineState.literalContext),
             )
             if (engineState.raw.isEmpty()) lastComposingSpan = null
         } else {
@@ -1317,6 +1318,7 @@ class KeyboardController(
             EngineAct.Backspace,
             EngineAct.BackspaceWord,
             is EngineAct.Direct,
+            is EngineAct.Paste,
             is EngineAct.MoveCursor,
             EngineAct.Language,
             is EngineAct.Page -> calibrator.markDirty()
@@ -1385,6 +1387,7 @@ class KeyboardController(
             null -> if (engineState.shift == ShiftState.Off) act.ch.lowercaseChar().toString() else act.ch.uppercaseChar().toString()
         }
         is EngineAct.Direct -> current + act.text
+        is EngineAct.Paste -> current + act.text
         EngineAct.Space -> "$current "
         EngineAct.Backspace -> current.dropLast(1)
         EngineAct.BackspaceWord -> ""
@@ -1394,7 +1397,7 @@ class KeyboardController(
     private fun needsChineseNow(act: EngineAct): Boolean {
         if (engineState.language != Language.Chinese || engineState.raw.isEmpty() || engineState.password || engineState.literalContext) return false
         return when (act) {
-            EngineAct.Space, EngineAct.Enter, is EngineAct.Direct, is EngineAct.Pick -> true
+            EngineAct.Space, EngineAct.Enter, is EngineAct.Direct, is EngineAct.Paste, is EngineAct.Pick -> true
             is EngineAct.Letter -> act.force == Choice.Symbol || act.force == Choice.Upper ||
                 (act.force == null && engineState.shift != ShiftState.Off)
             else -> false
@@ -1557,7 +1560,8 @@ class KeyboardController(
 
     private fun refreshLiteralAddressContext() {
         val traits = activeInfo?.let(::fieldTraitsOf)
-        val allowed = inputActive && traits != null && !traits.password && !traits.noLearn &&
+        // A no-learning field still needs literal address entry; helper suggestions remain suppressed.
+        val allowed = inputActive && traits != null && !traits.password &&
             !traits.numeric && !traits.uriOrEmail && state.overlay == Overlay.None
         val before = if (allowed) {
             runCatching { connection()?.getTextBeforeCursor(320, 0)?.toString() }.getOrNull()

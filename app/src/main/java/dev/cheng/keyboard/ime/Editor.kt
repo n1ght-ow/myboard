@@ -223,8 +223,9 @@ fun fieldSourceFromExtractedText(
     if (start != end) {
         val from = minOf(start, end)
         val to = maxOf(start, end)
+        if (to - from > MAX_FIELD_SOURCE_UNITS) return null
         return FieldSource(
-            text = text.substring(from, to).take(4000),
+            text = text.substring(from, to),
             selection = true,
             start = absoluteEditorPosition(from, startOffset) ?: return null,
             end = absoluteEditorPosition(to, startOffset) ?: return null,
@@ -319,6 +320,13 @@ fun smartCommitNeedsContext(
 fun shouldUseSmartCommit(password: Boolean, uriOrEmail: Boolean): Boolean =
     !password && !uriOrEmail
 
+fun smartCommitTextAfterDelete(
+    originalText: String,
+    resolvedText: String,
+    requiresDelete: Boolean,
+    deleteApplied: Boolean,
+): String = if (requiresDelete && !deleteApplied) originalText else resolvedText
+
 fun cursorPositionAfterMove(
     text: String,
     selectionEnd: Int,
@@ -368,7 +376,9 @@ fun lastCompleteGraphemeBeforeCursor(text: String, maxUtf16Units: Int): String? 
 }
 
 fun readField(connection: InputConnection): FieldSource? {
-    val extracted = connection.getExtractedText(extractedRequest(), 0)
+    val extracted = runCatching {
+        connection.getExtractedText(extractedRequest(), 0)
+    }.getOrNull()
     if (extracted?.text != null && extracted.startOffset >= 0) {
         val source = fieldSourceFromExtractedText(
             text = extracted.text.toString(),
@@ -378,7 +388,9 @@ fun readField(connection: InputConnection): FieldSource? {
         )
         if (source != null) return source
     }
-    val selected = connection.getSelectedText(0)?.toString()
+    val selected = runCatching {
+        connection.getSelectedText(0)?.toString()
+    }.getOrNull()
     if (!selected.isNullOrEmpty()) {
         return FieldSource(
             text = selected.take(4000),
@@ -389,8 +401,12 @@ fun readField(connection: InputConnection): FieldSource? {
             contextAfter = "",
         )
     }
-    val before = connection.getTextBeforeCursor(4000, 0)?.toString()
-    val after = connection.getTextAfterCursor(4000, 0)?.toString()
+    val before = runCatching {
+        connection.getTextBeforeCursor(4000, 0)?.toString()
+    }.getOrNull()
+    val after = runCatching {
+        connection.getTextAfterCursor(4000, 0)?.toString()
+    }.getOrNull()
     if (before == null && after == null) return null
     return paragraphSource(before.orEmpty() + after.orEmpty(), before.orEmpty().length, 0)
         ?.copy(start = -1, end = -1)
@@ -619,12 +635,31 @@ class EditorBridge(private val connection: () -> InputConnection?) {
         )
         val hasSelection = mayNeedContext && hasEditorSelection(input)
         val needContext = smartCommitNeedsContext(hasSelection, composing, text)
-        val before = if (needContext) input.getTextBeforeCursor(120, 0)?.toString().orEmpty() else ""
-        val smart = resolveSmartCommit(before, text, composing)
-        if (smart.deleteBefore > 0) {
-            input.deleteSurroundingText(smart.deleteBefore, 0)
+        val before = if (needContext) {
+            runCatching {
+                input.getTextBeforeCursor(120, 0)?.toString().orEmpty()
+            }.getOrDefault("")
+        } else {
+            ""
         }
-        input.commitText(smart.text, 1)
+        val smart = resolveSmartCommit(before, text, composing)
+        val deleteApplied = if (smart.deleteBefore > 0) {
+            runCatching {
+                input.deleteSurroundingText(smart.deleteBefore, 0)
+            }.getOrNull() ?: return
+        } else {
+            true
+        }
+        val commitText = smartCommitTextAfterDelete(
+            originalText = text,
+            resolvedText = smart.text,
+            requiresDelete = smart.deleteBefore > 0,
+            deleteApplied = deleteApplied,
+        )
+        val committed = runCatching {
+            input.commitText(commitText, 1)
+        }.getOrDefault(false)
+        if (!committed) return
         if (smart.cursorOffsetBack > 0) {
             moveCursor(input, -smart.cursorOffsetBack)
         }
@@ -632,7 +667,10 @@ class EditorBridge(private val connection: () -> InputConnection?) {
 
     private fun moveCursor(input: InputConnection, delta: Int) {
         if (delta == 0) return
-        val extracted = input.getExtractedText(ExtractedTextRequest(), 0)
+        if (delta == Int.MIN_VALUE) return
+        val extracted = runCatching {
+            input.getExtractedText(ExtractedTextRequest(), 0)
+        }.getOrNull()
         if (extracted?.text != null && extracted.selectionEnd >= 0) {
             val content = extracted.text.toString()
             val position = cursorPositionAfterMove(
@@ -642,27 +680,35 @@ class EditorBridge(private val connection: () -> InputConnection?) {
                 delta = delta,
             )
             if (position != null) {
-                input.setSelection(position, position)
-                return
+                val moved = runCatching {
+                    input.setSelection(position, position)
+                }.getOrDefault(false)
+                if (moved) return
             }
         }
         val code = if (delta < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
         repeat(abs(delta)) {
-            input.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
-            input.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+            runCatching {
+                input.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+                input.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+            }
         }
     }
 
     private fun deleteOne(input: InputConnection) {
         if (deleteSelectionIfPresent(input)) return
-        val before = input.getTextBeforeCursor(DELETE_ONE_WINDOW_UNITS, 0)?.toString().orEmpty()
+        val before = runCatching {
+            input.getTextBeforeCursor(DELETE_ONE_WINDOW_UNITS, 0)?.toString().orEmpty()
+        }.getOrDefault("")
         val grapheme = lastCompleteGraphemeBeforeCursor(before, DELETE_ONE_WINDOW_UNITS) ?: return
         deleteValidatedSuffixBefore(input, grapheme)
     }
 
     private fun deleteWord(input: InputConnection) {
         if (deleteSelectionIfPresent(input)) return
-        val before = input.getTextBeforeCursor(81, 0)?.toString().orEmpty()
+        val before = runCatching {
+            input.getTextBeforeCursor(81, 0)?.toString().orEmpty()
+        }.getOrDefault("")
         val safeBefore = safeUtf16Suffix(before, 80) ?: return
         val units = previousWordUnits(safeBefore)
         val suffix = safeUtf16Suffix(safeBefore, units) ?: return
@@ -672,7 +718,9 @@ class EditorBridge(private val connection: () -> InputConnection?) {
     private fun deleteBefore(input: InputConnection, units: Int) {
         if (units <= 0 || deleteSelectionIfPresent(input)) return
         val probeSize = if (units == Int.MAX_VALUE) units else units + 1
-        val before = input.getTextBeforeCursor(probeSize, 0)?.toString().orEmpty()
+        val before = runCatching {
+            input.getTextBeforeCursor(probeSize, 0)?.toString().orEmpty()
+        }.getOrDefault("")
         val suffix = safeUtf16Suffix(before, units) ?: return
         deleteValidatedSuffixBefore(input, suffix)
     }
@@ -689,7 +737,7 @@ class EditorBridge(private val connection: () -> InputConnection?) {
 
     private fun deleteSelectionIfPresent(input: InputConnection): Boolean {
         if (hasEditorSelection(input)) {
-            input.commitText("", 1)
+            runCatching { input.commitText("", 1) }
             return true
         }
         return false
@@ -709,6 +757,8 @@ class EditorBridge(private val connection: () -> InputConnection?) {
         runCatching { input.setSelection(selection.start, selection.end) }
     }
 }
+
+private const val MAX_FIELD_SOURCE_UNITS = 4000
 
 fun extractHostScene(info: EditorInfo?, enter: EnterKind): HostScene {
     val traits = info?.let(::fieldTraitsOf)

@@ -55,6 +55,7 @@ sealed interface EngineAct {
         val sample: TouchSample? = null,
     ) : EngineAct
     data class Direct(val text: String) : EngineAct
+    data class Paste(val text: String) : EngineAct
     data object Space : EngineAct
     data object Backspace : EngineAct
     data object BackspaceWord : EngineAct
@@ -79,6 +80,7 @@ class InputEngine(private val latin: LatinDecoder) {
         return when (act) {
             is EngineAct.Letter -> letter(state, act)
             is EngineAct.Direct -> direct(state, act.text)
+            is EngineAct.Paste -> paste(state, act.text)
             EngineAct.Space -> space(state)
             EngineAct.Backspace -> backspace(state)
             EngineAct.BackspaceWord -> backspaceWord(state)
@@ -231,6 +233,19 @@ class InputEngine(private val latin: LatinDecoder) {
                 touchSamples = emptyList(),
             ),
             pending.second + Cmd.Commit(text),
+        )
+    }
+
+    private fun paste(state: EngineState, text: String): EngineStep {
+        if (text.isEmpty()) return EngineStep(state)
+        val pendingCommands = when {
+            state.raw.isEmpty() -> emptyList()
+            state.password || state.uriOrEmail || state.literalContext -> listOf(Cmd.Commit(state.raw))
+            else -> takePending(state).second
+        }
+        return EngineStep(
+            literalFinishedState(state, state.shift),
+            pendingCommands + Cmd.Commit(text),
         )
     }
 
