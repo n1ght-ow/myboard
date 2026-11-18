@@ -337,12 +337,35 @@ fun cursorPositionAfterMove(
     if (hasSplitUtf16Boundary(text, startOffset)) return null
     if (!isUtf16Boundary(text, selectionEnd)) return null
     if (delta == Int.MIN_VALUE) return null
-    var local = selectionEnd
-    val direction = if (delta > 0) 1 else -1
-    repeat(abs(delta)) {
-        local = runCatching { text.offsetByCodePoints(local, direction) }.getOrNull() ?: return null
+    if (delta == 0) return absoluteEditorPosition(selectionEnd, startOffset)
+    val steps = abs(delta)
+    if (steps > text.length) return null
+
+    val asciiTarget = selectionEnd.toLong() + delta
+    if (asciiTarget in 0L..text.length.toLong()) {
+        val target = asciiTarget.toInt()
+        val left = (minOf(selectionEnd, target) - 1).coerceAtLeast(0)
+        val right = maxOf(selectionEnd, target).coerceAtMost(text.lastIndex)
+        if ((left..right).all { index -> text[index] in ' '..'~' }) {
+            return absoluteEditorPosition(target, startOffset)
+        }
     }
-    return absoluteEditorPosition(local, startOffset)
+
+    val clusters = GRAPHEME_CLUSTER.findAll(text)
+    val target = if (delta > 0) {
+        clusters.map { it.range.last + 1 }.filter { it > selectionEnd }.drop(steps - 1).firstOrNull()
+    } else {
+        val previous = IntArray(steps)
+        var count = 0
+        for (cluster in clusters) {
+            val start = cluster.range.first
+            if (start >= selectionEnd) break
+            previous[count % steps] = start
+            count++
+        }
+        if (count < steps) null else previous[(count - steps) % steps]
+    }
+    return target?.let { absoluteEditorPosition(it, startOffset) }
 }
 
 fun safeUtf16Suffix(text: String, maxUnits: Int): String? {
@@ -567,9 +590,13 @@ class EditorBridge(private val connection: () -> InputConnection?) {
     ) {
         val input = connection() ?: return
         val range = composition.ordered()
-        val extracted = input.getExtractedText(extractedRequest(), 0)
+        val extractedResult = runCatching {
+            input.getExtractedText(extractedRequest(), 0)
+        }
+        val extracted = extractedResult.getOrNull()
         val document = extracted?.text?.toString()
-        val rangeMatches = range.start >= 0 &&
+        val rangeMatches = extractedResult.isSuccess &&
+            range.start >= 0 &&
             range.end > range.start &&
             (
                 extracted == null ||
@@ -585,16 +612,38 @@ class EditorBridge(private val connection: () -> InputConnection?) {
                 )
         var replacementLength = range.end - range.start
         val replacement = candidate?.takeIf { rangeMatches }
+        var replacementApplied = false
         if (replacement != null) {
-            input.setSelection(range.start, range.end)
-            input.commitText(replacement, 1)
-            replacementLength = replacement.length
-        } else {
-            input.finishComposingText()
+            val selected = runCatching {
+                input.setSelection(range.start, range.end)
+            }.getOrDefault(false)
+            if (selected) {
+                val committed = runCatching {
+                    input.commitText(replacement, 1)
+                }.getOrDefault(false)
+                if (committed) {
+                    replacementApplied = true
+                    replacementLength = replacement.length
+                }
+            }
+        }
+        if (!replacementApplied) {
+            runCatching { input.finishComposingText() }
         }
         composing = false
-        val restored = remapSelectionAfterReplacement(selection, range, replacementLength)
-        input.setSelection(restored.start, restored.end)
+        val restored = if (replacementApplied) {
+            remapSelectionAfterReplacement(selection, range, replacementLength)
+        } else {
+            selection
+        }
+        runCatching { input.setSelection(restored.start, restored.end) }
+    }
+
+    fun commitPaste(text: String): Boolean {
+        val input = connection() ?: return false
+        if (!runCatching { input.commitText(text, 1) }.getOrDefault(false)) return false
+        composing = false
+        return true
     }
 
     fun apply(cmds: List<Cmd>, smartCommit: Boolean = true) {

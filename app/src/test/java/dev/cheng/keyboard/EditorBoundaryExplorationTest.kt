@@ -128,12 +128,28 @@ class EditorBoundaryExplorationTest {
     }
 
     @Test
-    fun cursorMovementAddsPartialOffsetAndMovesByCodePoint() {
+    fun cursorMovementAddsPartialOffsetAndKeepsSurrogatesTogether() {
         assertEquals(101, cursorPositionAfterMove("A😀B", 3, 100, -1))
         assertEquals(104, cursorPositionAfterMove("A😀B", 3, 100, 1))
         assertNull(cursorPositionAfterMove("A😀B", 2, 100, 1))
         assertNull(cursorPositionAfterMove("A😀B", 3, Int.MAX_VALUE, 1))
         assertNull(cursorPositionAfterMove("A😀B", 0, 100, -1))
+    }
+
+    @Test
+    fun cursorMovementCrossesWholeGraphemesInEitherDirection() {
+        for (cluster in listOf("👨‍👩‍👧‍👦", "🇨🇳", "e\u0301", "👍🏽", "\r\n")) {
+            val document = "A${cluster}B"
+            val end = document.length - 1
+            assertEquals(101, cursorPositionAfterMove(document, end, 100, -1))
+            assertEquals(101, cursorPositionAfterMove(document, document.length, 100, -2))
+            assertEquals(100 + end, cursorPositionAfterMove(document, 1, 100, 1))
+            assertEquals(100 + document.length, cursorPositionAfterMove(document, 1, 100, 2))
+            assertNull(cursorPositionAfterMove(document, end, 100, 2))
+        }
+        assertEquals(1, cursorPositionAfterMove("Ae\u0301B", 2, 0, -1))
+        assertEquals(3, cursorPositionAfterMove("Ae\u0301B", 2, 0, 1))
+        assertEquals(103, cursorPositionAfterMove("plain", 1, 100, 2))
     }
 
     @Test

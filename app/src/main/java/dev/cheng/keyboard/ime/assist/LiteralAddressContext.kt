@@ -9,8 +9,12 @@ fun isLiteralAddressContext(before: String): Boolean {
         match.range.first == 0 || before[match.range.first - 1].isAddressBoundary()
     }
     if (url != null) {
-        val host = before.substring(url.range.last + 1)
-        if (host.length <= 253 && host.all { it.isAddressLetterOrDigit() || it in ".-:[]" }) return true
+        val address = before.substring(url.range.last + 1)
+        val suffixStart = address.indexOfAny(charArrayOf('/', '?', '#'))
+        val host = if (suffixStart < 0) address else address.substring(0, suffixStart)
+        if (host.length <= 253 && host.all { it.isAddressLetterOrDigit() || it in ".-:[]" } &&
+            (suffixStart < 0 || host.isNotEmpty() && address.substring(suffixStart).all(Char::isUrlSuffixChar))
+        ) return true
     }
 
     val at = before.lastIndexOf('@')
@@ -25,6 +29,8 @@ fun isLiteralAddressContext(before: String): Boolean {
 }
 
 private fun Char.isAddressLetterOrDigit(): Boolean = this in 'a'..'z' || this in 'A'..'Z' || this in '0'..'9'
+
+private fun Char.isUrlSuffixChar(): Boolean = isAddressLetterOrDigit() || this in "-._~:/?#[]@!$&'()*+,;=%"
 
 private fun Char.isEmailLocal(): Boolean = isAddressLetterOrDigit() || this in "._+-%"
 

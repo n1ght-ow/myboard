@@ -30,6 +30,7 @@ data class EngineState(
     val touchSamples: List<TouchSample?> = emptyList(),
     val uriOrEmail: Boolean = false,
     val literalContext: Boolean = false,
+    val symbolReturnPage: KeyboardPage = KeyboardPage.Letters,
 )
 
 sealed interface Cmd {
@@ -64,6 +65,7 @@ sealed interface EngineAct {
     data object Shift : EngineAct
     data object Language : EngineAct
     data class Page(val page: KeyboardPage) : EngineAct
+    data object CloseSymbols : EngineAct
     data class Pick(val index: Int) : EngineAct
     data class Candidates(val preedit: String, val items: List<Candidate>) : EngineAct
 }
@@ -92,7 +94,19 @@ class InputEngine(private val latin: LatinDecoder) {
                 EngineStep(state.copy(shift = cycle(state.shift)))
             }
             EngineAct.Language -> switchLanguage(state)
-            is EngineAct.Page -> EngineStep(state.copy(page = act.page))
+            is EngineAct.Page -> EngineStep(
+                state.copy(
+                    page = act.page,
+                    symbolReturnPage = if (act.page == KeyboardPage.Symbols && state.page != KeyboardPage.Symbols) {
+                        state.page
+                    } else {
+                        state.symbolReturnPage
+                    },
+                ),
+            )
+            EngineAct.CloseSymbols -> EngineStep(
+                if (state.page == KeyboardPage.Symbols) state.copy(page = state.symbolReturnPage) else state,
+            )
             is EngineAct.Pick -> pick(state, act.index)
             is EngineAct.Candidates -> EngineStep(
                 state.copy(
@@ -243,9 +257,13 @@ class InputEngine(private val latin: LatinDecoder) {
             state.password || state.uriOrEmail || state.literalContext -> listOf(Cmd.Commit(state.raw))
             else -> takePending(state).second
         }
+        val committed = buildString {
+            pendingCommands.filterIsInstance<Cmd.Commit>().forEach { append(it.text) }
+            append(text)
+        }
         return EngineStep(
             literalFinishedState(state, state.shift),
-            pendingCommands + Cmd.Commit(text),
+            listOf(Cmd.Commit(committed)) + pendingCommands.filterNot { it is Cmd.Commit },
         )
     }
 
@@ -992,7 +1010,7 @@ class InputEngine(private val latin: LatinDecoder) {
         else -> "${left.trim()} ${right.trim()}"
     }
 
-    private fun learnable(state: EngineState) = !state.password && !state.noLearn
+    private fun learnable(state: EngineState) = !state.password && !state.noLearn && !state.uriOrEmail
 
     private fun cycle(shift: ShiftState): ShiftState = when (shift) {
         ShiftState.Off -> ShiftState.Once

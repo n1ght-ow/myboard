@@ -99,9 +99,8 @@ class ClipboardPasteRegressionTest {
 
         assertEquals(
             listOf<Cmd>(
-                Cmd.Commit("你"),
+                Cmd.Commit("你$payload"),
                 Cmd.LearnZh("你", "ni", prevContext = "前"),
-                Cmd.Commit(payload),
             ),
             chineseStep.cmds,
         )
@@ -129,7 +128,7 @@ class ClipboardPasteRegressionTest {
         val englishStep = paste(english, payload)
 
         assertEquals(
-            listOf<Cmd>(Cmd.Commit("don't"), Cmd.Commit(payload)),
+            listOf<Cmd>(Cmd.Commit("don't$payload")),
             englishStep.cmds,
         )
         assertNoPasteEdits(englishStep)
@@ -169,7 +168,7 @@ class ClipboardPasteRegressionTest {
 
                 assertEquals(
                     "$name payload=$payload",
-                    listOf<Cmd>(Cmd.Commit("dont"), Cmd.Commit(payload)),
+                    listOf<Cmd>(Cmd.Commit("dont$payload")),
                     step.cmds,
                 )
                 assertNoPasteEdits(step)
@@ -195,7 +194,7 @@ class ClipboardPasteRegressionTest {
 
         val step = paste(before, "hello")
 
-        assertEquals(listOf<Cmd>(Cmd.Commit("你"), Cmd.Commit("hello")), step.cmds)
+        assertEquals(listOf<Cmd>(Cmd.Commit("你hello")), step.cmds)
         assertNoPasteEdits(step)
         assertPasteStateCleared(step)
         assertPreferencesPreserved(before, step.state)

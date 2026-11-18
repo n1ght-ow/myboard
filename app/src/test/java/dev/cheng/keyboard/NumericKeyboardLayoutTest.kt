@@ -1,7 +1,13 @@
 package dev.cheng.keyboard
 
+import dev.cheng.keyboard.engine.Cmd
+import dev.cheng.keyboard.engine.EngineAct
+import dev.cheng.keyboard.engine.EngineState
+import dev.cheng.keyboard.engine.InputEngine
+import dev.cheng.keyboard.engine.LatinDecoder
 import dev.cheng.keyboard.ime.layout.hitKey
 import dev.cheng.keyboard.ime.layout.placeKeys
+import dev.cheng.keyboard.model.EnterKind
 import dev.cheng.keyboard.model.KeyKind
 import dev.cheng.keyboard.model.KeyboardPage
 import dev.cheng.keyboard.model.Language
@@ -16,6 +22,28 @@ class NumericKeyboardLayoutTest {
     private val gapX = 6f
     private val gapY = 10f
     private val side = 4f
+
+    @Test
+    fun symbolPageReturnsToThePageThatOpenedItEvenAfterAnInsertion() {
+        val engine = InputEngine(LatinDecoder())
+        for (initial in listOf(KeyboardPage.Letters, KeyboardPage.Number)) {
+            val start = EngineState(page = initial)
+            fun reduce(state: EngineState, action: EngineAct) = engine.reduce(state, action, EnterKind.Done)
+            val symbols = reduce(start, EngineAct.Page(KeyboardPage.Symbols)).state
+            assertEquals(KeyboardPage.Symbols, symbols.page)
+            assertEquals(initial, reduce(symbols, EngineAct.CloseSymbols).state.page)
+
+            val inserted = reduce(symbols, EngineAct.Direct("+"))
+            assertEquals(listOf<Cmd>(Cmd.Commit("+")), inserted.cmds)
+            assertEquals(KeyboardPage.Symbols, inserted.state.page)
+            assertEquals(initial, reduce(inserted.state, EngineAct.CloseSymbols).state.page)
+
+            val explicitNumber = reduce(symbols, EngineAct.Page(KeyboardPage.Number)).state
+            assertEquals(KeyboardPage.Number, explicitNumber.page)
+            val reopened = reduce(explicitNumber, EngineAct.Page(KeyboardPage.Symbols)).state
+            assertEquals(KeyboardPage.Number, reduce(reopened, EngineAct.CloseSymbols).state.page)
+        }
+    }
 
     @Test
     fun numberPageUsesStableFiveColumnGridAcrossWidths() {

@@ -82,13 +82,11 @@ class KeyGesture(
         lastRepeat = time
         downNeighbors = touchNeighbors.ifEmpty { touchSample?.neighborText.orEmpty() }
         downSample = touchSample
-        val actions = if (target.kind == KeyKind.Backspace) listOf(EngineAct.Backspace) else emptyList()
         val tapPreview = if (target.kind == KeyKind.Letter) TapPreview(target.id, target.label) else null
         return GestureFrame(
             pressedId = target.id,
             popup = null,
-            actions = actions,
-            haptic = if (target.kind == KeyKind.Backspace) HapticKind.Delete else HapticKind.Down,
+            haptic = if (target.kind == KeyKind.Backspace) null else HapticKind.Down,
             tapPreview = tapPreview,
         )
     }
@@ -135,9 +133,8 @@ class KeyGesture(
         if (abs(dx) > slopPx || abs(dy) > slopPx) gestureMoved = true
 
         if (current.kind == KeyKind.Backspace) {
-            if (!swiped && dx <= -swipePx && abs(dy) <= swipePx * 1.4f) {
+            if (!repeating && !swiped && dx <= -swipePx && abs(dy) <= swipePx * 1.4f) {
                 swiped = true
-                repeating = false
                 return GestureFrame(current.id, null, listOf(EngineAct.BackspaceWord), HapticKind.Delete)
             }
             return frame()
@@ -226,7 +223,7 @@ class KeyGesture(
         val flick = flickChoice
         val actions = when {
             cancelled -> emptyList()
-            current.kind == KeyKind.Backspace -> emptyList()
+            current.kind == KeyKind.Backspace -> if (repeating || swiped) emptyList() else listOf(EngineAct.Backspace)
             current.kind == KeyKind.Space && spaceSliding -> emptyList()
             current.kind == KeyKind.Letter && armed -> listOf(longPress(current, choice))
             current.kind == KeyKind.Letter && flick != null -> listOf(longPress(current, flick))
@@ -239,7 +236,8 @@ class KeyGesture(
         repeatCount = 0
         downNeighbors = ""
         downSample = null
-        return GestureFrame(null, null, actions, null)
+        val haptic = if (actions.singleOrNull() == EngineAct.Backspace) HapticKind.Delete else null
+        return GestureFrame(null, null, actions, haptic)
     }
 
     fun cancel(): GestureFrame {

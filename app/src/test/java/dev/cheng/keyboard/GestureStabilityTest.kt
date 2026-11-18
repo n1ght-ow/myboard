@@ -23,6 +23,7 @@ import org.junit.Test
 class GestureStabilityTest {
     private val fKey = KeyModel("l-f", KeyKind.Letter, "f", hint = "#")
     private val gKey = KeyModel("l-g", KeyKind.Letter, "g", hint = "%")
+    private val backspace = KeyModel("backspace", KeyKind.Backspace, "")
     private val placement = placeKeys(
         page = KeyboardPage.Letters,
         language = Language.English,
@@ -196,5 +197,29 @@ class GestureStabilityTest {
 
         val released = gesture.up()
         assertTrue(released.actions.isEmpty())
+    }
+
+    @Test
+    fun swipeBackspaceEmitsOnlyOneWordDeletion() {
+        val gesture = gesture()
+        assertTrue(gesture.down(backspace, 100f, 100f, 0L).actions.isEmpty())
+        assertEquals(listOf(EngineAct.BackspaceWord), gesture.move(60f, 100f, 100L, null).actions)
+        assertTrue(gesture.move(50f, 100f, 140L, null).actions.isEmpty())
+        assertTrue(gesture.alarm(350L).actions.isEmpty())
+        assertTrue(gesture.up().actions.isEmpty())
+    }
+
+    @Test
+    fun backspaceTapAndHoldDoNotDeleteAgainOnRelease() {
+        val gesture = gesture()
+        assertTrue(gesture.down(backspace, 100f, 100f, 0L).actions.isEmpty())
+        assertEquals(listOf(EngineAct.Backspace), gesture.up().actions)
+
+        gesture.down(backspace, 100f, 100f, 0L)
+        assertTrue(gesture.alarm(349L).actions.isEmpty())
+        assertEquals(listOf(EngineAct.Backspace), gesture.alarm(350L).actions)
+        assertEquals(listOf(EngineAct.Backspace), gesture.alarm(390L).actions)
+        assertTrue(gesture.move(60f, 100f, 400L, null).actions.isEmpty())
+        assertTrue(gesture.up().actions.isEmpty())
     }
 }

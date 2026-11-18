@@ -31,6 +31,21 @@ class LiteralAddressEngineRegressionTest {
     private val wrongEnglishCandidate = Candidate("come", "come", 999_000)
 
     @Test
+    fun explicitCandidatePicksInAddressFieldsDoNotTrainTheDictionaries() {
+        for ((language, raw, candidate) in listOf(
+            Triple(Language.Chinese, "qq", wrongChineseCandidate),
+            Triple(Language.English, "com", wrongEnglishCandidate),
+        )) {
+            val state = EngineState(language = language, uriOrEmail = true, raw = raw, candidates = listOf(candidate))
+            for (action in listOf(EngineAct.Pick(0), EngineAct.Space)) {
+                val step = engine.reduce(state, action, EnterKind.Go)
+                assertTrue(step.cmds.any { it is Cmd.Commit })
+                assertFalse(step.cmds.any { it is Cmd.LearnEn || it is Cmd.LearnZh || it is Cmd.LearnZhBigram })
+            }
+        }
+    }
+
+    @Test
     fun chineseAndEnglishTypeQqAndCompanyAddressesLiterally() {
         for (language in Language.entries) {
             for (address in listOf("qq.com", "company.com")) {

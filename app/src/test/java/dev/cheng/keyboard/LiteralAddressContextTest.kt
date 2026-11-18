@@ -28,17 +28,27 @@ class LiteralAddressContextTest {
 
     @Test
     fun mentionsMalformedAddressesAndUrlQueriesDoNotEnterEmailMode() {
-        for (text in listOf("@", "@alice", "alice@@", "alice@@bob@g", "alice..bob@g", "alice.@g", ".alice@g", "https://user@g", "https://example.com/?mail=alice@g", "user/path/alice@g", "a=" + "alice@g")) {
+        for (text in listOf("@", "@alice", "alice@@", "alice@@bob@g", "alice..bob@g", "alice.@g", ".alice@g", "https://user@g", "user/path/alice@g", "a=" + "alice@g")) {
             assertFalse(text, isLiteralAddressContext(text))
         }
     }
 
     @Test
-    fun explicitUrlHostsAreLiteralButPathsAndOrdinaryWordsAreNot() {
+    fun explicitUrlsStayLiteralThroughPathQueryAndFragment() {
         for (text in listOf("https://", "http://example", "https://example.com:8080", "www.example.", "访问：https://example.c")) {
             assertTrue(text, isLiteralAddressContext(text))
         }
-        for (text in listOf("你好", "company", "rq", "evilwww.example", "https://example.com/path", "https://example.com?q=hello")) {
+        for ((host, suffix) in listOf(
+            "https://example.com" to "/path/a%20b?mail=alice@g#part-2",
+            "https://example.com" to "?q=hello+world",
+            "www.example.com" to "#Section_2",
+        )) {
+            for (length in 1..suffix.length) {
+                val prefix = host + suffix.take(length)
+                assertTrue(prefix, isLiteralAddressContext(prefix))
+            }
+        }
+        for (text in listOf("你好", "company", "rq", "evilwww.example", "https:///path", "https://example.com/path next", "https://example.com/path，next")) {
             assertFalse(text, isLiteralAddressContext(text))
         }
     }
