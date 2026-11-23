@@ -2137,6 +2137,59 @@ class EngineBenchmarkTest {
     }
 
     @Test
+    fun round14PartialCandidateSelectionMining() {
+        val (syllables, lexicon, latin) = sharedEnv
+        val decoder = PinyinDecoder(syllables).also {
+            it.lexicon = lexicon
+            it.latin = latin
+        }
+        val engine = InputEngine(latin)
+        val phrases = lexicon.allEntries.asSequence()
+            .filter { it.nsy in 2..3 && it.row.letters.length in 5..12 && 'v' !in it.row.letters }
+            .sortedByDescending { it.row.freq }
+            .distinctBy { it.row.letters }
+            .drop(320)
+            .take(120)
+            .map { it.row.syllables.split(' ') }
+            .filter { parts -> parts.size in 2..3 && parts.all { it in syllables } }
+            .toList()
+        var selected = 0
+        for (parts in phrases + listOf(listOf("you", "yu"))) {
+            val first = parts.first()
+            val tail = parts.drop(1)
+            for (separator in listOf("", "'")) {
+                val spelling = parts.joinToString(separator)
+                val decoded = decoder.decode(spelling, fuzzy = false)
+                val expected = if (parts == listOf("you", "yu")) "有" else null
+                val index = decoded.candidates.indexOfFirst {
+                    it.syllables == first && it.consumed == first.length && (expected == null || it.text == expected)
+                }
+                if (expected != null) assertTrue("missing first-segment candidate for $spelling: $decoded", index >= 0)
+                if (index < 0) continue
+
+                val candidate = decoded.candidates[index]
+                val state = EngineState(raw = spelling, preedit = decoded.preedit, candidates = decoded.candidates, noLearn = true)
+                val partial = engine.reduce(state, EngineAct.Pick(index), EnterKind.Newline)
+                val suffix = tail.joinToString(separator)
+                assertEquals(spelling, suffix, partial.state.raw)
+                assertEquals(spelling, listOf(Cmd.Commit(candidate.text), Cmd.Compose(suffix)), partial.cmds)
+
+                val remaining = decoder.decode(suffix, fuzzy = false, context = candidate.text)
+                val rest = remaining.candidates.indexOfFirst {
+                    it.consumed == tail.sumOf(String::length) && it.syllables.isNotEmpty()
+                }
+                assertTrue("$spelling -> ${candidate.text} lost its remaining candidates: $remaining", rest >= 0)
+                val complete = engine.reduce(partial.state.copy(candidates = remaining.candidates), EngineAct.Pick(rest), EnterKind.Newline)
+                assertEquals("", complete.state.raw)
+                assertEquals(listOf(Cmd.Commit(remaining.candidates[rest].text)), complete.cmds)
+                selected++
+            }
+        }
+        println("R14_PARTIAL_PICK : selected first segment and completed remaining candidates in $selected cases")
+        assertTrue("too few partial candidate sequences exercised: $selected", selected >= 100)
+    }
+
+    @Test
     fun fragmentRecoveryExposesWholeWordsWithoutReplacingExistingFirstChoice() {
         val (syllables, lexicon, latin) = sharedEnv
         val decoder = PinyinDecoder(syllables).also {

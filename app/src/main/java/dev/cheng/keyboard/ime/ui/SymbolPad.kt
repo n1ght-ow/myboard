@@ -1,11 +1,9 @@
 package dev.cheng.keyboard.ime.ui
 
+import android.os.SystemClock
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -24,15 +23,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -40,12 +36,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import dev.cheng.keyboard.ime.KeyboardController
 import dev.cheng.keyboard.ime.UiState
+import dev.cheng.keyboard.ime.gesture.BackspaceHint
+import dev.cheng.keyboard.ime.gesture.KeyPointerTracker
 import dev.cheng.keyboard.ime.symbol.symbolCategories
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import dev.cheng.keyboard.model.KeyKind
+import dev.cheng.keyboard.model.KeyModel
+import kotlinx.coroutines.CancellationException
+
+private val SymbolDeleteKey = KeyModel("symbol-backspace", KeyKind.Backspace, "")
 
 @Composable
 internal fun SymbolPad(
@@ -138,11 +139,25 @@ internal fun SymbolPad(
                 modifier = Modifier.weight(2.75f),
                 onClick = controller::spaceFromSymbols,
             )
-            SymbolRepeatBackspaceKey(
-                palette = palette,
-                modifier = Modifier.weight(1.50f),
-                onTrigger = controller::backspaceFromSymbols,
-            )
+            Box(Modifier.weight(1.50f).fillMaxHeight()) {
+                SymbolDeleteButton(
+                    palette = palette,
+                    modifier = Modifier.fillMaxSize(),
+                    pressed = state.pressedId == SymbolDeleteKey.id,
+                    controller = controller,
+                )
+                if (state.backspaceHint != BackspaceHint.None) {
+                    BackspaceHintPill(
+                        hint = state.backspaceHint,
+                        palette = palette,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .offset(y = (-32).dp)
+                            .size(width = 96.dp, height = 28.dp)
+                            .zIndex(2f),
+                    )
+                }
+            }
         }
     }
 }
@@ -283,14 +298,13 @@ private fun SymbolSpaceKey(
 }
 
 @Composable
-private fun SymbolRepeatBackspaceKey(
+private fun SymbolDeleteButton(
     palette: Palette,
     modifier: Modifier,
-    onTrigger: () -> Unit,
+    pressed: Boolean,
+    controller: KeyboardController,
 ) {
     val shape = RoundedCornerShape(8.5.dp)
-    val currentOnTrigger by rememberUpdatedState(onTrigger)
-    var pressed by remember { mutableStateOf(false) }
     val fill = if (pressed) palette.funcPressed else palette.funcKey
     Box(
         modifier
@@ -301,26 +315,39 @@ private fun SymbolRepeatBackspaceKey(
             .clip(shape)
             .background(fill)
             .border(0.5.dp, palette.keyBorder, shape)
-            .pointerInput(Unit) {
-                coroutineScope {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false)
-                        pressed = true
-                        currentOnTrigger()
-                        val repeatJob = launch {
-                            delay(380L)
-                            while (true) {
-                                currentOnTrigger()
-                                delay(55L)
-                            }
-                        }
-                        try {
-                            waitForUpOrCancellation()
-                        } finally {
-                            repeatJob.cancel()
-                            pressed = false
+            .pointerInput(controller) {
+                try {
+                    awaitPointerEventScope {
+                        val pointers = KeyPointerTracker()
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Main)
+                            val cancel = event.hasPointerCancel()
+                            val time = event.changes.firstOrNull()?.uptimeMillis ?: SystemClock.uptimeMillis()
+                            pointers.process(
+                                changes = event.changes.map { it.asKeyPointerChange(cancel) },
+                                onDown = { pointer ->
+                                    controller.onDown(SymbolDeleteKey, pointer.x, pointer.y, pointer.time)
+                                    true
+                                },
+                                onRollover = { false },
+                                onMove = { pointer ->
+                                    controller.onMove(
+                                        pointer.x,
+                                        pointer.y,
+                                        pointer.time,
+                                        null,
+                                        released = !pointer.pressed,
+                                    )
+                                },
+                                onUp = { controller.onUp(time) },
+                                onCancel = controller::onCancel,
+                            )
+                            event.changes.forEach { it.consume() }
                         }
                     }
+                } catch (cancelled: CancellationException) {
+                    controller.onCancel()
+                    throw cancelled
                 }
             },
         contentAlignment = Alignment.Center,

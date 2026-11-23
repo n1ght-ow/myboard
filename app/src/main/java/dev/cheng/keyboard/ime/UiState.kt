@@ -3,6 +3,7 @@ package dev.cheng.keyboard.ime
 import dev.cheng.keyboard.ai.PolishCandidate
 import dev.cheng.keyboard.ai.PolishTone
 import dev.cheng.keyboard.engine.EngineState
+import dev.cheng.keyboard.ime.gesture.BackspaceHint
 import dev.cheng.keyboard.ime.gesture.PopupPreview
 import dev.cheng.keyboard.ime.gesture.TapPreview
 import dev.cheng.keyboard.ime.assist.TypingSuggestion
@@ -29,6 +30,7 @@ data class UiState(
     val pressedId: String? = null,
     val popup: PopupPreview? = null,
     val tapPreview: TapPreview? = null,
+    val backspaceHint: BackspaceHint = BackspaceHint.None,
     val menu: Boolean = false,
     val clip: String? = null,
     val freshClip: String? = null,

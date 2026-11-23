@@ -1158,7 +1158,7 @@ class KeyboardLogicTest {
     }
 
     @Test
-    fun smartAlternatingQuotesPairedBracketsAndBackspaceAcceleration() {
+    fun smartAlternatingQuotesPairedBracketsAndStableBackspaceRepeat() {
         assertEquals("“", resolveSmartCommit("", "“", composing = false).text)
         assertEquals("”", resolveSmartCommit("他说“你好", "“", composing = false).text)
         assertEquals("“", resolveSmartCommit("他说“你好”，又说", "“", composing = false).text)
@@ -1175,14 +1175,15 @@ class KeyboardLogicTest {
         val gesture = KeyGesture(slopPx = 16f, caseSlopPx = 24f, swipePx = 36f)
         val bksp = KeyModel("backspace", KeyKind.Backspace, "")
         gesture.down(bksp, 50f, 50f, 0L)
-        var now = 350L
-        var sawWordDelete = false
-        repeat(45) {
+        assertTrue(gesture.alarm(399L).actions.isEmpty())
+        var now = 400L
+        repeat(60) {
             val frame = gesture.alarm(now)
-            if (frame.actions.any { it == EngineAct.BackspaceWord }) sawWordDelete = true
-            now += 85L
+            assertEquals(listOf(EngineAct.Backspace), frame.actions)
+            assertEquals(now + 50L, gesture.nextAlarm(now))
+            now += 50L
         }
-        assertTrue(sawWordDelete)
+        assertTrue(gesture.up().actions.isEmpty())
     }
 
     @Test

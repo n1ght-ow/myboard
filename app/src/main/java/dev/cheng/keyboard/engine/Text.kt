@@ -116,6 +116,7 @@ fun applyAskDraft(draft: String, cmds: List<Cmd>): String {
                 val count = previousWordUnits(text)
                 if (count > 0) text = text.dropLast(count)
             }
+            Cmd.ClearInput -> text = ""
             else -> Unit
         }
     }

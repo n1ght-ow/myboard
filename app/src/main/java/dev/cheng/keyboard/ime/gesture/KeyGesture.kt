@@ -10,6 +10,8 @@ import kotlin.math.abs
 
 enum class HapticKind { Down, Arm, Step, Delete }
 
+enum class BackspaceHint { None, Repeat, ClearArmed }
+
 data class TapPreview(val keyId: String, val label: String)
 
 data class PopupPreview(
@@ -26,6 +28,7 @@ data class GestureFrame(
     val actions: List<EngineAct> = emptyList(),
     val haptic: HapticKind? = null,
     val tapPreview: TapPreview? = null,
+    val backspaceHint: BackspaceHint = BackspaceHint.None,
 )
 
 class KeyGesture(
@@ -34,24 +37,26 @@ class KeyGesture(
     var swipePx: Float,
     var verticalFlickPx: Float = 46f,
     private val longMs: Long = 350,
-    private val repeatMs: Long = 40,
+    private val backspaceLongMs: Long = 400,
+    private val repeatMs: Long = 50,
 ) {
     private val fastTapLockMs: Long = 70L
     private var tracking = false
     private var key: KeyModel? = null
     private var downX = 0f
     private var downY = 0f
+    private var latestX = 0f
+    private var latestY = 0f
     private var downAt = 0L
     private var gestureMoved = false
     private var armed = false
     private var flickChoice: Choice? = null
     private var cancelled = false
     private var choice = Choice.Symbol
-    private var swiped = false
     private var spaceSliding = false
     private var spaceAnchorX = 0f
     private var repeating = false
-    private var repeatCount = 0
+    private var clearArmed = false
     private var lastRepeat = 0L
     private var downNeighbors = ""
     private var downSample: TouchSample? = null
@@ -68,17 +73,18 @@ class KeyGesture(
         key = target
         downX = x
         downY = y
+        latestX = x
+        latestY = y
         downAt = time
         gestureMoved = false
         armed = false
         flickChoice = null
         cancelled = false
         choice = Choice.Symbol
-        swiped = false
         spaceSliding = false
         spaceAnchorX = x
         repeating = false
-        repeatCount = 0
+        clearArmed = false
         lastRepeat = time
         downNeighbors = touchNeighbors.ifEmpty { touchSample?.neighborText.orEmpty() }
         downSample = touchSample
@@ -93,12 +99,11 @@ class KeyGesture(
 
     fun canRollover(): Boolean {
         val current = key ?: return false
-        if (!tracking || cancelled || armed || flickChoice != null || spaceSliding || repeating || swiped) return false
+        if (!tracking || cancelled || armed || flickChoice != null || spaceSliding || repeating) return false
         return current.kind in setOf(
             KeyKind.Letter,
             KeyKind.Char,
             KeyKind.Space,
-            KeyKind.Backspace,
             KeyKind.Enter,
             KeyKind.Shift,
         )
@@ -125,6 +130,7 @@ class KeyGesture(
         hit: KeyModel?,
         touchNeighbors: String = "",
         touchSample: TouchSample? = null,
+        released: Boolean = false,
     ): GestureFrame {
         val current = key ?: return idle()
         if (!tracking) return idle()
@@ -133,9 +139,34 @@ class KeyGesture(
         if (abs(dx) > slopPx || abs(dy) > slopPx) gestureMoved = true
 
         if (current.kind == KeyKind.Backspace) {
-            if (!repeating && !swiped && dx <= -swipePx && abs(dy) <= swipePx * 1.4f) {
-                swiped = true
-                return GestureFrame(current.id, null, listOf(EngineAct.BackspaceWord), HapticKind.Delete)
+            if (cancelled) return frame()
+            if (abs(dx) > horizontalCancelPx || dy > downCancelPx) {
+                cancelled = true
+                clearArmed = false
+                return frame()
+            }
+            latestX = x
+            latestY = y
+            if (released && !repeating) return frame()
+            if (repeating || time >= downAt + backspaceLongMs) {
+                val startedByMove = !repeating
+                if (startedByMove) {
+                    repeating = true
+                    lastRepeat = time
+                }
+                val nextArmed = when {
+                    clearArmed -> dy <= -clearExitPx && abs(dx) <= clearExitMaxX
+                    released -> false
+                    else -> inClearArmZone()
+                }
+                if (nextArmed != clearArmed) {
+                    clearArmed = nextArmed
+                    if (!nextArmed) lastRepeat = time
+                    return frame(HapticKind.Step)
+                }
+                if (startedByMove && !clearArmed && !released) {
+                    return backspaceDelete(current)
+                }
             }
             return frame()
         }
@@ -223,7 +254,11 @@ class KeyGesture(
         val flick = flickChoice
         val actions = when {
             cancelled -> emptyList()
-            current.kind == KeyKind.Backspace -> if (repeating || swiped) emptyList() else listOf(EngineAct.Backspace)
+            current.kind == KeyKind.Backspace -> when {
+                clearArmed -> listOf(EngineAct.ClearInput)
+                repeating -> emptyList()
+                else -> listOf(EngineAct.Backspace)
+            }
             current.kind == KeyKind.Space && spaceSliding -> emptyList()
             current.kind == KeyKind.Letter && armed -> listOf(longPress(current, choice))
             current.kind == KeyKind.Letter && flick != null -> listOf(longPress(current, flick))
@@ -233,7 +268,8 @@ class KeyGesture(
         armed = false
         flickChoice = null
         spaceSliding = false
-        repeatCount = 0
+        repeating = false
+        clearArmed = false
         downNeighbors = ""
         downSample = null
         val haptic = if (actions.singleOrNull() == EngineAct.Backspace) HapticKind.Delete else null
@@ -248,7 +284,8 @@ class KeyGesture(
         flickChoice = null
         spaceSliding = false
         cancelled = false
-        repeatCount = 0
+        repeating = false
+        clearArmed = false
         downNeighbors = ""
         downSample = null
         return idle()
@@ -262,12 +299,17 @@ class KeyGesture(
             choice = Choice.Symbol
             return frame(HapticKind.Arm)
         }
-        if (current.kind == KeyKind.Backspace && !swiped && time >= nextRepeatAt()) {
-            repeating = true
-            repeatCount++
-            lastRepeat = time
-            val act = if (repeatCount > 40) EngineAct.BackspaceWord else EngineAct.Backspace
-            return GestureFrame(current.id, null, listOf(act), HapticKind.Delete)
+        if (current.kind == KeyKind.Backspace && !cancelled) {
+            if (!repeating) {
+                if (time < downAt + backspaceLongMs) return frame()
+                repeating = true
+                lastRepeat = time
+                return backspaceDelete(current)
+            }
+            if (!clearArmed && time >= nextRepeatAt()) {
+                lastRepeat = time
+                return backspaceDelete(current)
+            }
         }
         return frame()
     }
@@ -276,18 +318,15 @@ class KeyGesture(
         val current = key ?: return null
         if (!tracking) return null
         if (current.kind == KeyKind.Letter && !armed && flickChoice == null && !cancelled) return downAt + longMs
-        if (current.kind == KeyKind.Backspace && !swiped) return nextRepeatAt().coerceAtLeast(now)
+        if (current.kind == KeyKind.Backspace && !cancelled && !clearArmed) {
+            return nextRepeatAt().coerceAtLeast(now)
+        }
         return null
     }
 
     private fun nextRepeatAt(): Long {
-        if (!repeating) return downAt + longMs
-        val interval = when {
-            repeatCount >= 40 -> 80L
-            repeatCount >= 15 -> 25L
-            else -> repeatMs
-        }
-        return lastRepeat + interval
+        if (!repeating) return downAt + backspaceLongMs
+        return lastRepeat + repeatMs
     }
 
     private fun frame(haptic: HapticKind? = null): GestureFrame {
@@ -301,6 +340,12 @@ class KeyGesture(
             pressedId = current?.id,
             popup = if (current != null && activeChoice != null) preview(current, activeChoice) else null,
             haptic = haptic,
+            backspaceHint = when {
+                current?.kind != KeyKind.Backspace || cancelled -> BackspaceHint.None
+                clearArmed -> BackspaceHint.ClearArmed
+                repeating -> BackspaceHint.Repeat
+                else -> BackspaceHint.None
+            },
         )
     }
 
@@ -325,6 +370,35 @@ class KeyGesture(
     private fun entersTargetCore(touchSample: TouchSample?): Boolean =
         touchSample == null ||
             (abs(touchSample.hitResidualX) <= 0.28f && abs(touchSample.hitResidualY) <= 0.30f)
+
+    private val clearArmPx: Float
+        get() = (swipePx * 2f).coerceAtLeast(56f)
+
+    private val clearExitPx: Float
+        get() = clearArmPx * 0.62f
+
+    private val clearArmMaxX: Float
+        get() = (swipePx * 1.1f).coerceAtLeast(28f)
+
+    private val clearExitMaxX: Float
+        get() = (swipePx * 1.45f).coerceAtLeast(clearArmMaxX)
+
+    private val horizontalCancelPx: Float
+        get() = (swipePx * 1.8f).coerceAtLeast(48f)
+
+    private val downCancelPx: Float
+        get() = (swipePx * 1.5f).coerceAtLeast(48f)
+
+    private fun inClearArmZone(): Boolean =
+        latestY - downY <= -clearArmPx && abs(latestX - downX) <= clearArmMaxX
+
+    private fun backspaceDelete(current: KeyModel) = GestureFrame(
+        pressedId = current.id,
+        popup = null,
+        actions = listOf(EngineAct.Backspace),
+        haptic = HapticKind.Delete,
+        backspaceHint = BackspaceHint.Repeat,
+    )
 
     private fun preview(current: KeyModel, selected: Choice) = PopupPreview(
         keyId = current.id,

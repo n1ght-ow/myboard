@@ -200,11 +200,10 @@ class GestureStabilityTest {
     }
 
     @Test
-    fun swipeBackspaceEmitsOnlyOneWordDeletion() {
+    fun lateralBackspaceDragCancelsWithoutWordDelete() {
         val gesture = gesture()
         assertTrue(gesture.down(backspace, 100f, 100f, 0L).actions.isEmpty())
-        assertEquals(listOf(EngineAct.BackspaceWord), gesture.move(60f, 100f, 100L, null).actions)
-        assertTrue(gesture.move(50f, 100f, 140L, null).actions.isEmpty())
+        assertTrue(gesture.move(20f, 100f, 100L, null).actions.isEmpty())
         assertTrue(gesture.alarm(350L).actions.isEmpty())
         assertTrue(gesture.up().actions.isEmpty())
     }
@@ -216,10 +215,10 @@ class GestureStabilityTest {
         assertEquals(listOf(EngineAct.Backspace), gesture.up().actions)
 
         gesture.down(backspace, 100f, 100f, 0L)
-        assertTrue(gesture.alarm(349L).actions.isEmpty())
-        assertEquals(listOf(EngineAct.Backspace), gesture.alarm(350L).actions)
-        assertEquals(listOf(EngineAct.Backspace), gesture.alarm(390L).actions)
-        assertTrue(gesture.move(60f, 100f, 400L, null).actions.isEmpty())
+        assertTrue(gesture.alarm(399L).actions.isEmpty())
+        assertEquals(listOf(EngineAct.Backspace), gesture.alarm(400L).actions)
+        assertEquals(listOf(EngineAct.Backspace), gesture.alarm(450L).actions)
+        assertTrue(gesture.move(60f, 100f, 460L, null).actions.isEmpty())
         assertTrue(gesture.up().actions.isEmpty())
     }
 }

@@ -49,6 +49,7 @@ import dev.cheng.keyboard.ime.assist.TypingAssistKind
 import dev.cheng.keyboard.ime.assist.TypingSuggestion
 import dev.cheng.keyboard.ime.assist.typingSuggestions
 import dev.cheng.keyboard.ime.assist.isLiteralAddressContext
+import dev.cheng.keyboard.ime.gesture.BackspaceHint
 import dev.cheng.keyboard.ime.gesture.KeyGesture
 import dev.cheng.keyboard.ime.gesture.TapPreview
 import dev.cheng.keyboard.ime.layout.HitContext
@@ -221,6 +222,7 @@ class KeyboardController(
 
     fun startInput(info: EditorInfo, restarting: Boolean) {
         inputActive = true
+        alarmJob?.cancel()
         typingSnapshot = null
         val session = editorSessionKeyOf(info)
         val resetSession = shouldResetEditorSession(restarting, activeSession, session)
@@ -295,6 +297,7 @@ class KeyboardController(
                 pressedId = null,
                 popup = null,
                 tapPreview = null,
+                backspaceHint = BackspaceHint.None,
                 expanded = false,
                 enter = enter,
                 canUndoPolish = false,
@@ -441,6 +444,7 @@ class KeyboardController(
                 pressedId = null,
                 popup = null,
                 tapPreview = null,
+                backspaceHint = BackspaceHint.None,
                 menu = false,
                 expanded = false,
                 overlay = Overlay.None,
@@ -480,9 +484,20 @@ class KeyboardController(
         return true
     }
 
-    fun onMove(x: Float, y: Float, time: Long, hit: KeyModel?, sample: TouchSample? = null) {
-        applyFrame(gesture.move(x, y, time, hit, sample?.neighborText.orEmpty(), sample))
-        schedule(time)
+    fun onMove(
+        x: Float,
+        y: Float,
+        time: Long,
+        hit: KeyModel?,
+        sample: TouchSample? = null,
+        released: Boolean = false,
+    ) {
+        applyFrame(gesture.move(x, y, time, hit, sample?.neighborText.orEmpty(), sample, released))
+        if (released) {
+            alarmJob?.cancel()
+        } else {
+            schedule(time)
+        }
     }
 
     fun onUp(time: Long) {
@@ -720,11 +735,6 @@ class KeyboardController(
     fun spaceFromSymbols() {
         if (state.haptic) haptic(HapticKind.Down)
         dispatch(EngineAct.Space)
-    }
-
-    fun backspaceFromSymbols() {
-        if (state.haptic) haptic(HapticKind.Delete)
-        dispatch(EngineAct.Backspace)
     }
 
     fun insertSymbol(text: String) {
@@ -1191,6 +1201,7 @@ class KeyboardController(
                 pressedId = frame.pressedId,
                 popup = frame.popup,
                 tapPreview = frame.tapPreview ?: it.tapPreview,
+                backspaceHint = frame.backspaceHint,
             )
         }
         frame.actions.forEach(::dispatch)
@@ -1221,12 +1232,31 @@ class KeyboardController(
 
     private fun dispatch(act: EngineAct) {
         if (interceptAsk(act)) return
-        synchronizeComposition()
-        refreshLiteralAddressContext()
-        if (state.overlay != Overlay.Ask) clearStaleAutoSpace()
-        if (needsChineseNow(act)) refreshChinese()
-        val step = engine.reduce(engineState, act, enter)
         val asking = state.overlay == Overlay.Ask
+        val clearing = act == EngineAct.ClearInput && !asking
+        if (!clearing) {
+            synchronizeComposition()
+            refreshLiteralAddressContext()
+            if (!asking) clearStaleAutoSpace()
+            if (needsChineseNow(act)) refreshChinese()
+        }
+        val step = engine.reduce(engineState, act, enter)
+        val clearResult = if (clearing) {
+            bridge.clearInput(privateField = engineState.password || engineState.noLearn)
+        } else {
+            null
+        }
+        when (clearResult) {
+            ClearInputResult.Unchanged -> {
+                publish()
+                Toast.makeText(context, "输入框未确认清空", Toast.LENGTH_SHORT).show()
+                return
+            }
+            ClearInputResult.CompositionFinalizedWithoutClear -> {
+                Toast.makeText(context, "输入框未确认清空", Toast.LENGTH_SHORT).show()
+            }
+            ClearInputResult.Applied, null -> Unit
+        }
         val paste = act is EngineAct.Paste && !asking
         if (paste) {
             val text = step.cmds.filterIsInstance<Cmd.Commit>().singleOrNull()?.text ?: return
@@ -1240,6 +1270,20 @@ class KeyboardController(
         }
         updateCalibrationForAction(act, step)
         engineState = step.state
+        if (clearResult != null) {
+            token++
+            candidateRaw = ""
+            lastComposingSpan = null
+            autoSpacePosition = null
+            lastPolishUndo = null
+            typingSnapshot = null
+            update {
+                it.copy(
+                    canUndoPolish = false,
+                    typingSuggestions = emptyList(),
+                )
+            }
+        }
         if (engineState.raw.isNotEmpty() && lastPolishUndo != null) {
             lastPolishUndo = null
             update { it.copy(canUndoPolish = false) }
@@ -1280,7 +1324,7 @@ class KeyboardController(
                     }
                 }
             }
-            if (!paste) bridge.apply(
+            if (!paste && !clearing) bridge.apply(
                 step.cmds,
                 smartCommit = shouldUseSmartCommit(engineState.password, engineState.uriOrEmail || engineState.literalContext),
             )
@@ -1363,6 +1407,7 @@ class KeyboardController(
         when (act) {
             EngineAct.Backspace,
             EngineAct.BackspaceWord,
+            EngineAct.ClearInput,
             is EngineAct.Direct,
             is EngineAct.Paste,
             is EngineAct.MoveCursor,
@@ -1438,6 +1483,7 @@ class KeyboardController(
         EngineAct.Space -> "$current "
         EngineAct.Backspace -> current.dropLast(1)
         EngineAct.BackspaceWord -> ""
+        EngineAct.ClearInput -> ""
         else -> null
     }
 

@@ -7,6 +7,7 @@ data class KeyPointerChange(
     val x: Float = 0f,
     val y: Float = 0f,
     val time: Long = 0L,
+    val cancelled: Boolean = false,
 )
 
 /** Tracks physical presses, so a finger already settled by rollover cannot type twice. */
@@ -22,6 +23,12 @@ class KeyPointerTracker {
         onUp: () -> Unit,
         onCancel: () -> Unit,
     ) {
+        if (changes.any { it.cancelled }) {
+            waiting.clear()
+            if (activeId != null) onCancel()
+            activeId = null
+            return
+        }
         waiting.keys.removeAll { id -> changes.none { it.id == id && it.pressed } }
         val active = activeId
         var movedId: Long? = null
@@ -32,6 +39,7 @@ class KeyPointerTracker {
                     onCancel()
                     activeId = null
                     waiting.clear()
+                    return
                 }
                 !change.pressed -> {
                     onMove(change)

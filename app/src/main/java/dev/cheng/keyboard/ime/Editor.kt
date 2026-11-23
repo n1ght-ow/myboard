@@ -149,6 +149,12 @@ enum class TypingSuggestionEditResult {
     CompositionFinalizedWithoutReplacement,
 }
 
+enum class ClearInputResult {
+    Applied,
+    Unchanged,
+    CompositionFinalizedWithoutClear,
+}
+
 fun isUtf16Boundary(text: String, index: Int): Boolean {
     if (index !in 0..text.length) return false
     return index == 0 ||
@@ -646,8 +652,74 @@ class EditorBridge(private val connection: () -> InputConnection?) {
         return true
     }
 
+    fun clearInput(privateField: Boolean = false): ClearInputResult {
+        val input = connection() ?: return ClearInputResult.Unchanged
+        val snapshot = if (privateField) null else readClearSnapshot(input)
+        if (runCatching { input.beginBatchEdit() }.isFailure) return ClearInputResult.Unchanged
+
+        try {
+            val failure = if (composing) {
+                if (!runCatching { input.finishComposingText() }.getOrDefault(false)) return ClearInputResult.Unchanged
+                composing = false
+                ClearInputResult.CompositionFinalizedWithoutClear
+            } else {
+                ClearInputResult.Unchanged
+            }
+            val cleared = runCatching {
+                val fullLength = snapshot?.fullLength
+                val selected = if (fullLength != null) {
+                    input.setSelection(0, fullLength)
+                } else {
+                    input.performContextMenuAction(android.R.id.selectAll) &&
+                        input.getTextBeforeCursor(1, 0)?.isEmpty() == true &&
+                        input.getTextAfterCursor(1, 0)?.isEmpty() == true
+                }
+                selected && input.commitText("", 1)
+            }.getOrDefault(false)
+            if (cleared) return ClearInputResult.Applied
+            snapshot?.selection?.let { restoreTypingSelection(input, it) }
+            return failure
+        } finally {
+            runCatching { input.endBatchEdit() }
+        }
+    }
+
+    private data class ClearSnapshot(val selection: EditorTextSpan, val fullLength: Int?)
+
+    private fun readClearSnapshot(input: InputConnection): ClearSnapshot? = runCatching {
+        val extracted = input.getExtractedText(extractedRequest(), 0)
+            ?: return@runCatching null
+        val text = extracted.text?.toString() ?: return@runCatching null
+        if (extracted.partialStartOffset >= 0 ||
+            !isUtf16Boundary(text, extracted.selectionStart) || !isUtf16Boundary(text, extracted.selectionEnd)
+        ) return@runCatching null
+        val start = absoluteEditorPosition(extracted.selectionStart, extracted.startOffset) ?: return@runCatching null
+        val end = absoluteEditorPosition(extracted.selectionEnd, extracted.startOffset) ?: return@runCatching null
+        val selection = EditorTextSpan(start, end)
+        val range = selection.ordered()
+        val fullLength = text.length.takeIf {
+            extracted.startOffset == 0 && it <= 16_384 &&
+                input.getTextBeforeCursor(range.start + 1, 0)?.length == range.start &&
+                input.getTextAfterCursor(it - range.end + 1, 0)?.length == it - range.end
+        }
+        ClearSnapshot(selection, fullLength)
+    }.getOrNull()
+
     fun apply(cmds: List<Cmd>, smartCommit: Boolean = true) {
         val input = connection() ?: return
+        val commitThenCompose = cmds.size >= 2 && cmds[0] is Cmd.Commit && cmds[1] is Cmd.Compose
+        if (!commitThenCompose || runCatching { input.beginBatchEdit() }.isFailure) {
+            applyCommands(input, cmds, smartCommit)
+            return
+        }
+        try {
+            applyCommands(input, cmds, smartCommit)
+        } finally {
+            runCatching { input.endBatchEdit() }
+        }
+    }
+
+    private fun applyCommands(input: InputConnection, cmds: List<Cmd>, smartCommit: Boolean) {
         for (cmd in cmds) {
             when (cmd) {
                 is Cmd.Commit -> {
@@ -665,6 +737,7 @@ class EditorBridge(private val connection: () -> InputConnection?) {
                 Cmd.DeleteOne -> deleteOne(input)
                 is Cmd.DeleteCount -> deleteBefore(input, cmd.count)
                 Cmd.DeleteWord -> deleteWord(input)
+                Cmd.ClearInput -> clearInput()
                 is Cmd.MoveCursor -> moveCursor(input, cmd.delta)
                 is Cmd.EditorAction -> input.performEditorAction(cmd.kind.imeAction())
                 is Cmd.LearnZh, is Cmd.LearnZhBigram, is Cmd.LearnEn -> Unit

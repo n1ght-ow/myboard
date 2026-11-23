@@ -149,6 +149,61 @@ class KeyPointerTrackerTest {
     }
 
     @Test
+    fun cancelledPointerCallsCancelWithoutReleasingTheGesture() {
+        val tracker = KeyPointerTracker()
+        val trace = mutableListOf<String>()
+        fun event(vararg changes: KeyPointerChange) = tracker.process(
+            changes.toList(),
+            onDown = { trace += "down:${it.id}"; true },
+            onRollover = { false },
+            onMove = { trace += "move:${it.pressed}" },
+            onUp = { trace += "up" },
+            onCancel = { trace += "cancel" },
+        )
+        event(down(1))
+        trace.clear()
+        event(up(1).copy(cancelled = true))
+        assertEquals(listOf("cancel"), trace)
+    }
+
+    @Test
+    fun releaseCoordinatesReachMoveAsUnpressedBeforeUp() {
+        val tracker = KeyPointerTracker()
+        val trace = mutableListOf<String>()
+        fun event(vararg changes: KeyPointerChange) = tracker.process(
+            changes.toList(),
+            onDown = { true },
+            onRollover = { false },
+            onMove = { trace += "move:${it.pressed}:${it.x}" },
+            onUp = { trace += "up" },
+            onCancel = { trace += "cancel" },
+        )
+        event(down(1))
+        trace.clear()
+        event(up(1).copy(x = 120f, time = 90L))
+        assertEquals(listOf("move:false:120.0", "up"), trace)
+    }
+
+    @Test
+    fun cancelledActivePointerDropsWaitingFingerWithoutAdoptingIt() {
+        val tracker = KeyPointerTracker()
+        var starts = 0
+        var cancels = 0
+        fun event(vararg changes: KeyPointerChange) = tracker.process(
+            changes.toList(),
+            onDown = { starts++; true },
+            onRollover = { false },
+            onMove = {}, onUp = {}, onCancel = { cancels++ },
+        )
+        event(down(1))
+        event(held(1), down(2))
+        event(up(1).copy(cancelled = true), held(2))
+        event(held(2))
+        assertEquals(1, starts)
+        assertEquals(1, cancels)
+    }
+
+    @Test
     fun releaseCoordinatesAreDeliveredBeforeUpAndNextDown() {
         val tracker = KeyPointerTracker()
         val trace = mutableListOf<String>()

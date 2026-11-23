@@ -29,11 +29,30 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 
+internal class InputViewRestoreGate {
+    private var restorePending = false
+
+    fun onInputViewFinished() {
+        restorePending = true
+    }
+
+    fun shouldRestoreOnWindowShown(inputStarted: Boolean): Boolean {
+        if (!inputStarted) {
+            restorePending = false
+            return false
+        }
+        val restore = restorePending
+        restorePending = false
+        return restore
+    }
+}
+
 class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {
     private val lifecycleRegistry = LifecycleRegistry(this)
     private val store = ViewModelStore()
     private val savedStateRegistryController = SavedStateRegistryController.create(this)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val inputViewRestoreGate = InputViewRestoreGate()
     private var controller: KeyboardController? = null
     private var inputView: View? = null
     private val vibrator: Vibrator? by lazy {
@@ -81,7 +100,6 @@ class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwne
 
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
         super.onStartInputView(info, restarting)
-        controller?.startInput(info, restarting)
         moveTo(Lifecycle.State.RESUMED)
     }
 
@@ -99,13 +117,23 @@ class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwne
 
     override fun onWindowShown() {
         super.onWindowShown()
+        if (inputViewRestoreGate.shouldRestoreOnWindowShown(currentInputStarted)) {
+            currentInputEditorInfo?.let { controller?.startInput(it, restarting = true) }
+        }
         moveTo(Lifecycle.State.RESUMED)
     }
 
     override fun onWindowHidden() {
-        controller?.onHidden()
         moveTo(Lifecycle.State.STARTED)
         super.onWindowHidden()
+    }
+
+    override fun onFinishInputView(finishingInput: Boolean) {
+        super.onFinishInputView(finishingInput)
+        if (lifecycleRegistry.currentState != Lifecycle.State.DESTROYED) {
+            controller?.onHidden()
+            inputViewRestoreGate.onInputViewFinished()
+        }
     }
 
     override fun onCurrentInputMethodSubtypeChanged(newSubtype: InputMethodSubtype) {

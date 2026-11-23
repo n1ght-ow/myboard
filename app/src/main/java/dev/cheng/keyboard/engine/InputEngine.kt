@@ -37,6 +37,7 @@ sealed interface Cmd {
     data class Commit(val text: String) : Cmd
     data class Compose(val text: String) : Cmd
     data object ClearCompose : Cmd
+    data object ClearInput : Cmd
     data object DeleteOne : Cmd
     data class DeleteCount(val count: Int) : Cmd
     data object DeleteWord : Cmd
@@ -68,6 +69,7 @@ sealed interface EngineAct {
     data object CloseSymbols : EngineAct
     data class Pick(val index: Int) : EngineAct
     data class Candidates(val preedit: String, val items: List<Candidate>) : EngineAct
+    data object ClearInput : EngineAct
 }
 
 data class EngineStep(
@@ -113,6 +115,25 @@ class InputEngine(private val latin: LatinDecoder) {
                     preedit = if (state.associating || state.raw.isEmpty()) state.preedit else act.preedit,
                     candidates = act.items,
                 ),
+            )
+            EngineAct.ClearInput -> EngineStep(
+                state.copy(
+                    raw = "",
+                    preedit = "",
+                    candidates = emptyList(),
+                    associating = false,
+                    partialText = "",
+                    partialSyllables = "",
+                    autoSpace = false,
+                    lastEnglishWord = null,
+                    undoAutocorrect = null,
+                    verbatimFirst = false,
+                    lastChineseContext = "",
+                    touchHints = emptyList(),
+                    touchSamples = emptyList(),
+                    literalContext = false,
+                ),
+                listOf(Cmd.ClearInput),
             )
         }
     }

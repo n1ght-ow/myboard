@@ -44,7 +44,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEvent
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.changedToDown
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -78,6 +81,7 @@ import dev.cheng.keyboard.ime.ResultKind
 import dev.cheng.keyboard.ime.UiState
 import dev.cheng.keyboard.ime.assist.TypingAssistKind
 import dev.cheng.keyboard.ime.assist.TypingSuggestion
+import dev.cheng.keyboard.ime.gesture.BackspaceHint
 import dev.cheng.keyboard.ime.gesture.PopupPreview
 import dev.cheng.keyboard.ime.gesture.TapPreview
 import dev.cheng.keyboard.ime.gesture.KeyPointerChange
@@ -118,6 +122,22 @@ internal data class Palette(
     val keyShadow: Color,
     val keyBorder: Color,
     val divider: Color,
+)
+
+internal fun PointerEvent.hasPointerCancel(): Boolean {
+    if (changes.isEmpty()) return false
+    if (type == PointerEventType.Unknown || type == PointerEventType.Exit) return true
+    return changes.all { !it.pressed && it.isConsumed }
+}
+
+internal fun PointerInputChange.asKeyPointerChange(cancelled: Boolean) = KeyPointerChange(
+    id = id.value,
+    pressed = pressed,
+    down = changedToDown(),
+    x = position.x,
+    y = position.y,
+    time = uptimeMillis,
+    cancelled = cancelled,
 )
 
 private val DarkPalette = Palette(
@@ -704,6 +724,7 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
                             val pressContexts = mutableMapOf<Long, HitContext>()
                             while (true) {
                                 val event = awaitPointerEvent(PointerEventPass.Main)
+                                val cancel = event.hasPointerCancel()
                                 val keysNow = placementState.value.keys
                                 val time = event.changes.firstOrNull()?.uptimeMillis ?: SystemClock.uptimeMillis()
                                 fun press(pointer: KeyPointerChange, rollover: Boolean): Boolean {
@@ -722,9 +743,7 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
                                     }
                                 }
                                 pointers.process(
-                                    changes = event.changes.map {
-                                        KeyPointerChange(it.id.value, it.pressed, it.changedToDown(), it.position.x, it.position.y, it.uptimeMillis)
-                                    },
+                                    changes = event.changes.map { it.asKeyPointerChange(cancel) },
                                     onDown = { press(it, false) },
                                     onRollover = { press(it, true) },
                                     onMove = { pointer ->
@@ -733,6 +752,7 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
                                         controller.onMove(
                                             pointer.x, pointer.y, pointer.time, hit?.model,
                                             hit?.let { touchSampleOf(keysNow, pointer.x, pointer.y, it.model, ctx) },
+                                            released = !pointer.pressed,
                                         )
                                     },
                                     onUp = { controller.onUp(time); touchContext = null },
@@ -775,6 +795,29 @@ private fun KeyArea(state: UiState, palette: Palette, controller: KeyboardContro
             val anchor = placement.keys.firstOrNull { it.model.id == popup?.keyId }
             if (popup != null && anchor != null) {
                 PopupKeys(popup, anchor, widthPx, side, topClearancePx, palette, density)
+            }
+            val backspaceAnchor = placement.keys.firstOrNull { it.model.kind == KeyKind.Backspace }
+            if (state.backspaceHint != BackspaceHint.None && backspaceAnchor != null) {
+                val hintWidth = 96.dp
+                val hintHeight = 28.dp
+                val bounds = placeFloatingPopup(
+                    anchor = backspaceAnchor,
+                    popupWidth = with(density) { hintWidth.toPx() },
+                    popupHeight = with(density) { hintHeight.toPx() },
+                    gapAbove = with(density) { 5.dp.toPx() },
+                    boardWidth = widthPx,
+                    sidePx = side,
+                    topClearancePx = topClearancePx,
+                )
+                BackspaceHintPill(
+                    hint = state.backspaceHint,
+                    palette = palette,
+                    modifier = Modifier
+                        .zIndex(2f)
+                        .offset { IntOffset(bounds.x.roundToInt(), bounds.y.roundToInt()) }
+                        .size(hintWidth, hintHeight)
+                        .shadow(elevation = 3.dp, shape = RoundedCornerShape(9.dp), clip = false),
+                )
             }
         }
     }
@@ -1194,6 +1237,33 @@ private fun LanguageMark(language: Language, palette: Palette) {
             fontSize = 9.5.sp,
             fontWeight = FontWeight.SemiBold,
             lineHeight = 10.sp,
+        )
+    }
+}
+
+@Composable
+internal fun BackspaceHintPill(
+    hint: BackspaceHint,
+    palette: Palette,
+    modifier: Modifier = Modifier,
+) {
+    if (hint == BackspaceHint.None) return
+    val armed = hint == BackspaceHint.ClearArmed
+    val shape = RoundedCornerShape(9.dp)
+    Box(
+        modifier
+            .clip(shape)
+            .background(if (armed) palette.accent else palette.sheetElevated)
+            .border(0.7.dp, if (armed) palette.accent else palette.divider, shape),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            if (armed) "松开清空" else "上滑清空",
+            color = if (armed) palette.onAccent else palette.label,
+            fontSize = 12.sp,
+            lineHeight = 13.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
         )
     }
 }
