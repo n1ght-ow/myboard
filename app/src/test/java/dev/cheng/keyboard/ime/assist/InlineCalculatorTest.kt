@@ -56,6 +56,35 @@ class InlineCalculatorTest {
     }
 
     @Test
+    fun preservesFiniteLowOrderResidueThroughCancellation() {
+        val largeProduct = "999999999999*999999999999"
+
+        assertEquals(
+            "0.0000000001",
+            calculateInline("(($largeProduct+0.00000000001)-$largeProduct)*10"),
+        )
+        assertEquals(
+            "-0.0000000001",
+            calculateInline("(($largeProduct-0.00000000001)-$largeProduct)*10"),
+        )
+        assertNull(calculateInline("($largeProduct+0.00000000001)-$largeProduct"))
+        assertNull(calculateInline("($largeProduct-0.00000000001)-$largeProduct"))
+        assertNull(calculateInline("($largeProduct+0.000000000000001)-$largeProduct"))
+        assertEquals(
+            "0.0000000001",
+            calculateInline("($largeProduct+0.00000000005)-$largeProduct"),
+        )
+    }
+
+    @Test
+    fun keepsTerminatingDivisionExactBeforeCancellation() {
+        assertEquals(
+            "0",
+            calculateInline("(1/9007199254740992*9007199254740992)-1"),
+        )
+    }
+
+    @Test
     fun rejectsLoneNumbersAndIncompleteExpressions() {
         assertNull(calculateInline(""))
         assertNull(calculateInline("   "))

@@ -162,6 +162,11 @@ private fun buildSyllableAliases(words: Set<String>): Map<String, String> {
 
 private data class LatticePath(val parts: List<String>, val score: Int)
 
+private val pinyinInitials = setOf(
+    "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h", "j", "q", "x",
+    "zh", "ch", "sh", "r", "z", "c", "s", "y", "w",
+)
+
 private fun isFullLatticeSyllable(syllable: String): Boolean {
     return syllable.length >= 2 || (syllable.length == 1 && syllable[0] in "aeo")
 }
@@ -277,8 +282,7 @@ fun segmentPinyin(raw: String, trie: SylTrie): List<Seg> {
     if ('\'' in raw) {
         val trimmed = raw.lowercase().filter { it in 'a'..'z' || it == '\'' }.trim('\'')
         if (trimmed.isNotEmpty() && '\'' in trimmed) {
-            val segmented = segmentSeparated(trimmed, trie)
-            if (segmented.isNotEmpty()) return segmented
+            return segmentSeparated(trimmed, trie)
         }
     }
     val text = raw.lowercase().filter { it in 'a'..'z' }
@@ -294,7 +298,7 @@ private fun segmentSeparated(trimmed: String, trie: SylTrie): List<Seg> {
         val options = segmentChunk(chunk, trie, allowPartial = isLast).let { segs ->
             if (isLast) segs else segs.filter { !it.partial }
         }.take(4)
-        if (options.isEmpty()) return emptyList()
+        if (options.isEmpty()) return combined.filter { it.parts.isNotEmpty() }
         val next = ArrayList<Seg>(combined.size * options.size)
         for (prefix in combined) {
             for (opt in options) {
@@ -460,6 +464,13 @@ class PinyinDecoder(syllables: Set<String>) {
         val segs = segmentPinyin(text, activeTrie)
         val full = segs.filter { !it.partial }
         val keepWritten = '\'' in text
+        val explicitChunks = if (keepWritten) {
+            text.trim('\'').split('\'').filter { it.isNotEmpty() }
+        } else {
+            emptyList()
+        }
+        val hasInternalSeparator = explicitChunks.size > 1
+        val explicitInitialsOnly = hasInternalSeparator && explicitChunks.all { it in pinyinInitials }
         // Keep partial segments both when last token is incomplete AND when last token is a 1-letter extensible syllable
         val open = segs.filter { seg ->
             seg.partial && seg.parts.isNotEmpty() &&
@@ -506,12 +517,16 @@ class PinyinDecoder(syllables: Set<String>) {
             !primarySeg.partial &&
             primarySeg.parts.all { it.length >= 2 } &&
             rankedPinyin.isNotEmpty()
-        val wholeAbbrev = if (solid || letters.length !in 2..64) {
+        val wholeAbbrev = if (
+            solid ||
+            letters.length !in 2..64 ||
+            (hasInternalSeparator && !explicitInitialsOnly)
+        ) {
             emptyList()
         } else {
             book.abbreviations(letters)
         }
-        val mixedAbbrev = if (solid || letters.length !in 2..64) {
+        val mixedAbbrev = if (hasInternalSeparator || solid || letters.length !in 2..64) {
             emptyList()
         } else {
             book.mixedAbbreviations(letters)
@@ -639,6 +654,7 @@ class PinyinDecoder(syllables: Set<String>) {
             topBodyFreq > 5_000_000
         val shouldTryTypos = when {
             letters.length !in 2..22 -> false
+            hasInternalSeparator -> false
             strongFuzzyRepair -> false
             cleanMidTyping || cleanSingleInitial -> false
             body.isEmpty() -> true
@@ -740,6 +756,7 @@ class PinyinDecoder(syllables: Set<String>) {
             }
         }
         val doubledLead = if (
+            !hasInternalSeparator &&
             letters.length >= 3 &&
             letters[0] == letters[1] &&
             letters[0] !in "aeiouv"
@@ -752,7 +769,7 @@ class PinyinDecoder(syllables: Set<String>) {
             val best = doubledLead.first()
             body = listOf(best) + body.filter { it.text != best.text }
         }
-        val interiorDuplicate = if (!solid && letters.length >= 4) {
+        val interiorDuplicate = if (!hasInternalSeparator && !solid && letters.length >= 4) {
             book.interiorDuplicateRepairs(letters, 500_000)
         } else {
             emptyList()
@@ -779,7 +796,7 @@ class PinyinDecoder(syllables: Set<String>) {
 
         // Longest valid Chinese prefix guarantee: never return empty when leading syllables are decodable!
         var fallbackPrefixSeg: Seg? = null
-        if (body.isEmpty()) {
+        if (body.isEmpty() && !hasInternalSeparator) {
             val prefixSegs = longestPrefixSegments(letters, trie)
             fallbackPrefixSeg = prefixSegs.firstOrNull()
             val prefixCandidates = ArrayList<Scored>()
@@ -790,7 +807,7 @@ class PinyinDecoder(syllables: Set<String>) {
             body = book.rank(prefixCandidates)
         }
 
-        if (touchSamples.isNotEmpty() && letters.length >= 2) {
+        if (!hasInternalSeparator && touchSamples.isNotEmpty() && letters.length >= 2) {
             val soft = book.softTouchVariants(letters, touchSamples)
             if (soft.isNotEmpty()) body = if (body.isEmpty()) soft else book.rank(body + soft)
         }
@@ -806,7 +823,8 @@ class PinyinDecoder(syllables: Set<String>) {
             emptyList()
         } else {
             val anchored = book.anchor(anchorSeg).ifEmpty {
-                book.firstLetterAnchor(letters)
+                val anchorLetters = if (hasInternalSeparator) explicitChunks.first() else letters
+                book.firstLetterAnchor(anchorLetters)
             }
             anchored.filter { item -> body.none { it.text == item.text } }.take(8)
         }

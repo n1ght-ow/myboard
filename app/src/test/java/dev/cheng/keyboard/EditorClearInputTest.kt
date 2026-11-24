@@ -48,7 +48,7 @@ class EditorClearInputTest {
         assertEquals(ClearInputResult.Applied, bridge.clearInput())
 
         assertEquals("", input.text)
-        assertEquals(listOf("begin", "finish", "selection:0..10", "clear", "end"), input.edits)
+        assertEquals(listOf("finish", "selection:0..10", "clear"), input.edits)
     }
 
     @Test
@@ -62,7 +62,7 @@ class EditorClearInputTest {
 
         assertEquals("before and after", input.text)
         assertEquals(7 to 3, input.start to input.end)
-        assertEquals(listOf("begin", "selectAll", "selection:7..3", "end"), input.edits)
+        assertEquals(listOf("selectAll", "selection:7..3"), input.edits)
     }
 
     @Test
@@ -76,7 +76,7 @@ class EditorClearInputTest {
 
         assertEquals("前ni后", input.text)
         assertEquals(3 to 3, input.start to input.end)
-        assertEquals(listOf("begin", "finish", "selection:0..4", "clear", "selection:3..3", "end"), input.edits)
+        assertEquals(listOf("finish", "selection:0..4", "clear", "selection:3..3"), input.edits)
     }
 
     @Test
@@ -88,7 +88,7 @@ class EditorClearInputTest {
 
         assertEquals("secret", input.text)
         assertEquals(0, input.extractionCalls)
-        assertEquals(listOf("begin", "selectAll", "end"), input.edits)
+        assertEquals(listOf("selectAll"), input.edits)
     }
 
     @Test

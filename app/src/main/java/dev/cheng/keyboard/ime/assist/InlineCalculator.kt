@@ -11,6 +11,7 @@ private const val MAX_BINARY_OPERATIONS = 40
 private const val MAX_WORKING_SCALE = MAX_BINARY_OPERATIONS * MAX_LITERAL_DIGITS
 private const val MAX_RESULT_INTEGER_DIGITS = 24
 private const val MAX_WORKING_PRECISION = 34
+private const val MAX_EXACT_PRECISION = MAX_RESULT_INTEGER_DIGITS + MAX_WORKING_SCALE
 private const val DISPLAY_SCALE = 10
 
 private val workingContext = MathContext(MAX_WORKING_PRECISION, RoundingMode.HALF_UP)
@@ -167,25 +168,29 @@ private class InlineExpressionParser(
     private fun peek(): Char? = source.getOrNull(index)
 
     private fun addBounded(left: BigDecimal, right: BigDecimal): BigDecimal? =
-        bound(left.add(right, workingContext))
+        bound(left.add(right))
 
     private fun subtractBounded(left: BigDecimal, right: BigDecimal): BigDecimal? =
-        bound(left.subtract(right, workingContext))
+        bound(left.subtract(right))
 
     private fun multiplyBounded(left: BigDecimal, right: BigDecimal): BigDecimal? =
-        bound(left.multiply(right, workingContext))
+        bound(left.multiply(right))
 
     private fun divideBounded(left: BigDecimal, right: BigDecimal): BigDecimal? {
         if (right.signum() == 0) return null
-        return bound(left.divide(right, workingContext))
+        val quotient = try {
+            left.divide(right)
+        } catch (_: ArithmeticException) {
+            left.divide(right, workingContext)
+        }
+        return bound(quotient)
     }
 
     private fun bound(value: BigDecimal): BigDecimal? {
-        val rounded = value.round(workingContext)
-        if (rounded.precision() > MAX_WORKING_PRECISION) return null
-        if (rounded.scale() > MAX_WORKING_SCALE) return null
-        if (integerDigitCount(rounded) > MAX_RESULT_INTEGER_DIGITS) return null
-        return rounded
+        if (value.precision() > MAX_EXACT_PRECISION) return null
+        if (value.scale() > MAX_WORKING_SCALE) return null
+        if (integerDigitCount(value) > MAX_RESULT_INTEGER_DIGITS) return null
+        return value
     }
 
     private fun render(value: BigDecimal): String? {

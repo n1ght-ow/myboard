@@ -162,6 +162,62 @@ class TypingAssistTest {
     }
 
     @Test
+    fun embeddedUrlPrefixesInsideOneAddressDoNotBecomeNewHosts() {
+        val badContexts = listOf(
+            TypingAssistContext(before = "https://example.com/a(www.exa"),
+            TypingAssistContext(before = "https://example.com/a(www.exa", uriField = true),
+            TypingAssistContext(before = "https://example.com/?next=(www.exa"),
+            TypingAssistContext(before = "https://example.com/?next=(https://exa"),
+            TypingAssistContext(before = "https://example.com/#(https://exa"),
+            TypingAssistContext(before = "https://example.com/#(https://exa", uriField = true),
+            TypingAssistContext(before = "example.com/a(www.exa", uriField = true),
+            TypingAssistContext(before = "example.com?q=(https://exa", uriField = true),
+        )
+
+        for (context in badContexts) {
+            assertTrue(
+                "embedded URL prefix must not become a host: ${context.before}",
+                typingSuggestions(context, now).none { it.kind == TypingAssistKind.Url },
+            )
+        }
+    }
+
+    @Test
+    fun standaloneUrlPrefixesStillOfferSuffixesWithUnchangedRanges() {
+        val textContexts = listOf(
+            "网址：https://exa",
+            "(www.exa",
+            "说明 https://done.example/path https://exa",
+            "https://done.example，https://exa",
+            "https://done.example、www.exa",
+            "evilwww.example;https://exa",
+        )
+
+        for (before in textContexts) {
+            val suggestions = typingSuggestions(
+                TypingAssistContext(before = before),
+                now,
+            ).filter { it.kind == TypingAssistKind.Url }
+            assertEquals(listOf(".com", ".cn", ".net", ".org"), suggestions.map { it.label })
+            assertTrue(suggestions.all { it.expectedBefore == before })
+        }
+
+        val uri = typingSuggestions(
+            TypingAssistContext(before = "example.c", uriField = true),
+            now,
+        )
+        assertEquals(listOf(".com", ".cn"), uri.map { it.label })
+        assertTrue(uri.all { it.expectedBefore == "example.c" && it.replaceBefore == 2 })
+
+        val explicitUri = typingSuggestions(
+            TypingAssistContext(before = "https://exa", uriField = true),
+            now,
+        )
+        assertEquals(listOf(".com", ".cn", ".net", ".org"), explicitUri.map { it.label })
+        assertTrue(explicitUri.all { it.expectedBefore == "https://exa" && it.replaceBefore == 0 })
+    }
+
+    @Test
     fun trailingUrlDotReplacesDotInsteadOfDuplicatingIt() {
         val suggestions = typingSuggestions(
             TypingAssistContext(before = "https://example.", uriField = true),

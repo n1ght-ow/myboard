@@ -32,6 +32,10 @@ import kotlinx.coroutines.cancel
 internal class InputViewRestoreGate {
     private var restorePending = false
 
+    fun onInputStarted() {
+        restorePending = false
+    }
+
     fun onInputViewFinished() {
         restorePending = true
     }
@@ -95,6 +99,7 @@ class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwne
 
     override fun onStartInput(info: EditorInfo, restarting: Boolean) {
         super.onStartInput(info, restarting)
+        inputViewRestoreGate.onInputStarted()
         controller?.startInput(info, restarting)
     }
 

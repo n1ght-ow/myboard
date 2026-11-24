@@ -99,7 +99,9 @@ class KeyGesture(
 
     fun canRollover(): Boolean {
         val current = key ?: return false
-        if (!tracking || cancelled || armed || flickChoice != null || spaceSliding || repeating) return false
+        if (!tracking) return false
+        if (cancelled) return current.kind == KeyKind.Backspace
+        if (armed || flickChoice != null || spaceSliding || repeating) return false
         return current.kind in setOf(
             KeyKind.Letter,
             KeyKind.Char,

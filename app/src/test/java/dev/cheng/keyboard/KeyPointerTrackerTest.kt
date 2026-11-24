@@ -8,6 +8,7 @@ import dev.cheng.keyboard.ime.gesture.KeyPointerTracker
 import dev.cheng.keyboard.model.KeyKind
 import dev.cheng.keyboard.model.KeyModel
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class KeyPointerTrackerTest {
@@ -273,5 +274,65 @@ class KeyPointerTrackerTest {
         event(down(1))
         event(held(1).copy(x = 140f), down(2))
         assertEquals(listOf("move:1:140.0", "roll:2"), trace)
+    }
+
+    @Test
+    fun cancelledBackspaceDoesNotBlockNewFingerOrDeleteOnOldRelease() {
+        class Typist {
+            val tracker = KeyPointerTracker()
+            val gesture = KeyGesture(16f, 34f, 36f)
+            val actions = mutableListOf<EngineAct>()
+            val backspace = KeyModel("backspace", KeyKind.Backspace, "")
+            val letter = KeyModel("l-a", KeyKind.Letter, "a", hint = "1")
+
+            fun keyAt(x: Float) = if (x < 150f) backspace else letter
+
+            fun accept(frame: GestureFrame) {
+                actions += frame.actions
+            }
+
+            fun event(vararg changes: KeyPointerChange) = tracker.process(
+                changes.toList(),
+                onDown = { accept(gesture.down(keyAt(it.x), it.x, it.y, it.time)); true },
+                onRollover = {
+                    val frames = gesture.rollover(keyAt(it.x), it.x, it.y, it.time)
+                    frames.forEach(::accept)
+                    frames.isNotEmpty()
+                },
+                onMove = { accept(gesture.move(it.x, it.y, it.time, keyAt(it.x))) },
+                onUp = { accept(gesture.up()) },
+                onCancel = { gesture.cancel() },
+            )
+        }
+
+        fun check(secondFingerWaitsBeforeCancel: Boolean) {
+            val typist = Typist()
+            typist.event(down(1).copy(x = 100f, y = 100f, time = 10L))
+            if (secondFingerWaitsBeforeCancel) {
+                typist.event(
+                    held(1).copy(x = 100f, y = 100f, time = 20L),
+                    down(2).copy(x = 300f, y = 100f, time = 20L),
+                )
+                typist.event(
+                    held(1).copy(x = 20f, y = 100f, time = 30L),
+                    held(2).copy(x = 300f, y = 100f, time = 30L),
+                )
+            } else {
+                typist.event(held(1).copy(x = 20f, y = 100f, time = 20L))
+                typist.event(
+                    held(1).copy(x = 20f, y = 100f, time = 30L),
+                    down(2).copy(x = 300f, y = 100f, time = 30L),
+                )
+            }
+            typist.event(held(1).copy(x = 20f, y = 100f, time = 40L), up(2).copy(x = 300f, time = 40L))
+            typist.event(up(1).copy(x = 20f, y = 100f, time = 50L))
+
+            assertEquals(1, typist.actions.size)
+            assertTrue(typist.actions.none { it == EngineAct.Backspace || it == EngineAct.ClearInput })
+            assertEquals('a', (typist.actions.single() as EngineAct.Letter).ch)
+        }
+
+        check(secondFingerWaitsBeforeCancel = false)
+        check(secondFingerWaitsBeforeCancel = true)
     }
 }

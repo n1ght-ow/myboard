@@ -19,7 +19,6 @@ import java.io.File
 
 const val MAX_RECENT_CLIPS = 12
 private const val MAX_CLIP_CHARS = 4096
-private const val CLIP_GRAPHEME_WINDOW = 256
 private val GRAPHEME_CLUSTER = Regex("\\X")
 
 val Context.settingsStore by preferencesDataStore(name = "keyboard")
@@ -99,20 +98,11 @@ private fun truncateRecentClip(text: String, maxChars: Int): String {
 }
 
 private fun graphemeSafeEnd(text: String, target: Int): Int {
-    var windowStart = (target - CLIP_GRAPHEME_WINDOW).coerceAtLeast(0)
-    var windowEnd = (target + CLIP_GRAPHEME_WINDOW).coerceAtMost(text.length)
-    if (windowStart > 0 && text[windowStart - 1].isHighSurrogate() && text[windowStart].isLowSurrogate()) {
-        windowStart--
-    }
-    if (windowEnd < text.length && text[windowEnd - 1].isHighSurrogate() && text[windowEnd].isLowSurrogate()) {
-        windowEnd++
-    }
-
-    for (match in GRAPHEME_CLUSTER.findAll(text.substring(windowStart, windowEnd))) {
-        val start = windowStart + match.range.first
-        val end = windowStart + match.range.last + 1
-        if (target > start && target < end) return start
-        if (end >= target) break
+    val boundedEnd = target + Character.charCount(text.codePointAt(target))
+    val matcher = GRAPHEME_CLUSTER.toPattern().matcher(text)
+    matcher.region(0, boundedEnd)
+    while (matcher.find()) {
+        if (matcher.end() > target) return matcher.start()
     }
     return target
 }

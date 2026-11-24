@@ -19,54 +19,85 @@ fun parseSseLine(line: String): SseDelta? {
 }
 
 internal fun jsonString(json: String, field: String): String? {
-    val key = "\"$field\""
-    var search = 0
-    while (search < json.length) {
-        val found = json.indexOf(key, search)
-        if (found < 0) return null
-        val before = if (found == 0) ' ' else json[found - 1]
-        if (before == '_' || before.isLetterOrDigit()) {
-            search = found + key.length
+    var cursor = 0
+    while (cursor < json.length) {
+        if (json[cursor] != '"') {
+            cursor++
             continue
         }
-        var cursor = found + key.length
-        while (cursor < json.length && json[cursor].isWhitespace()) cursor++
-        if (cursor >= json.length || json[cursor] != ':') return null
-        cursor++
-        while (cursor < json.length && json[cursor].isWhitespace()) cursor++
-        if (cursor >= json.length) return null
-        if (json.startsWith("null", cursor)) return null
-        if (json[cursor] != '"') return null
-        cursor++
-        val out = StringBuilder()
-        while (cursor < json.length) {
-            val ch = json[cursor]
-            if (ch == '\\' && cursor + 1 < json.length) {
-                when (val next = json[cursor + 1]) {
-                    'n' -> out.append('\n')
-                    't' -> out.append('\t')
-                    'r' -> out.append('\r')
-                    '"' -> out.append('"')
-                    '\\' -> out.append('\\')
-                    '/' -> out.append('/')
-                    'u' -> if (cursor + 5 < json.length) {
-                        val hex = json.substring(cursor + 2, cursor + 6)
-                        out.append(hex.toIntOrNull(16)?.toChar() ?: '?')
-                        cursor += 6
-                        continue
-                    } else {
-                        out.append(next)
-                    }
-                    else -> out.append(next)
+        val tokenEnd = jsonStringEnd(json, cursor)
+        if (tokenEnd < 0) return null
+        var colon = tokenEnd + 1
+        while (colon < json.length && json[colon].isWhitespace()) colon++
+        if (colon >= json.length || json[colon] != ':') {
+            cursor = tokenEnd + 1
+            continue
+        }
+        if (json.substring(cursor + 1, tokenEnd) != field) {
+            cursor = tokenEnd + 1
+            continue
+        }
+        var valueStart = colon + 1
+        while (valueStart < json.length && json[valueStart].isWhitespace()) valueStart++
+        if (valueStart >= json.length) return null
+        if (json.startsWith("null", valueStart)) return null
+        if (json[valueStart] != '"') return null
+        return jsonStringValue(json, valueStart)
+    }
+    return null
+}
+
+private fun jsonStringEnd(json: String, quote: Int): Int {
+    var cursor = quote + 1
+    while (cursor < json.length) {
+        when (json[cursor]) {
+            '\\' -> {
+                if (cursor + 1 >= json.length) return -1
+                cursor += if (json[cursor + 1] == 'u') {
+                    if (cursor + 5 >= json.length) return -1
+                    6
+                } else {
+                    2
                 }
-                cursor += 2
-                continue
             }
-            if (ch == '"') return out.toString()
+            '"' -> return cursor
+            else -> cursor++
+        }
+    }
+    return -1
+}
+
+private fun jsonStringValue(json: String, quote: Int): String? {
+    val out = StringBuilder()
+    var cursor = quote + 1
+    while (cursor < json.length) {
+        val ch = json[cursor]
+        if (ch == '"') return out.toString()
+        if (ch != '\\') {
             out.append(ch)
             cursor++
+            continue
         }
-        return null
+        if (cursor + 1 >= json.length) return null
+        when (val escaped = json[cursor + 1]) {
+            '"' -> out.append('"')
+            '\\' -> out.append('\\')
+            '/' -> out.append('/')
+            'b' -> out.append('\b')
+            'f' -> out.append('\u000C')
+            'n' -> out.append('\n')
+            'r' -> out.append('\r')
+            't' -> out.append('\t')
+            'u' -> {
+                if (cursor + 5 >= json.length) return null
+                val hex = json.substring(cursor + 2, cursor + 6)
+                out.append(hex.toIntOrNull(16)?.toChar() ?: '?')
+                cursor += 6
+                continue
+            }
+            else -> out.append(escaped)
+        }
+        cursor += 2
     }
     return null
 }

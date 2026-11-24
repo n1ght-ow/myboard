@@ -66,6 +66,13 @@ fun applyCase(suggestion: String, typed: String): String {
             "I'" + suggestion.substring(2)
         }
     }
+    if (
+        typed.equals(suggestion, ignoreCase = true) &&
+        typed.any { it.isLowerCase() } &&
+        typed.drop(1).any { it.isUpperCase() }
+    ) {
+        return typed
+    }
     if (typed.length > 1 && typed.all { !it.isLetter() || it.isUpperCase() } && typed.any { it.isUpperCase() }) {
         return suggestion.uppercase()
     }
@@ -89,10 +96,18 @@ fun shiftAfter(current: ShiftState, committed: String): ShiftState {
 
 fun shouldAutoCap(before: String): Boolean {
     var index = before.length
-    while (index > 0 && before[index - 1].isWhitespace()) index--
+    while (index > 0) {
+        val ch = before[index - 1]
+        if (ch.isLineBreak()) return true
+        if (!ch.isWhitespace()) break
+        index--
+    }
     if (index == 0) return true
-    return before[index - 1] in ".!?。！？\n"
+    return before[index - 1] in ".!?。！？"
 }
+
+private fun Char.isLineBreak(): Boolean =
+    this == '\n' || this == '\r' || this == '\u2028' || this == '\u2029'
 
 fun previousWordUnits(before: String): Int {
     if (before.isEmpty()) return 0

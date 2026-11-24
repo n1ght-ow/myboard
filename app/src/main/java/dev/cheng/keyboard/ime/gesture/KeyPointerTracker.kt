@@ -53,7 +53,7 @@ class KeyPointerTracker {
             }
         }
 
-        // Only a physical down can enter the queue. Held fingers are never re-adopted.
+        // Only a physical down can enter the queue; a queued press can replace a yielding gesture.
         for (change in changes) {
             if (change.down && change.pressed && change.id != activeId) waiting[change.id] = change
         }
@@ -75,6 +75,16 @@ class KeyPointerTracker {
             if (onRollover(change)) {
                 waiting.remove(change.id)
                 activeId = change.id
+                started = true
+            }
+        }
+        if (!started && activeId != null) {
+            val held = waiting.values.firstOrNull { press ->
+                changes.any { it.id == press.id && it.pressed && !it.down }
+            }
+            if (held != null && onRollover(held)) {
+                waiting.remove(held.id)
+                activeId = held.id
                 started = true
             }
         }

@@ -252,14 +252,18 @@ private fun urlSuggestions(context: TypingAssistContext): List<TypingSuggestion>
 
 private fun urlToken(before: String, uriField: Boolean): String? {
     if (before.isEmpty()) return null
-    val match = explicitUrlPrefix.findAll(before).toList().asReversed().firstOrNull {
-        it.range.first == 0 || before[it.range.first - 1].isExplicitUrlPrefixBoundary()
-    }
     if (uriField) {
         if (before.any(Char::isWhitespace)) return null
-        return before.substring(match?.range?.first ?: 0)
+        return before
     }
-    match ?: return null
+
+    val matches = explicitUrlPrefix.findAll(before).filter {
+        it.range.first == 0 || before[it.range.first - 1].isExplicitUrlPrefixBoundary()
+    }.toList()
+    val match = matches.lastOrNull() ?: return null
+    var tokenStart = match.range.first
+    while (tokenStart > 0 && before[tokenStart - 1].isUriTokenChar()) tokenStart--
+    if (matches.any { it.range.first in tokenStart until match.range.first }) return null
     return before.substring(match.range.first)
 }
 
@@ -357,7 +361,6 @@ private fun calculatorSuggestions(context: TypingAssistContext): List<TypingSugg
     if (body.isEmpty() || body.none { it in '0'..'9' }) return emptyList()
     if (body.any { !isExpressionChar(it) }) return emptyList()
     if (!hasBalancedParentheses(body)) return emptyList()
-    if (!hasPotentialBinaryOperator(body)) return emptyList()
     if (looksLikeDateOrPhone(body)) return emptyList()
 
     val result = calculateInline(body)?.trim().orEmpty()
@@ -413,28 +416,6 @@ private fun hasBalancedParentheses(expression: String): Boolean {
     return depth == 0
 }
 
-private fun hasPotentialBinaryOperator(expression: String): Boolean {
-    val compact = expression.filterNot(Char::isWhitespace)
-    var previousSignificant: Char? = null
-    for (ch in compact) {
-        when (ch) {
-            '+', '-' -> {
-                if (previousSignificant?.let { it.isDigit() || it == ')' } == true) {
-                    return true
-                }
-            }
-
-            '*', '/', '×', '÷' -> {
-                if (previousSignificant?.let { it.isDigit() || it == ')' } == true) {
-                    return true
-                }
-            }
-        }
-        previousSignificant = ch
-    }
-    return false
-}
-
 private fun looksLikeDateOrPhone(expression: String): Boolean {
     val compact = expression.filterNot(Char::isWhitespace)
     if (
@@ -480,6 +461,10 @@ private fun Char.isExplicitUrlPrefixBoundary(): Boolean =
             this == '&' ||
             this == '='
         )
+
+private fun Char.isUriTokenChar(): Boolean =
+    isAsciiLetterOrDigit() ||
+        this in "-._~:/?#[]@!$&'()*+,;=%"
 
 private fun Char.isStandaloneTokenChar(): Boolean =
     isWhitespace() ||

@@ -182,7 +182,13 @@ class LatinDecoder {
             }
         }
 
-        if (scored.isEmpty()) return emptyList()
+        if (scored.isEmpty()) {
+            return if (verbatimFirst) {
+                listOf(Candidate(prefix, prefix, 1))
+            } else {
+                emptyList()
+            }
+        }
 
         val ranked = scored.entries
             .sortedByDescending { it.value.second }

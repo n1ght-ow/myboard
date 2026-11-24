@@ -86,6 +86,40 @@ internal fun englishAutoSpacePosition(snapshot: TypingEditorSnapshot?, word: Str
     return snapshot.selection.end
 }
 
+internal fun displayedCandidateIndex(current: EngineState, shown: EngineState, index: Int): Int? {
+    if (current.raw != shown.raw || current.partialText != shown.partialText ||
+        current.language != shown.language || current.shift != shown.shift ||
+        current.associating != shown.associating
+    ) return null
+    val selected = shown.candidates.getOrNull(index) ?: return null
+    return current.candidates.indexOfFirst {
+        it.text == selected.text && it.syllables == selected.syllables && it.consumed == selected.consumed
+    }.takeIf { it >= 0 }
+}
+
+internal fun wholeCompositionCandidate(state: EngineState, decodedRaw: String): String? {
+    if (state.language != Language.Chinese || state.password || state.associating || state.raw != decodedRaw) return null
+    val letters = state.raw.count { it in 'a'..'z' || it in 'A'..'Z' }
+    return state.candidates.firstOrNull()?.takeIf { letters > 0 && it.consumed == letters }?.text
+}
+
+internal fun EngineState.afterInputViewFinished(): EngineState = copy(
+    raw = "",
+    preedit = "",
+    candidates = emptyList(),
+    associating = false,
+    partialText = "",
+    partialSyllables = "",
+    autoSpace = false,
+    lastEnglishWord = null,
+    undoAutocorrect = null,
+    verbatimFirst = false,
+    lastChineseContext = "",
+    touchHints = emptyList(),
+    touchSamples = emptyList(),
+    literalContext = false,
+)
+
 class KeyboardController(
     private val context: Context,
     private val scope: CoroutineScope,
@@ -334,7 +368,9 @@ class KeyboardController(
         if (state.overlay == Overlay.Ask || state.overlay == Overlay.NeedKey) return
         refreshLiteralAddressContext()
         val currentComposition = if (candidatesStart >= 0 && candidatesEnd > candidatesStart) {
-            EditorTextSpan(candidatesStart, candidatesEnd).also { lastComposingSpan = it }
+            EditorTextSpan(candidatesStart, candidatesEnd).also {
+                if (candidatesEnd - candidatesStart == engineState.raw.length) lastComposingSpan = it
+            }
         } else {
             null
         }
@@ -386,15 +422,7 @@ class KeyboardController(
     private fun detachComposition(composition: EditorTextSpan, selection: EditorTextSpan) {
         val composedText = engineState.raw
         if (composedText.isEmpty()) return
-        val candidate = if (
-            engineState.language == Language.Chinese &&
-            !engineState.password &&
-            candidateRaw == composedText
-        ) {
-            engineState.candidates.firstOrNull()?.text
-        } else {
-            null
-        }
+        val candidate = wholeCompositionCandidate(engineState, candidateRaw)
         token++
         lastComposingSpan = null
         candidateRaw = ""
@@ -431,7 +459,11 @@ class KeyboardController(
         inputActive = false
         typingSnapshot = null
         autoSpacePosition = null
-        engineState = engineState.copy(literalContext = false)
+        engineState = engineState.afterInputViewFinished()
+        bridge.reset()
+        token++
+        lastComposingSpan = null
+        candidateRaw = ""
         aiToken++
         client.cancel()
         gesture.cancel()
@@ -441,6 +473,7 @@ class KeyboardController(
         source = null
         update {
             it.copy(
+                engine = engineState,
                 pressedId = null,
                 popup = null,
                 tapPreview = null,
@@ -527,7 +560,7 @@ class KeyboardController(
         }
     }
 
-    fun pick(index: Int) = dispatch(EngineAct.Pick(index))
+    fun pick(shown: EngineState, index: Int) = dispatch(EngineAct.Pick(index), shown)
 
     fun pickTypingSuggestion(suggestion: TypingSuggestion) {
         val expected = typingSnapshot ?: return
@@ -579,8 +612,9 @@ class KeyboardController(
         publish()
     }
 
-    fun forgetCandidate(index: Int) {
-        val item = state.engine.candidates.getOrNull(index) ?: return
+    fun forgetCandidate(shown: EngineState, index: Int) {
+        val currentIndex = displayedCandidateIndex(engineState, shown, index) ?: return
+        val item = engineState.candidates[currentIndex]
         val text = item.text
         var removed = false
         if (engineState.language == Language.English || text.all { it in 'a'..'z' || it in 'A'..'Z' || it == '\'' }) {
@@ -1230,15 +1264,25 @@ class KeyboardController(
         }
     }
 
-    private fun dispatch(act: EngineAct) {
-        if (interceptAsk(act)) return
+    private fun dispatch(action: EngineAct, shown: EngineState? = null) {
+        if (interceptAsk(action)) return
         val asking = state.overlay == Overlay.Ask
-        val clearing = act == EngineAct.ClearInput && !asking
+        val clearing = action == EngineAct.ClearInput && !asking
         if (!clearing) {
             synchronizeComposition()
             refreshLiteralAddressContext()
             if (!asking) clearStaleAutoSpace()
-            if (needsChineseNow(act)) refreshChinese()
+            if (needsChineseNow(action)) refreshChinese()
+        }
+        val act = if (action is EngineAct.Pick && shown != null) {
+            val index = displayedCandidateIndex(engineState, shown, action.index)
+            if (index == null) {
+                publish()
+                return
+            }
+            EngineAct.Pick(index)
+        } else {
+            action
         }
         val step = engine.reduce(engineState, act, enter)
         val clearResult = if (clearing) {
@@ -1270,6 +1314,7 @@ class KeyboardController(
         }
         updateCalibrationForAction(act, step)
         engineState = step.state
+        if (act is EngineAct.Pick) lastComposingSpan = null
         if (clearResult != null) {
             token++
             candidateRaw = ""
@@ -1490,7 +1535,7 @@ class KeyboardController(
     private fun needsChineseNow(act: EngineAct): Boolean {
         if (engineState.language != Language.Chinese || engineState.raw.isEmpty() || engineState.password || engineState.literalContext) return false
         return when (act) {
-            EngineAct.Space, EngineAct.Enter, is EngineAct.Direct, is EngineAct.Paste, is EngineAct.Pick -> true
+            EngineAct.Space, EngineAct.Enter, is EngineAct.Direct, is EngineAct.Paste -> true
             is EngineAct.Letter -> act.force == Choice.Symbol || act.force == Choice.Upper ||
                 (act.force == null && engineState.shift != ShiftState.Off)
             else -> false

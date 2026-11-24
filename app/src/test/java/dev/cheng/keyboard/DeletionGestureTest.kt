@@ -168,4 +168,24 @@ class DeletionGestureTest {
         assertFalse(gesture.canRollover())
         assertTrue(gesture.rollover(letter, 100f, 100f, 100L).isEmpty())
     }
+
+    @Test
+    fun cancelledBackspaceYieldsToNewPressWithoutDeletingOrClearing() {
+        val gesture = gesture()
+        val letter = KeyModel("l-a", KeyKind.Letter, "a", hint = "1")
+        gesture.down(backspace, 100f, 100f, 0L)
+        gesture.alarm(400L)
+        assertEquals(BackspaceHint.ClearArmed, gesture.move(100f, 10f, 420L, null).backspaceHint)
+        assertEquals(BackspaceHint.None, gesture.move(20f, 10f, 430L, null).backspaceHint)
+
+        val frames = gesture.rollover(letter, 300f, 100f, 450L)
+        assertEquals(2, frames.size)
+        assertTrue(frames[0].actions.isEmpty())
+        assertEquals("l-a", frames[1].pressedId)
+
+        val released = gesture.up()
+        assertEquals(1, released.actions.size)
+        val action = released.actions.single() as EngineAct.Letter
+        assertEquals('a', action.ch)
+    }
 }

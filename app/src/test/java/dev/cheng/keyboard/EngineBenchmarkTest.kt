@@ -2154,6 +2154,7 @@ class EngineBenchmarkTest {
             .filter { parts -> parts.size in 2..3 && parts.all { it in syllables } }
             .toList()
         var selected = 0
+        var retyped = 0
         for (parts in phrases + listOf(listOf("you", "yu"))) {
             val first = parts.first()
             val tail = parts.drop(1)
@@ -2183,9 +2184,21 @@ class EngineBenchmarkTest {
                 assertEquals("", complete.state.raw)
                 assertEquals(listOf(Cmd.Commit(remaining.candidates[rest].text)), complete.cmds)
                 selected++
+
+                val backspaced = engine.reduce(partial.state, EngineAct.Backspace, EnterKind.Newline)
+                assertEquals("$spelling after backspace", candidate.text, backspaced.state.partialText)
+                val repaired = engine.reduce(backspaced.state, EngineAct.Letter(suffix.last(), null, ""), EnterKind.Newline)
+                assertEquals("$spelling after retyping", suffix, repaired.state.raw)
+                assertEquals("$spelling after retyping", candidate.syllables, repaired.state.partialSyllables)
+                val finalPick = engine.reduce(
+                    repaired.state.copy(candidates = remaining.candidates), EngineAct.Pick(rest), EnterKind.Newline,
+                )
+                assertEquals("$spelling after choosing again", complete.cmds, finalPick.cmds)
+                assertEquals("$spelling after choosing again", complete.state.lastChineseContext, finalPick.state.lastChineseContext)
+                retyped++
             }
         }
-        println("R14_PARTIAL_PICK : selected first segment and completed remaining candidates in $selected cases")
+        println("R14_PARTIAL_PICK : direct=$selected, backspace_and_retype=$retyped")
         assertTrue("too few partial candidate sequences exercised: $selected", selected >= 100)
     }
 

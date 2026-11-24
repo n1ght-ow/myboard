@@ -527,6 +527,24 @@ class InputEngine(private val latin: LatinDecoder) {
                     listOf(Cmd.DeleteCount(committedLen), Cmd.Compose(originalRaw)),
                 )
             }
+            if (state.language == Language.Chinese && state.partialText.isNotEmpty()) {
+                val (partialText, partialSyllables) = dropLastCommittedChar(state.partialText, state.partialSyllables)
+                return EngineStep(
+                    state.copy(
+                        associating = false,
+                        candidates = emptyList(),
+                        preedit = "",
+                        partialText = partialText,
+                        partialSyllables = partialSyllables,
+                        autoSpace = false,
+                        undoAutocorrect = null,
+                        verbatimFirst = false,
+                        touchHints = emptyList(),
+                        touchSamples = emptyList(),
+                    ),
+                    listOf(Cmd.DeleteOne),
+                )
+            }
             return EngineStep(
                 state.copy(
                     associating = false,
@@ -553,8 +571,8 @@ class InputEngine(private val latin: LatinDecoder) {
                     preedit = "",
                     candidates = emptyList(),
                     associating = false,
-                    partialText = "",
-                    partialSyllables = "",
+                    partialText = if (state.language == Language.Chinese) state.partialText else "",
+                    partialSyllables = if (state.language == Language.Chinese) state.partialSyllables else "",
                     autoSpace = false,
                     undoAutocorrect = null,
                     verbatimFirst = false,
@@ -593,8 +611,6 @@ class InputEngine(private val latin: LatinDecoder) {
                 preedit = raw,
                 candidates = emptyList(),
                 associating = false,
-                partialText = "",
-                partialSyllables = "",
                 touchHints = nextHints,
                 touchSamples = nextSamples,
             ),
@@ -881,7 +897,14 @@ class InputEngine(private val latin: LatinDecoder) {
         val rest = if (state.associating) "" else leftover(state.raw, item.consumed)
         if (rest.isNotEmpty()) {
             val nextPartialText = if (item.syllables.isNotBlank()) state.partialText + item.text else ""
-            val nextPartialSyl = if (item.syllables.isNotBlank()) joinSpace(state.partialSyllables, item.syllables) else ""
+            val nextPartialSyl = if (
+                item.syllables.isNotBlank() &&
+                (state.partialText.isEmpty() || state.partialSyllables.isNotBlank())
+            ) {
+                joinSpace(state.partialSyllables, item.syllables)
+            } else {
+                ""
+            }
             val remainLetters = rest.count { it in 'a'..'z' || it in 'A'..'Z' }
             cmds += Cmd.Compose(rest)
             return EngineStep(
@@ -901,7 +924,7 @@ class InputEngine(private val latin: LatinDecoder) {
         }
 
         if (!state.associating && learnable(state)) {
-            if (state.partialText.isNotEmpty() && item.syllables.isNotBlank()) {
+            if (state.partialText.isNotEmpty() && state.partialSyllables.isNotBlank() && item.syllables.isNotBlank()) {
                 val composedText = state.partialText + item.text
                 val composedSyl = joinSpace(state.partialSyllables, item.syllables)
                 if (composedText.length in 2..8) {
@@ -975,7 +998,11 @@ class InputEngine(private val latin: LatinDecoder) {
             val text = if (chosen != null) chosen.text + unconsumed else state.raw
             val cmds = mutableListOf<Cmd>(Cmd.Commit(text))
             if (chosen != null && learnable(state) && chosen.syllables.isNotBlank()) {
-                if (state.partialText.isNotEmpty() && (state.partialText.length + chosen.text.length) in 2..8) {
+                if (
+                    state.partialText.isNotEmpty() &&
+                    state.partialSyllables.isNotBlank() &&
+                    (state.partialText.length + chosen.text.length) in 2..8
+                ) {
                     cmds += Cmd.LearnZh(
                         state.partialText + chosen.text,
                         joinSpace(state.partialSyllables, chosen.syllables),
@@ -1029,6 +1056,24 @@ class InputEngine(private val latin: LatinDecoder) {
         left.isBlank() -> right.trim()
         right.isBlank() -> left.trim()
         else -> "${left.trim()} ${right.trim()}"
+    }
+
+    private fun dropLastCommittedChar(text: String, syllables: String): Pair<String, String> {
+        if (text.isEmpty()) return "" to ""
+        val textCount = text.codePointCount(0, text.length)
+        val textStart = text.offsetByCodePoints(0, textCount - 1)
+        val nextText = text.substring(0, textStart)
+        val syllablesList = syllables.trim().split(' ').filter { it.isNotEmpty() }
+        val nextSyllables = if (
+            textCount != syllablesList.size ||
+            nextText.isEmpty() ||
+            syllablesList.size <= 1
+        ) {
+            ""
+        } else {
+            syllablesList.dropLast(1).joinToString(" ")
+        }
+        return nextText to nextSyllables
     }
 
     private fun learnable(state: EngineState) = !state.password && !state.noLearn && !state.uriOrEmail

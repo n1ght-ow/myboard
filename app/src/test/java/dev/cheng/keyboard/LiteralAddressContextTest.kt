@@ -54,6 +54,40 @@ class LiteralAddressContextTest {
     }
 
     @Test
+    fun nestedExplicitPrefixesInsideOneUrlStayLiteral() {
+        for (text in listOf(
+            "https://example.com/a/alpha_beta",
+            "https://example.com/a(www.alpha_beta",
+            "https://example.com/?next=(www.abc%20d",
+            "https://example.com/#(https://name_sub",
+        )) {
+            assertTrue(text, isLiteralAddressContext(text))
+        }
+
+        for (text in listOf(
+            "https://example.com/path next",
+            "https://example.com/a(www.alpha_beta next",
+            "www.abc%20d",
+            "www.alpha_beta",
+            "https://user@example.com",
+        )) {
+            assertFalse(text, isLiteralAddressContext(text))
+        }
+    }
+
+    @Test
+    fun realSecondUrlAfterBoundaryStaysLiteral() {
+        for (text in listOf(
+            "https://one.example/a(www.alpha_beta https://two.example/x",
+            "https://one.example/path https://two.example/x",
+            "https://one.example/path，https://two.example/x",
+            "https://one.example/path (www.two.example/x",
+        )) {
+            assertTrue(text, isLiteralAddressContext(text))
+        }
+    }
+
+    @Test
     fun unboundedOrNonAsciiDomainsAreConservativelyExcluded() {
         assertFalse(isLiteralAddressContext("a".repeat(65) + "@q"))
         assertFalse(isLiteralAddressContext("alice@" + "a".repeat(254)))

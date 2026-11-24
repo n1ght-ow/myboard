@@ -43,6 +43,37 @@ class ClipboardBoundaryExplorationTest {
     }
 
     @Test
+    fun boundaryKeepsWholeLongCombiningClusterFromOriginalStart() {
+        val original = "A" + "e" + "\u0301".repeat(5000)
+
+        val stored = mergeRecentClips(original, emptyList()).single()
+
+        assertEquals("A", stored)
+    }
+
+    @Test
+    fun boundaryDoesNotLeaveHalfRegionalIndicatorPair() {
+        val original = "a" + "🇦🇧".repeat(1200)
+
+        val stored = mergeRecentClips(original, emptyList()).single()
+
+        assertEquals("a" + "🇦🇧".repeat(1023), stored)
+        assertEquals(4093, stored.length)
+        assertTrue(stored.hasOnlyPairedSurrogates())
+    }
+
+    @Test
+    fun boundaryDoesNotLeaveHalfRegionalIndicatorPairAfterTwoAsciiChars() {
+        val original = "aa" + "🇦🇧".repeat(1200)
+
+        val stored = mergeRecentClips(original, emptyList()).single()
+
+        assertEquals("aa" + "🇦🇧".repeat(1023), stored)
+        assertEquals(4094, stored.length)
+        assertTrue(stored.hasOnlyPairedSurrogates())
+    }
+
+    @Test
     fun boundaryDoesNotSplitEmojiVariationSequence() {
         val original = "a".repeat(4095) + "❤\uFE0F"
 

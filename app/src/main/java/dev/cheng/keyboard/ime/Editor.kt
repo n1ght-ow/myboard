@@ -275,7 +275,17 @@ fun compositionDetachTarget(
     val next = newSelection.ordered()
     if (next.start < 0 || next.end < 0) return null
     if (old == next) return null
-    val composition = candidates?.takeIf { it.start >= 0 && it.end > it.start }
+    val candidate = candidates
+        ?.takeIf { it.start >= 0 && it.end > it.start }
+        ?.ordered()
+    val appendedSuffix = candidate != null &&
+        candidate.end - candidate.start != compositionLength &&
+        old.end == candidate.end &&
+        next.start == next.end &&
+        next.start >= candidate.end &&
+        next.start - candidate.end == compositionLength
+    if (appendedSuffix) return null
+    val composition = candidate
         ?: remembered?.takeIf {
             it.start >= 0 && it.end > it.start && it.end - it.start == compositionLength
         }
@@ -654,37 +664,41 @@ class EditorBridge(private val connection: () -> InputConnection?) {
 
     fun clearInput(privateField: Boolean = false): ClearInputResult {
         val input = connection() ?: return ClearInputResult.Unchanged
-        val snapshot = if (privateField) null else readClearSnapshot(input)
-        if (runCatching { input.beginBatchEdit() }.isFailure) return ClearInputResult.Unchanged
-
-        try {
-            val failure = if (composing) {
-                if (!runCatching { input.finishComposingText() }.getOrDefault(false)) return ClearInputResult.Unchanged
-                composing = false
-                ClearInputResult.CompositionFinalizedWithoutClear
-            } else {
-                ClearInputResult.Unchanged
+        var finalizedWithoutClear = false
+        if (composing) {
+            if (!runCatching { input.finishComposingText() }.getOrDefault(false)) {
+                return ClearInputResult.Unchanged
             }
-            val cleared = runCatching {
-                val fullLength = snapshot?.fullLength
-                val selected = if (fullLength != null) {
-                    input.setSelection(0, fullLength)
-                } else {
-                    input.performContextMenuAction(android.R.id.selectAll) &&
-                        input.getTextBeforeCursor(1, 0)?.isEmpty() == true &&
-                        input.getTextAfterCursor(1, 0)?.isEmpty() == true
-                }
-                selected && input.commitText("", 1)
-            }.getOrDefault(false)
-            if (cleared) return ClearInputResult.Applied
-            snapshot?.selection?.let { restoreTypingSelection(input, it) }
-            return failure
-        } finally {
-            runCatching { input.endBatchEdit() }
+            composing = false
+            finalizedWithoutClear = true
+        }
+        val snapshot = if (privateField) null else readClearSnapshot(input)
+        val cleared = runCatching {
+            val fullLength = snapshot?.fullLength
+            val selected = if (fullLength != null) {
+                input.setSelection(0, fullLength) &&
+                    selectedTextMatches(input, snapshot?.text.orEmpty())
+            } else {
+                input.performContextMenuAction(android.R.id.selectAll) &&
+                    input.getTextBeforeCursor(1, 0)?.isEmpty() == true &&
+                    input.getTextAfterCursor(1, 0)?.isEmpty() == true
+            }
+            selected && input.commitText("", 1)
+        }.getOrDefault(false)
+        if (cleared) return ClearInputResult.Applied
+        snapshot?.selection?.let { restoreTypingSelection(input, it) }
+        return if (finalizedWithoutClear) {
+            ClearInputResult.CompositionFinalizedWithoutClear
+        } else {
+            ClearInputResult.Unchanged
         }
     }
 
-    private data class ClearSnapshot(val selection: EditorTextSpan, val fullLength: Int?)
+    private data class ClearSnapshot(
+        val selection: EditorTextSpan,
+        val text: String,
+        val fullLength: Int?,
+    )
 
     private fun readClearSnapshot(input: InputConnection): ClearSnapshot? = runCatching {
         val extracted = input.getExtractedText(extractedRequest(), 0)
@@ -702,13 +716,15 @@ class EditorBridge(private val connection: () -> InputConnection?) {
                 input.getTextBeforeCursor(range.start + 1, 0)?.length == range.start &&
                 input.getTextAfterCursor(it - range.end + 1, 0)?.length == it - range.end
         }
-        ClearSnapshot(selection, fullLength)
+        ClearSnapshot(selection, text, fullLength)
     }.getOrNull()
 
     fun apply(cmds: List<Cmd>, smartCommit: Boolean = true) {
         val input = connection() ?: return
         val commitThenCompose = cmds.size >= 2 && cmds[0] is Cmd.Commit && cmds[1] is Cmd.Compose
-        if (!commitThenCompose || runCatching { input.beginBatchEdit() }.isFailure) {
+        val batchStarted = commitThenCompose &&
+            runCatching { input.beginBatchEdit() }.getOrDefault(false)
+        if (!batchStarted) {
             applyCommands(input, cmds, smartCommit)
             return
         }
@@ -877,6 +893,19 @@ class EditorBridge(private val connection: () -> InputConnection?) {
 
     private fun restoreTypingSelection(input: InputConnection, selection: EditorTextSpan) {
         runCatching { input.setSelection(selection.start, selection.end) }
+    }
+
+    private fun selectedTextMatches(input: InputConnection, expected: String): Boolean {
+        val selected = runCatching { input.getSelectedText(0)?.toString() }.getOrNull()
+        if (selected != null) return selected == expected
+        val extracted = runCatching { input.getExtractedText(extractedRequest(), 0) }.getOrNull()
+        if (extracted?.text != null && extracted.startOffset >= 0) {
+            val text = extracted.text.toString()
+            val start = minOf(extracted.selectionStart, extracted.selectionEnd)
+            val end = maxOf(extracted.selectionStart, extracted.selectionEnd)
+            return start == 0 && end == text.length && text == expected
+        }
+        return false
     }
 }
 

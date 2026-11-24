@@ -316,8 +316,8 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                             .clip(pillShape)
                             .background(if (primary) palette.accentSoft else Color.Transparent)
                             .candidateTap(
-                                onClick = { controller.pick(0) },
-                                onLongClick = { controller.forgetCandidate(0) },
+                                onClick = { controller.pick(state.engine, 0) },
+                                onLongClick = { controller.forgetCandidate(state.engine, 0) },
                             )
                             .padding(horizontal = 10.dp, vertical = 3.dp),
                     )
@@ -342,8 +342,8 @@ private fun Toolbar(state: UiState, palette: Palette, controller: KeyboardContro
                             .clip(pillShape)
                             .background(if (primary) palette.accentSoft else Color.Transparent)
                             .candidateTap(
-                                onClick = { controller.pick(index) },
-                                onLongClick = { controller.forgetCandidate(index) },
+                                onClick = { controller.pick(state.engine, index) },
+                                onLongClick = { controller.forgetCandidate(state.engine, index) },
                             )
                             .padding(horizontal = 10.dp, vertical = 3.dp),
                     )
@@ -1427,8 +1427,8 @@ private fun CandidateGrid(state: UiState, palette: Palette, controller: Keyboard
                                 shape = cellShape,
                             )
                             .candidateTap(
-                                onClick = { controller.pick(cell.index) },
-                                onLongClick = { controller.forgetCandidate(cell.index) },
+                                onClick = { controller.pick(state.engine, cell.index) },
+                                onLongClick = { controller.forgetCandidate(state.engine, cell.index) },
                             )
                             .padding(horizontal = 6.dp, vertical = 11.dp),
                     )
