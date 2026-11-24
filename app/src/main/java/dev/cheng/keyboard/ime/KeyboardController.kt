@@ -22,6 +22,7 @@ import dev.cheng.keyboard.ai.PolishUndo
 import dev.cheng.keyboard.ai.TRANSLATE_PROMPT
 import dev.cheng.keyboard.ai.buildPolishUserPrompt
 import dev.cheng.keyboard.ai.parsePolishStream
+import dev.cheng.keyboard.data.MAX_PINNED_CLIPS
 import dev.cheng.keyboard.data.PrefKeys
 import dev.cheng.keyboard.data.Secrets
 import dev.cheng.keyboard.data.SqliteLexicon
@@ -31,8 +32,10 @@ import dev.cheng.keyboard.data.encodeRecentClips
 import dev.cheng.keyboard.data.installLexicon
 import dev.cheng.keyboard.data.mergeRecentClipLists
 import dev.cheng.keyboard.data.mergeRecentClips
+import dev.cheng.keyboard.data.removeClip
 import dev.cheng.keyboard.data.settingsStore
 import dev.cheng.keyboard.data.themeMode
+import dev.cheng.keyboard.data.togglePinnedClip
 import dev.cheng.keyboard.engine.Cmd
 import dev.cheng.keyboard.engine.EngineAct
 import dev.cheng.keyboard.engine.EngineState
@@ -41,6 +44,7 @@ import dev.cheng.keyboard.engine.LatinDecoder
 import dev.cheng.keyboard.engine.PinyinDecoder
 import dev.cheng.keyboard.engine.PoetryIndex
 import dev.cheng.keyboard.engine.applyAskDraft
+import dev.cheng.keyboard.engine.dropLastGrapheme
 import dev.cheng.keyboard.engine.extractTrailingCjk
 import dev.cheng.keyboard.engine.stripWrapped
 import dev.cheng.keyboard.ime.gesture.HapticKind
@@ -161,8 +165,11 @@ class KeyboardController(
     private var tapClearJob: Job? = null
     private var clipExpireJob: Job? = null
     private var noteClearJob: Job? = null
+    private data class ClearUndo(val text: String, val selection: EditorTextSpan)
+
     private var source: FieldSource? = null
     private var lastPolishUndo: PolishUndo? = null
+    private var lastClearUndo: ClearUndo? = null
     private var candidateRaw = ""
     private var aiToken = 0
     private val clipboard = context.getSystemService(ClipboardManager::class.java)
@@ -193,6 +200,7 @@ class KeyboardController(
                     )
                 }
                 val storedClips = decodeRecentClips(prefs[PrefKeys.recentClips])
+                val storedPinned = decodeRecentClips(prefs[PrefKeys.pinnedClips], MAX_PINNED_CLIPS)
                 update {
                     it.copy(
                         theme = prefs.themeMode(),
@@ -200,6 +208,7 @@ class KeyboardController(
                         haptic = prefs[PrefKeys.haptic] != false,
                         fuzzy = fuzzy,
                         recentClips = mergeRecentClipLists(it.recentClips, storedClips),
+                        pinnedClips = storedPinned,
                     )
                 }
                 if (engineState.raw.isNotEmpty() && engineState.language == Language.Chinese) requestPinyin(engineState.raw)
@@ -313,6 +322,7 @@ class KeyboardController(
         gesture.cancel()
         tapClearJob?.cancel()
         lastPolishUndo = null
+        lastClearUndo = null
         if (resetSession) {
             aiToken++
             client.cancel()
@@ -332,9 +342,11 @@ class KeyboardController(
                 popup = null,
                 tapPreview = null,
                 backspaceHint = BackspaceHint.None,
+                spaceSliding = false,
                 expanded = false,
                 enter = enter,
                 canUndoPolish = false,
+                canUndoClear = false,
                 menu = false,
                 clip = null,
                 freshClip = null,
@@ -396,6 +408,10 @@ class KeyboardController(
             val clearedAutoSpace = (tapSelection.start != autoSpacePosition || tapSelection.end != autoSpacePosition) &&
                 clearStaleAutoSpace()
             val before = connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+            if (lastClearUndo != null && (before.isNotEmpty() || newSelStart > 0 || newSelEnd > 0)) {
+                lastClearUndo = null
+                update { it.copy(canUndoClear = false) }
+            }
             val nextShift = if (engineState.language == Language.English && engineState.shift != ShiftState.Caps && !engineState.literalContext) {
                 activeInfo?.let { resolveAutoShift(it, before) } ?: engineState.shift
             } else {
@@ -471,6 +487,8 @@ class KeyboardController(
         tapClearJob?.cancel()
         calibrator.discardPending()
         source = null
+        lastPolishUndo = null
+        lastClearUndo = null
         update {
             it.copy(
                 engine = engineState,
@@ -478,6 +496,7 @@ class KeyboardController(
                 popup = null,
                 tapPreview = null,
                 backspaceHint = BackspaceHint.None,
+                spaceSliding = false,
                 menu = false,
                 expanded = false,
                 overlay = Overlay.None,
@@ -490,6 +509,8 @@ class KeyboardController(
                 polishTone = PolishTone.Auto,
                 polishCandidates = emptyList(),
                 polishSelected = 0,
+                canUndoPolish = false,
+                canUndoClear = false,
                 busy = false,
                 note = null,
                 typingSuggestions = emptyList(),
@@ -560,7 +581,10 @@ class KeyboardController(
         }
     }
 
-    fun pick(shown: EngineState, index: Int) = dispatch(EngineAct.Pick(index), shown)
+    fun pick(shown: EngineState, index: Int) {
+        if (state.haptic) haptic(HapticKind.Step)
+        dispatch(EngineAct.Pick(index), shown)
+    }
 
     fun pickTypingSuggestion(suggestion: TypingSuggestion) {
         val expected = typingSnapshot ?: return
@@ -578,10 +602,12 @@ class KeyboardController(
             return
         }
         val accepted = result == TypingSuggestionEditResult.Applied
+        if (accepted && state.haptic) haptic(HapticKind.Step)
         token++
         candidateRaw = ""
         lastComposingSpan = null
         lastPolishUndo = null
+        lastClearUndo = null
         calibrator.discardPending()
         bridge.reset()
         val before = runCatching { input.getTextBeforeCursor(64, 0)?.toString().orEmpty() }.getOrDefault("")
@@ -605,6 +631,7 @@ class KeyboardController(
                 expanded = false,
                 menu = false,
                 canUndoPolish = false,
+                canUndoClear = false,
                 typingSuggestions = emptyList(),
             )
         }
@@ -648,9 +675,13 @@ class KeyboardController(
         if (removed) flashNote("已移除「$text」")
     }
 
-    fun toggleExpanded() = update { it.copy(expanded = !it.expanded) }
+    fun toggleExpanded() {
+        if (state.haptic) haptic(HapticKind.Step)
+        update { it.copy(expanded = !it.expanded) }
+    }
 
     fun toggleMenu() {
+        if (state.haptic) haptic(HapticKind.Step)
         if (state.menu) {
             update { it.copy(menu = false, clip = null) }
         } else {
@@ -678,7 +709,52 @@ class KeyboardController(
 
     fun pasteText(text: String) {
         if (text.isEmpty() || engineState.password || engineState.noLearn) return
+        if (state.haptic) haptic(HapticKind.Step)
         dispatch(EngineAct.Paste(text))
+    }
+
+    fun togglePinClip(text: String) {
+        if (text.isBlank() || engineState.password || engineState.noLearn) return
+        val before = state.pinnedClips
+        val next = togglePinnedClip(text, before, MAX_PINNED_CLIPS)
+        if (next == before) return
+        val wasPinned = removeClip(text, before).size < before.size
+        savePinnedClips(next)
+        update { it.copy(pinnedClips = next) }
+        if (state.haptic) haptic(HapticKind.Step)
+        flashNote(if (wasPinned) "已取消置顶" else "已置顶")
+    }
+
+    fun deleteClip(text: String) {
+        if (text.isBlank() || engineState.password || engineState.noLearn) return
+        val nextRecent = removeClip(text, state.recentClips)
+        val nextPinned = removeClip(text, state.pinnedClips)
+        val clearCurrent = state.clip == text
+        val clearFresh = state.freshClip == text
+        if (nextRecent == state.recentClips && nextPinned == state.pinnedClips && !clearCurrent && !clearFresh) return
+        if (nextRecent != state.recentClips) saveRecentClips(nextRecent)
+        if (nextPinned != state.pinnedClips) savePinnedClips(nextPinned)
+        if (clearFresh) clipExpireJob?.cancel()
+        update {
+            it.copy(
+                recentClips = nextRecent,
+                pinnedClips = nextPinned,
+                clip = if (clearCurrent) null else it.clip,
+                freshClip = if (clearFresh) null else it.freshClip,
+            )
+        }
+        if (state.haptic) haptic(HapticKind.Delete)
+        flashNote("已删除")
+    }
+
+    fun clearRecentClips() {
+        if (engineState.password || engineState.noLearn) return
+        if (state.recentClips.isEmpty() && state.clip == null && state.freshClip == null) return
+        clipExpireJob?.cancel()
+        saveRecentClips(emptyList())
+        update { it.copy(recentClips = emptyList(), clip = null, freshClip = null) }
+        if (state.haptic) haptic(HapticKind.Delete)
+        flashNote("已清空历史")
     }
 
     fun dismissFreshClip() {
@@ -755,11 +831,15 @@ class KeyboardController(
     }
 
     fun selectSymbolCategory(index: Int) {
+        if (state.haptic) haptic(HapticKind.Step)
         val safe = index.coerceIn(0, dev.cheng.keyboard.ime.symbol.symbolCategories.lastIndex)
         update { it.copy(symbolIndex = safe, symbolRecent = false) }
     }
 
-    fun selectRecentSymbols() = update { it.copy(symbolRecent = true) }
+    fun selectRecentSymbols() {
+        if (state.haptic) haptic(HapticKind.Step)
+        update { it.copy(symbolRecent = true) }
+    }
 
     fun toggleSymbolLock() {
         if (state.haptic) haptic(HapticKind.Down)
@@ -1082,8 +1162,36 @@ class KeyboardController(
             update { it.copy(note = "当前输入框未接受撤回，请重试") }
             return
         }
+        if (state.haptic) haptic(HapticKind.Action)
         lastPolishUndo = null
-        update { it.copy(canUndoPolish = false, note = "已撤回") }
+        update { it.copy(canUndoPolish = false) }
+        flashNote("已撤回")
+    }
+
+    fun undoClearInput() {
+        val undo = lastClearUndo ?: return
+        if (engineState.password || engineState.noLearn || engineState.raw.isNotEmpty()) {
+            lastClearUndo = null
+            update { it.copy(canUndoClear = false) }
+            return
+        }
+        val restored = bridge.restoreClearedInput(undo.text, undo.selection)
+        lastClearUndo = null
+        if (!restored) {
+            update { it.copy(canUndoClear = false) }
+            flashNote("内容已变化，无法恢复")
+            return
+        }
+        if (state.haptic) haptic(HapticKind.Action)
+        val before = runCatching { connection()?.getTextBeforeCursor(64, 0)?.toString().orEmpty() }.getOrDefault("")
+        engineState = engineState.copy(
+            lastChineseContext = extractTrailingCjk(before),
+            autoSpace = false,
+            undoAutocorrect = null,
+        )
+        update { it.copy(canUndoClear = false) }
+        flashNote("已恢复")
+        publish()
     }
 
     fun copyResult() {
@@ -1236,6 +1344,7 @@ class KeyboardController(
                 popup = frame.popup,
                 tapPreview = frame.tapPreview ?: it.tapPreview,
                 backspaceHint = frame.backspaceHint,
+                spaceSliding = frame.spaceSliding,
             )
         }
         frame.actions.forEach(::dispatch)
@@ -1285,11 +1394,12 @@ class KeyboardController(
             action
         }
         val step = engine.reduce(engineState, act, enter)
-        val clearResult = if (clearing) {
-            bridge.clearInput(privateField = engineState.password || engineState.noLearn)
+        val clearOutcome = if (clearing) {
+            bridge.clearInputWithOutcome(privateField = engineState.password || engineState.noLearn)
         } else {
             null
         }
+        val clearResult = clearOutcome?.result
         when (clearResult) {
             ClearInputResult.Unchanged -> {
                 publish()
@@ -1321,17 +1431,37 @@ class KeyboardController(
             lastComposingSpan = null
             autoSpacePosition = null
             lastPolishUndo = null
+            val undoable = if (
+                clearResult == ClearInputResult.Applied &&
+                !engineState.password &&
+                !engineState.noLearn &&
+                !clearOutcome.clearedText.isNullOrEmpty()
+            ) {
+                val cleared = clearOutcome.clearedText
+                val span = clearOutcome.clearedSelection ?: EditorTextSpan(cleared.length, cleared.length)
+                ClearUndo(cleared, span)
+            } else {
+                null
+            }
+            lastClearUndo = undoable
             typingSnapshot = null
             update {
                 it.copy(
                     canUndoPolish = false,
+                    canUndoClear = undoable != null,
                     typingSuggestions = emptyList(),
                 )
             }
         }
-        if (engineState.raw.isNotEmpty() && lastPolishUndo != null) {
+        val mutatedText = !asking && !clearing && (
+            engineState.raw.isNotEmpty() ||
+                paste ||
+                step.cmds.any { it is Cmd.Commit || it is Cmd.DeleteOne || it is Cmd.DeleteCount || it is Cmd.DeleteWord }
+            )
+        if (mutatedText && (lastPolishUndo != null || lastClearUndo != null)) {
             lastPolishUndo = null
-            update { it.copy(canUndoPolish = false) }
+            lastClearUndo = null
+            update { it.copy(canUndoPolish = false, canUndoClear = false) }
         }
         if (act == EngineAct.Language && !engineState.uriOrEmail) {
             preferredLanguage = engineState.language
@@ -1526,7 +1656,7 @@ class KeyboardController(
         is EngineAct.Direct -> current + act.text
         is EngineAct.Paste -> current + act.text
         EngineAct.Space -> "$current "
-        EngineAct.Backspace -> current.dropLast(1)
+        EngineAct.Backspace -> dropLastGrapheme(current)
         EngineAct.BackspaceWord -> ""
         EngineAct.ClearInput -> ""
         else -> null
@@ -1650,6 +1780,15 @@ class KeyboardController(
         scope.launch {
             context.settingsStore.edit { prefs ->
                 prefs[PrefKeys.recentClips] = encoded
+            }
+        }
+    }
+
+    private fun savePinnedClips(clips: List<String>) {
+        val encoded = encodeRecentClips(clips, MAX_PINNED_CLIPS)
+        scope.launch {
+            context.settingsStore.edit { prefs ->
+                prefs[PrefKeys.pinnedClips] = encoded
             }
         }
     }

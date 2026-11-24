@@ -12,6 +12,33 @@ private val pairedSymbols = setOf(
     "（）", "《》", "【】", "「」", "『』", "“”", "‘’", "()", "[]", "{}",
 )
 
+private const val MAX_WRAP_SELECTION_UNITS = 2000
+
+fun isPairedSymbol(text: String): Boolean = text.length == 2 && text in pairedSymbols
+
+fun wrapSelectedWithPair(selected: String, pair: String): String? {
+    if (!isPairedSymbol(pair)) return null
+    if (selected.isEmpty() || selected.length > MAX_WRAP_SELECTION_UNITS) return null
+    if (hasUnpairedSurrogateInText(selected)) return null
+    return "${pair[0]}$selected${pair[1]}"
+}
+
+private fun hasUnpairedSurrogateInText(text: String): Boolean {
+    var index = 0
+    while (index < text.length) {
+        val ch = text[index]
+        if (ch.isHighSurrogate()) {
+            if (index + 1 >= text.length || !text[index + 1].isLowSurrogate()) return true
+            index += 2
+        } else if (ch.isLowSurrogate()) {
+            return true
+        } else {
+            index++
+        }
+    }
+    return false
+}
+
 fun resolveSmartCommit(before: String, text: String, composing: Boolean): SmartCommit {
     if (!composing && text.isNotEmpty() && text[0] in '0'..'9') {
         if (before.length >= 2 && before[before.length - 2] in '0'..'9') {
@@ -103,6 +130,12 @@ fun shouldAutoCap(before: String): Boolean {
         index--
     }
     if (index == 0) return true
+    if (index < before.length) {
+        while (index > 0 && before[index - 1] in "\"'”’)]）】》」』") {
+            index--
+        }
+        if (index == 0) return false
+    }
     return before[index - 1] in ".!?。！？"
 }
 
@@ -123,7 +156,7 @@ fun applyAskDraft(draft: String, cmds: List<Cmd>): String {
     for (cmd in cmds) {
         when (cmd) {
             is Cmd.Commit -> text += cmd.text.replace("\n", "")
-            Cmd.DeleteOne -> text = dropLastCodePoint(text)
+            Cmd.DeleteOne -> text = dropLastGrapheme(text)
             is Cmd.DeleteCount -> {
                 if (cmd.count > 0) text = text.dropLast(cmd.count.coerceAtMost(text.length))
             }
@@ -138,10 +171,23 @@ fun applyAskDraft(draft: String, cmds: List<Cmd>): String {
     return text
 }
 
-private fun dropLastCodePoint(text: String): String {
+private val DRAFT_GRAPHEME_CLUSTER = Regex("\\X")
+
+fun dropLastGrapheme(text: String): String {
     if (text.isEmpty()) return text
-    val last = text.last()
-    return if (text.length >= 2 && last.isLowSurrogate() && text[text.lastIndex - 1].isHighSurrogate()) {
+    val windowStart = (text.length - 256).coerceAtLeast(0)
+    val window = text.substring(windowStart)
+    val analysisStart = if (windowStart > 0 && window.first().isLowSurrogate()) 1 else 0
+    val analysis = window.substring(analysisStart)
+    var last: MatchResult? = null
+    for (match in DRAFT_GRAPHEME_CLUSTER.findAll(analysis)) {
+        last = match
+    }
+    if (last != null && last.range.last == analysis.lastIndex) {
+        return text.dropLast(last.value.length)
+    }
+    val tail = text.last()
+    return if (text.length >= 2 && tail.isLowSurrogate() && text[text.lastIndex - 1].isHighSurrogate()) {
         text.dropLast(2)
     } else {
         text.dropLast(1)

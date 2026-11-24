@@ -174,6 +174,7 @@ class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwne
             val vib = vibrator
             val (primitive, scale) = when (kind) {
                 HapticKind.Down -> VibrationEffect.Composition.PRIMITIVE_LOW_TICK to 0.55f
+                HapticKind.Action -> VibrationEffect.Composition.PRIMITIVE_LOW_TICK to 0.72f
                 HapticKind.Delete -> VibrationEffect.Composition.PRIMITIVE_LOW_TICK to 0.40f
                 HapticKind.Step -> VibrationEffect.Composition.PRIMITIVE_TICK to 0.40f
                 HapticKind.Arm -> VibrationEffect.Composition.PRIMITIVE_CLICK to 0.65f
@@ -193,7 +194,7 @@ class KeyboardService : InputMethodService(), LifecycleOwner, ViewModelStoreOwne
         }
         val view = inputView ?: return
         val constant = when (kind) {
-            HapticKind.Down -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            HapticKind.Down, HapticKind.Action -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 HapticFeedbackConstants.KEYBOARD_PRESS
             } else {
                 HapticFeedbackConstants.KEYBOARD_TAP

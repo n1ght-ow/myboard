@@ -8,7 +8,7 @@ import dev.cheng.keyboard.model.KeyboardPage
 import dev.cheng.keyboard.model.TouchSample
 import kotlin.math.abs
 
-enum class HapticKind { Down, Arm, Step, Delete }
+enum class HapticKind { Down, Action, Arm, Step, Delete }
 
 enum class BackspaceHint { None, Repeat, ClearArmed }
 
@@ -29,6 +29,7 @@ data class GestureFrame(
     val haptic: HapticKind? = null,
     val tapPreview: TapPreview? = null,
     val backspaceHint: BackspaceHint = BackspaceHint.None,
+    val spaceSliding: Boolean = false,
 )
 
 class KeyGesture(
@@ -92,7 +93,7 @@ class KeyGesture(
         return GestureFrame(
             pressedId = target.id,
             popup = null,
-            haptic = if (target.kind == KeyKind.Backspace) null else HapticKind.Down,
+            haptic = downHaptic(target),
             tapPreview = tapPreview,
         )
     }
@@ -180,14 +181,26 @@ class KeyGesture(
                 cancelled = false
                 val dir = if (dx > 0) 1 else -1
                 spaceAnchorX = x
-                return GestureFrame(current.id, null, listOf(EngineAct.MoveCursor(dir)), HapticKind.Step)
+                return GestureFrame(
+                    pressedId = current.id,
+                    popup = null,
+                    actions = listOf(EngineAct.MoveCursor(dir)),
+                    haptic = HapticKind.Step,
+                    spaceSliding = true,
+                )
             }
             if (spaceSliding) {
                 val deltaPx = x - spaceAnchorX
                 if (abs(deltaPx) >= stepPx) {
                     val steps = (deltaPx / stepPx).toInt()
                     spaceAnchorX += steps * stepPx
-                    return GestureFrame(current.id, null, listOf(EngineAct.MoveCursor(steps)), HapticKind.Step)
+                    return GestureFrame(
+                        pressedId = current.id,
+                        popup = null,
+                        actions = listOf(EngineAct.MoveCursor(steps)),
+                        haptic = HapticKind.Step,
+                        spaceSliding = true,
+                    )
                 }
                 return frame()
             }
@@ -244,6 +257,41 @@ class KeyGesture(
             return frame()
         }
 
+        if (current.hasQuickChars() && armed) {
+            val next = when {
+                dx <= -caseSlopPx -> Choice.Upper
+                dx >= caseSlopPx -> Choice.Lower
+                else -> Choice.Symbol
+            }
+            val haptic = if (next != choice) HapticKind.Step else null
+            choice = next
+            return frame(haptic)
+        }
+
+        if (current.hasQuickChars() && !armed) {
+            val elapsed = time - downAt
+            if (dy <= -verticalFlickPx && abs(dy) > abs(dx) * 1.75f && elapsed >= 45L) {
+                val changed = flickChoice != Choice.Symbol
+                flickChoice = Choice.Symbol
+                cancelled = false
+                return frame(if (changed) HapticKind.Step else null)
+            }
+            if (flickChoice != null) {
+                if (abs(dy) < verticalFlickPx * 0.6f) {
+                    flickChoice = null
+                    return frame(HapticKind.Step)
+                }
+                return frame()
+            }
+            val upwardIntent = dy < 0f && abs(dy) > abs(dx) * 1.3f && abs(dx) <= slopPx * 2
+            if (!upwardIntent && (abs(dx) > slopPx * 2 || abs(dy) > slopPx * 2)) {
+                cancelled = true
+            } else if (hit?.id == current.id) {
+                cancelled = false
+            }
+            return frame()
+        }
+
         if (abs(dx) > slopPx * 2 || abs(dy) > slopPx * 2) cancelled = true
         return frame()
     }
@@ -264,6 +312,8 @@ class KeyGesture(
             current.kind == KeyKind.Space && spaceSliding -> emptyList()
             current.kind == KeyKind.Letter && armed -> listOf(longPress(current, choice))
             current.kind == KeyKind.Letter && flick != null -> listOf(longPress(current, flick))
+            current.hasQuickChars() && armed -> listOf(quickCharAction(current, choice))
+            current.hasQuickChars() && flick != null -> listOf(quickCharAction(current, flick))
             else -> listOfNotNull(tap(current))
         }
         key = null
@@ -296,7 +346,7 @@ class KeyGesture(
     fun alarm(time: Long): GestureFrame {
         val current = key ?: return idle()
         if (!tracking) return idle()
-        if (current.kind == KeyKind.Letter && !armed && flickChoice == null && !cancelled && time >= downAt + longMs) {
+        if (current.supportsPopup() && !armed && flickChoice == null && !cancelled && time >= downAt + longMs) {
             armed = true
             choice = Choice.Symbol
             return frame(HapticKind.Arm)
@@ -319,7 +369,7 @@ class KeyGesture(
     fun nextAlarm(now: Long): Long? {
         val current = key ?: return null
         if (!tracking) return null
-        if (current.kind == KeyKind.Letter && !armed && flickChoice == null && !cancelled) return downAt + longMs
+        if (current.supportsPopup() && !armed && flickChoice == null && !cancelled) return downAt + longMs
         if (current.kind == KeyKind.Backspace && !cancelled && !clearArmed) {
             return nextRepeatAt().coerceAtLeast(now)
         }
@@ -334,8 +384,8 @@ class KeyGesture(
     private fun frame(haptic: HapticKind? = null): GestureFrame {
         val current = key
         val activeChoice = when {
-            current != null && armed && current.kind == KeyKind.Letter -> choice
-            current != null && flickChoice != null && current.kind == KeyKind.Letter -> flickChoice
+            current != null && armed && current.supportsPopup() -> choice
+            current != null && flickChoice != null && current.supportsPopup() -> flickChoice
             else -> null
         }
         return GestureFrame(
@@ -348,6 +398,7 @@ class KeyGesture(
                 repeating -> BackspaceHint.Repeat
                 else -> BackspaceHint.None
             },
+            spaceSliding = spaceSliding,
         )
     }
 
@@ -402,16 +453,52 @@ class KeyGesture(
         backspaceHint = BackspaceHint.Repeat,
     )
 
-    private fun preview(current: KeyModel, selected: Choice) = PopupPreview(
-        keyId = current.id,
-        lower = current.label.lowercase(),
-        upper = current.label.uppercase(),
-        symbol = current.hint.orEmpty(),
-        choice = selected,
-    )
+    private fun preview(current: KeyModel, selected: Choice): PopupPreview = if (current.hasQuickChars()) {
+        PopupPreview(
+            keyId = current.id,
+            lower = current.quickChars[2],
+            upper = current.quickChars[0],
+            symbol = current.quickChars[1],
+            choice = selected,
+        )
+    } else {
+        PopupPreview(
+            keyId = current.id,
+            lower = current.label.lowercase(),
+            upper = current.label.uppercase(),
+            symbol = current.hint.orEmpty(),
+            choice = selected,
+        )
+    }
 
     private fun longPress(current: KeyModel, selected: Choice) =
         EngineAct.Letter(current.label.first(), selected, current.hint.orEmpty(), downNeighbors, downSample)
+
+    private fun quickCharAction(current: KeyModel, selected: Choice): EngineAct.Direct {
+        val text = when (selected) {
+            Choice.Upper -> current.quickChars[0]
+            Choice.Symbol -> current.quickChars[1]
+            Choice.Lower -> current.quickChars[2]
+        }
+        return EngineAct.Direct(text)
+    }
+
+    private fun KeyModel.hasQuickChars(): Boolean = kind == KeyKind.Char && quickChars.size == 3
+
+    private fun KeyModel.supportsPopup(): Boolean = kind == KeyKind.Letter || hasQuickChars()
+
+    private fun downHaptic(target: KeyModel): HapticKind? = when (target.kind) {
+        KeyKind.Backspace -> null
+        KeyKind.Letter, KeyKind.Char -> HapticKind.Down
+        KeyKind.Space,
+        KeyKind.Enter,
+        KeyKind.Shift,
+        KeyKind.Language,
+        KeyKind.PageLetters,
+        KeyKind.PageNumber,
+        KeyKind.PageSymbols,
+        KeyKind.PageMore -> HapticKind.Action
+    }
 
     private fun tap(current: KeyModel): EngineAct? = when (current.kind) {
         KeyKind.Letter -> EngineAct.Letter(current.label.first(), null, current.hint.orEmpty(), downNeighbors, downSample)

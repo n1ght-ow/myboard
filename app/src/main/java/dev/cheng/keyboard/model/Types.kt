@@ -36,6 +36,7 @@ data class KeyModel(
     val insert: String? = null,
     val weight: Float = 1f,
     val accent: Boolean = false,
+    val quickChars: List<String> = emptyList(),
 )
 
 data class Candidate(

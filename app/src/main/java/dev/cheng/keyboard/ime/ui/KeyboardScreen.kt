@@ -472,6 +472,9 @@ private fun typingSuggestionKindLabel(suggestion: TypingSuggestion): String = wh
     TypingAssistKind.Email -> "邮箱"
     TypingAssistKind.Url -> "网址"
     TypingAssistKind.DateTime -> when {
+        suggestion.id.startsWith("datetime:now:") -> "此刻"
+        suggestion.id.startsWith("datetime:tomorrow:") -> "明天"
+        suggestion.id.startsWith("datetime:yesterday:") -> "昨天"
         suggestion.replacement.startsWith("星期") -> "今日"
         ':' in suggestion.replacement -> "时间"
         else -> "日期"
@@ -484,6 +487,9 @@ private fun typingSuggestionDescription(suggestion: TypingSuggestion, shown: Str
         TypingAssistKind.Email -> "邮箱补全"
         TypingAssistKind.Url -> "网址补全"
         TypingAssistKind.DateTime -> when {
+            suggestion.id.startsWith("datetime:now:") -> "插入当前时间"
+            suggestion.id.startsWith("datetime:tomorrow:") -> "插入明天日期"
+            suggestion.id.startsWith("datetime:yesterday:") -> "插入昨天日期"
             suggestion.replacement.startsWith("星期") -> "插入星期"
             ':' in suggestion.replacement -> "插入时间"
             else -> "插入日期"
@@ -535,18 +541,21 @@ private fun FunctionRow(state: UiState, palette: Palette, controller: KeyboardCo
             contentAlignment = Alignment.CenterStart,
         ) {
             val note = state.note?.takeIf { state.overlay == Overlay.None }
-            if (state.canUndoPolish) {
+            if (state.canUndoPolish || state.canUndoClear) {
                 val undoShape = RoundedCornerShape(14.dp)
+                val undoLabel = if (state.canUndoPolish) "已替换" else "已清空"
                 Row(
                     Modifier
                         .clip(undoShape)
                         .background(palette.sheet)
                         .border(0.8.dp, palette.divider, undoShape)
-                        .clickable { controller.undoPolish() }
+                        .clickable {
+                            if (state.canUndoPolish) controller.undoPolish() else controller.undoClearInput()
+                        }
                         .padding(horizontal = 10.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("已替换", color = palette.subtle, fontSize = 12.sp, maxLines = 1)
+                    Text(undoLabel, color = palette.subtle, fontSize = 12.sp, maxLines = 1)
                     Text(
                         " 撤回",
                         color = palette.accent,
@@ -900,8 +909,10 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
         KeyKind.Space -> onNumberPage
         else -> false
     }
+    val spaceSlidingNow = key.model.kind == KeyKind.Space && state.spaceSliding && pressed
     val fill = when {
         key.model.accent -> if (pressed) palette.accentPressed else palette.accent
+        spaceSlidingNow -> palette.accentSoft
         isLettersBottomPairKey -> if (pressed) palette.funcPressed else Color.Transparent
         isLettersBottomFlatKey -> if (pressed) palette.funcPressed.copy(alpha = 0.72f) else Color.Transparent
         isLettersBottomSpace -> if (pressed) palette.pressed else palette.key
@@ -946,6 +957,7 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
     val actualKeyHeight = with(density) { key.h.toDp() }
     val surfaceModifier = when {
         onNumberPage -> Modifier
+            .padding(top = if (pressed) 1.dp else 0.dp)
             .clip(corner)
             .background(if (pressed) fill else palette.keyShadow)
             .padding(bottom = if (pressed) 0.dp else 1.dp)
@@ -956,10 +968,19 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
         } else {
             Modifier
         }
-        isLettersBottomSpace || isLettersBottomEnter -> Modifier
+        isLettersBottomSpace -> Modifier
+            .padding(top = if (pressed) 1.dp else 0.dp)
+            .clip(corner)
+            .background(fill)
+            .then(
+                if (spaceSlidingNow) Modifier.border(0.8.dp, palette.accent.copy(alpha = 0.65f), corner) else Modifier,
+            )
+        isLettersBottomEnter -> Modifier
+            .padding(top = if (pressed) 1.dp else 0.dp)
             .clip(corner)
             .background(fill)
         else -> Modifier
+            .padding(top = if (pressed) 1.dp else 0.dp)
             .clip(corner)
             .background(if (pressed) fill else palette.keyShadow)
             .padding(bottom = if (pressed) 0.dp else 1.dp)
@@ -969,6 +990,8 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
                 width = 0.5.dp,
                 color = if (shiftActive && state.engine.shift == ShiftState.Caps) {
                     palette.accent.copy(alpha = 0.45f)
+                } else if (spaceSlidingNow) {
+                    palette.accent.copy(alpha = 0.65f)
                 } else {
                     palette.keyBorder
                 },
@@ -1042,6 +1065,7 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
             }
             KeyKind.Space -> {
                 val spaceLabel = when {
+                    spaceSlidingNow -> "← 移动光标 →"
                     onNumberPage -> "空格"
                     isLettersBottomSpace && state.engine.language == Language.Chinese -> "空格"
                     isLettersBottomSpace -> "English"
@@ -1052,11 +1076,11 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
                     text = spaceLabel,
                     maxWidth = keyWidth,
                     maxHeight = actualKeyHeight,
-                    maxFontSize = if (onNumberPage) 14f else 12f,
-                    color = palette.subtle,
-                    fontWeight = FontWeight.Medium,
+                    maxFontSize = if (onNumberPage && !spaceSlidingNow) 14f else 12f,
+                    color = if (spaceSlidingNow) palette.accent else palette.subtle,
+                    fontWeight = if (spaceSlidingNow) FontWeight.SemiBold else FontWeight.Medium,
                 )
-                if (!onNumberPage && !isLettersBottomSpace) {
+                if (!onNumberPage && !isLettersBottomSpace && !spaceSlidingNow) {
                     Box(
                         Modifier
                             .align(Alignment.BottomCenter)
@@ -1141,14 +1165,25 @@ private fun KeyCap(key: PlacedKey, state: UiState, palette: Palette, keyHeight: 
                         color = palette.label,
                         fontWeight = FontWeight.Medium,
                     )
-                    isLettersPunctuation -> FittedKeyLabel(
-                        text = key.model.label,
-                        maxWidth = keyWidth,
-                        maxHeight = actualKeyHeight,
-                        maxFontSize = 19f,
-                        color = palette.label,
-                        fontWeight = FontWeight.Medium,
-                    )
+                    isLettersPunctuation -> {
+                        if (key.model.hint != null) {
+                            Text(
+                                key.model.hint,
+                                color = palette.hint,
+                                fontSize = 9.sp,
+                                lineHeight = 10.sp,
+                                modifier = Modifier.align(Alignment.TopEnd).padding(top = 2.dp, end = 3.dp),
+                            )
+                        }
+                        FittedKeyLabel(
+                            text = key.model.label,
+                            maxWidth = keyWidth,
+                            maxHeight = actualKeyHeight,
+                            maxFontSize = 19f,
+                            color = palette.label,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
                     else -> Text(
                         key.model.label,
                         color = if (key.model.accent) palette.onAccent else palette.label,

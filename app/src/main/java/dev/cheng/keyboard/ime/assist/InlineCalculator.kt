@@ -44,25 +44,33 @@ private fun isSupportedCharacter(character: Char): Boolean =
         character == '/' ||
         character == '×' ||
         character == '÷' ||
+        character == '%' ||
         character == '(' ||
         character == ')' ||
         character.isWhitespace()
+
+private data class ParsedValue(
+    val value: BigDecimal,
+    val directPercent: Boolean = false,
+)
+
+private val HUNDRED = BigDecimal(100)
 
 private class InlineExpressionParser(
     private val source: String,
 ) {
     private var index = 0
     private var parenthesisDepth = 0
-    private var binaryOperationCount = 0
+    private var operationCount = 0
 
     fun parse(): String? {
-        val value = parseExpression() ?: return null
+        val parsed = parseExpression() ?: return null
         skipWhitespace()
-        if (index != source.length || binaryOperationCount == 0) return null
-        return render(value)
+        if (index != source.length || operationCount == 0) return null
+        return render(parsed.value)
     }
 
-    private fun parseExpression(): BigDecimal? {
+    private fun parseExpression(): ParsedValue? {
         var left = parseTerm() ?: return null
 
         while (true) {
@@ -75,15 +83,21 @@ private class InlineExpressionParser(
             if (peek() == operator) return null
 
             val right = parseTerm() ?: return null
-            if (++binaryOperationCount > MAX_BINARY_OPERATIONS) return null
-            left = when (operator) {
-                '+' -> addBounded(left, right)
-                else -> subtractBounded(left, right)
+            if (++operationCount > MAX_BINARY_OPERATIONS) return null
+            val effectiveRight = if (right.directPercent && !left.directPercent) {
+                multiplyBounded(left.value, right.value) ?: return null
+            } else {
+                right.value
+            }
+            val next = when (operator) {
+                '+' -> addBounded(left.value, effectiveRight)
+                else -> subtractBounded(left.value, effectiveRight)
             } ?: return null
+            left = ParsedValue(next, directPercent = left.directPercent && right.directPercent)
         }
     }
 
-    private fun parseTerm(): BigDecimal? {
+    private fun parseTerm(): ParsedValue? {
         var left = parseUnary() ?: return null
 
         while (true) {
@@ -95,23 +109,37 @@ private class InlineExpressionParser(
 
             index++
             val right = parseUnary() ?: return null
-            if (++binaryOperationCount > MAX_BINARY_OPERATIONS) return null
-            left = when (operator) {
-                '*', '×' -> multiplyBounded(left, right)
-                else -> divideBounded(left, right)
+            if (++operationCount > MAX_BINARY_OPERATIONS) return null
+            val next = when (operator) {
+                '*', '×' -> multiplyBounded(left.value, right.value)
+                else -> divideBounded(left.value, right.value)
             } ?: return null
+            left = ParsedValue(next, directPercent = false)
         }
     }
 
-    private fun parseUnary(): BigDecimal? {
+    private fun parseUnary(): ParsedValue? {
         skipWhitespace()
         val sign = when (peek()) {
             '+', '-' -> source[index++]
             else -> null
         }
         skipWhitespace()
+        val parsed = parsePostfix() ?: return null
+        val signed = if (sign == '-') parsed.value.negate() else parsed.value
+        return ParsedValue(signed, directPercent = parsed.directPercent)
+    }
+
+    private fun parsePostfix(): ParsedValue? {
         val value = parsePrimary() ?: return null
-        return if (sign == '-') value.negate() else value
+        skipWhitespace()
+        if (peek() != '%') return ParsedValue(value, directPercent = false)
+        index++
+        skipWhitespace()
+        if (peek() == '%') return null
+        if (++operationCount > MAX_BINARY_OPERATIONS) return null
+        val percent = divideBounded(value, HUNDRED) ?: return null
+        return ParsedValue(percent, directPercent = true)
     }
 
     private fun parsePrimary(): BigDecimal? {
@@ -122,12 +150,12 @@ private class InlineExpressionParser(
         parenthesisDepth++
         if (parenthesisDepth > MAX_PARENTHESIS_DEPTH) return null
 
-        val value = parseExpression() ?: return null
+        val parsed = parseExpression() ?: return null
         skipWhitespace()
         if (peek() != ')') return null
         index++
         parenthesisDepth--
-        return value
+        return parsed.value
     }
 
     private fun parseNumber(): BigDecimal? {

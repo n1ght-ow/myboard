@@ -69,6 +69,10 @@ private val dateTimeTriggers = listOf(
     DateTimeTrigger("/date", "date"),
     DateTimeTrigger("/time", "time"),
     DateTimeTrigger("/weekday", "weekday"),
+    DateTimeTrigger("/now", "now"),
+    DateTimeTrigger("/ymd", "cdate"),
+    DateTimeTrigger("/tomorrow", "tomorrow"),
+    DateTimeTrigger("/yesterday", "yesterday"),
     DateTimeTrigger("日期", "date"),
     DateTimeTrigger("时间", "time"),
     DateTimeTrigger("星期", "weekday"),
@@ -291,6 +295,7 @@ private fun dateTimeSuggestions(
     context: TypingAssistContext,
     now: LocalDateTime,
 ): List<TypingSuggestion> {
+    if (isLiteralAddressContext(context.before)) return emptyList()
     val trigger = dateTimeTriggers.firstOrNull {
         context.before.endsWith(it.token, ignoreCase = true)
     } ?: return emptyList()
@@ -301,6 +306,10 @@ private fun dateTimeSuggestions(
     val (labelPrefix, replacement) = when (trigger.kind) {
         "date" -> "日期 " to formatDate(now)
         "time" -> "时间 " to formatTime(now)
+        "now" -> "此刻 " to "${formatDate(now)} ${formatTime(now)}"
+        "cdate" -> "日期 " to formatChineseDate(now)
+        "tomorrow" -> "明天 " to formatDate(now.plusDays(1))
+        "yesterday" -> "昨天 " to formatDate(now.minusDays(1))
         else -> "星期 " to formatWeekday(now)
     }
 
@@ -326,6 +335,9 @@ private fun formatDate(now: LocalDateTime): String =
         append(twoDigits(now.dayOfMonth))
     }
 
+private fun formatChineseDate(now: LocalDateTime): String =
+    "${now.year}年${now.monthValue}月${now.dayOfMonth}日"
+
 private fun formatTime(now: LocalDateTime): String =
     "${twoDigits(now.hour)}:${twoDigits(now.minute)}"
 
@@ -343,7 +355,7 @@ private fun twoDigits(value: Int): String = value.toString().padStart(2, '0')
 
 private fun calculatorSuggestions(context: TypingAssistContext): List<TypingSuggestion> {
     val before = context.before
-    if (!before.endsWith('=')) return emptyList()
+    if (before.isEmpty() || !before.last().isCalculatorTerminator()) return emptyList()
 
     var start = before.lastIndex
     while (start > 0 && isExpressionChar(before[start - 1])) {
@@ -354,12 +366,13 @@ private fun calculatorSuggestions(context: TypingAssistContext): List<TypingSugg
     }
 
     val expression = before.substring(start)
-    if (expression.count { it == '=' } != 1) return emptyList()
+    if (expression.count { it.isCalculatorTerminator() } != 1) return emptyList()
     if (start > 0 && !isExpressionBoundary(before[start - 1])) return emptyList()
 
-    val body = expression.dropLast(1).trim(' ', '\t')
-    if (body.isEmpty() || body.none { it in '0'..'9' }) return emptyList()
-    if (body.any { !isExpressionChar(it) }) return emptyList()
+    val rawBody = expression.dropLast(1).trim(' ', '\t')
+    if (rawBody.isEmpty() || rawBody.none { it in '0'..'9' }) return emptyList()
+    if (rawBody.any { !isExpressionChar(it) }) return emptyList()
+    val body = normalizeCalculatorBody(rawBody)
     if (!hasBalancedParentheses(body)) return emptyList()
     if (looksLikeDateOrPhone(body)) return emptyList()
 
@@ -380,17 +393,34 @@ private fun calculatorSuggestions(context: TypingAssistContext): List<TypingSugg
     )
 }
 
+private fun Char.isCalculatorTerminator(): Boolean = this == '=' || this == '＝'
+
+private fun normalizeCalculatorBody(raw: String): String = buildString(raw.length) {
+    for (ch in raw) {
+        append(
+            when (ch) {
+                '＋' -> '+'
+                '－' -> '-'
+                '（' -> '('
+                '）' -> ')'
+                '％' -> '%'
+                else -> ch
+            },
+        )
+    }
+}
+
 private fun isExpressionChar(ch: Char): Boolean =
     ch.isExpressionSpacing() ||
         ch in '0'..'9' ||
-        ch in "+-*/×÷.()"
+        ch in "+-*/×÷%.()＋－（）％"
 
 private fun Char.isExpressionSpacing(): Boolean =
     this == ' ' || this == '\t'
 
 private fun isExpressionBoundary(ch: Char): Boolean =
     !(
-        ch.isLetterOrDigit() ||
+        ch.isAsciiLetterOrDigit() ||
             ch == '_' ||
             ch == '.' ||
             ch == '@' ||
@@ -399,7 +429,8 @@ private fun isExpressionBoundary(ch: Char): Boolean =
             ch == '?' ||
             ch == '#' ||
             ch == '&' ||
-            ch == '='
+            ch == '=' ||
+            ch == '＝'
         )
 
 private fun hasBalancedParentheses(expression: String): Boolean {
@@ -442,7 +473,8 @@ private fun Char.isTokenContinuation(): Boolean =
         this == '#' ||
         this == '&' ||
         this == '=' ||
-        this in "+*×÷%^"
+        this == '＝' ||
+        this in "+*×÷%^＋－％"
 
 private fun Char.isExplicitUrlPrefixBoundary(): Boolean =
     !(
@@ -468,7 +500,7 @@ private fun Char.isUriTokenChar(): Boolean =
 
 private fun Char.isStandaloneTokenChar(): Boolean =
     isWhitespace() ||
-        this in "，。！？；：、（）【】《》「」『』〈〉〔〕“”‘’…—～·"
+        this in "([{,;\"'，。！？；：、（）【】《》「」『』〈〉〔〕“”‘’…—～·"
 
 private fun Char.isAsciiLetterOrDigit(): Boolean =
     this in 'a'..'z' || this in 'A'..'Z' || this in '0'..'9'

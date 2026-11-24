@@ -8,9 +8,11 @@ import android.view.inputmethod.InputConnection
 import dev.cheng.keyboard.ai.HostScene
 import dev.cheng.keyboard.ai.hostSceneOf
 import dev.cheng.keyboard.engine.Cmd
+import dev.cheng.keyboard.engine.isPairedSymbol
 import dev.cheng.keyboard.engine.previousWordUnits
 import dev.cheng.keyboard.engine.resolveSmartCommit
 import dev.cheng.keyboard.engine.shouldAutoCap
+import dev.cheng.keyboard.engine.wrapSelectedWithPair
 import dev.cheng.keyboard.model.EnterKind
 import dev.cheng.keyboard.model.ShiftState
 import dev.cheng.keyboard.ime.assist.TypingSuggestion
@@ -154,6 +156,12 @@ enum class ClearInputResult {
     Unchanged,
     CompositionFinalizedWithoutClear,
 }
+
+data class ClearInputOutcome(
+    val result: ClearInputResult,
+    val clearedText: String? = null,
+    val clearedSelection: EditorTextSpan? = null,
+)
 
 fun isUtf16Boundary(text: String, index: Int): Boolean {
     if (index !in 0..text.length) return false
@@ -662,12 +670,15 @@ class EditorBridge(private val connection: () -> InputConnection?) {
         return true
     }
 
-    fun clearInput(privateField: Boolean = false): ClearInputResult {
-        val input = connection() ?: return ClearInputResult.Unchanged
+    fun clearInput(privateField: Boolean = false): ClearInputResult =
+        clearInputWithOutcome(privateField).result
+
+    fun clearInputWithOutcome(privateField: Boolean = false): ClearInputOutcome {
+        val input = connection() ?: return ClearInputOutcome(ClearInputResult.Unchanged)
         var finalizedWithoutClear = false
         if (composing) {
             if (!runCatching { input.finishComposingText() }.getOrDefault(false)) {
-                return ClearInputResult.Unchanged
+                return ClearInputOutcome(ClearInputResult.Unchanged)
             }
             composing = false
             finalizedWithoutClear = true
@@ -676,22 +687,49 @@ class EditorBridge(private val connection: () -> InputConnection?) {
         val cleared = runCatching {
             val fullLength = snapshot?.fullLength
             val selected = if (fullLength != null) {
-                input.setSelection(0, fullLength) &&
-                    selectedTextMatches(input, snapshot?.text.orEmpty())
+                input.setSelection(0, fullLength)
             } else {
-                input.performContextMenuAction(android.R.id.selectAll) &&
-                    input.getTextBeforeCursor(1, 0)?.isEmpty() == true &&
-                    input.getTextAfterCursor(1, 0)?.isEmpty() == true
+                input.performContextMenuAction(android.R.id.selectAll)
             }
-            selected && input.commitText("", 1)
+            val verified = selected &&
+                input.getTextBeforeCursor(1, 0)?.isEmpty() == true &&
+                input.getTextAfterCursor(1, 0)?.isEmpty() == true
+            verified && input.commitText("", 1)
         }.getOrDefault(false)
-        if (cleared) return ClearInputResult.Applied
+        if (cleared) {
+            val recoverable = !privateField &&
+                snapshot != null &&
+                snapshot.fullLength != null &&
+                snapshot.text.isNotEmpty()
+            return ClearInputOutcome(
+                result = ClearInputResult.Applied,
+                clearedText = if (recoverable) snapshot?.text else null,
+                clearedSelection = if (recoverable) snapshot?.selection else null,
+            )
+        }
         snapshot?.selection?.let { restoreTypingSelection(input, it) }
-        return if (finalizedWithoutClear) {
+        val result = if (finalizedWithoutClear) {
             ClearInputResult.CompositionFinalizedWithoutClear
         } else {
             ClearInputResult.Unchanged
         }
+        return ClearInputOutcome(result)
+    }
+
+    fun restoreClearedInput(text: String, selection: EditorTextSpan): Boolean {
+        if (text.isEmpty() || hasUnpairedSurrogate(text)) return false
+        val input = connection() ?: return false
+        val emptyBefore = runCatching { input.getTextBeforeCursor(1, 0)?.isEmpty() == true }.getOrDefault(false)
+        val emptyAfter = runCatching { input.getTextAfterCursor(1, 0)?.isEmpty() == true }.getOrDefault(false)
+        if (!emptyBefore || !emptyAfter) return false
+        if (!runCatching { input.commitText(text, 1) }.getOrDefault(false)) return false
+        composing = false
+        val start = selection.start.coerceIn(0, text.length)
+        val end = selection.end.coerceIn(0, text.length)
+        if (isUtf16Boundary(text, start) && isUtf16Boundary(text, end)) {
+            runCatching { input.setSelection(start, end) }
+        }
+        return true
     }
 
     private data class ClearSnapshot(
@@ -771,7 +809,17 @@ class EditorBridge(private val connection: () -> InputConnection?) {
             composing = composing,
             text = text,
         )
-        val hasSelection = mayNeedContext && hasEditorSelection(input)
+        val selectedText = if (!composing && isPairedSymbol(text)) {
+            runCatching { input.getSelectedText(0)?.toString() }.getOrNull()
+        } else {
+            null
+        }
+        val wrappedSelection = selectedText?.let { wrapSelectedWithPair(it, text) }
+        if (wrappedSelection != null) {
+            runCatching { input.commitText(wrappedSelection, 1) }
+            return
+        }
+        val hasSelection = mayNeedContext && (selectedText != null || hasEditorSelection(input))
         val needContext = smartCommitNeedsContext(hasSelection, composing, text)
         val before = if (needContext) {
             runCatching {
@@ -893,19 +941,6 @@ class EditorBridge(private val connection: () -> InputConnection?) {
 
     private fun restoreTypingSelection(input: InputConnection, selection: EditorTextSpan) {
         runCatching { input.setSelection(selection.start, selection.end) }
-    }
-
-    private fun selectedTextMatches(input: InputConnection, expected: String): Boolean {
-        val selected = runCatching { input.getSelectedText(0)?.toString() }.getOrNull()
-        if (selected != null) return selected == expected
-        val extracted = runCatching { input.getExtractedText(extractedRequest(), 0) }.getOrNull()
-        if (extracted?.text != null && extracted.startOffset >= 0) {
-            val text = extracted.text.toString()
-            val start = minOf(extracted.selectionStart, extracted.selectionEnd)
-            val end = maxOf(extracted.selectionStart, extracted.selectionEnd)
-            return start == 0 && end == text.length && text == expected
-        }
-        return false
     }
 }
 

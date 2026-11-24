@@ -18,10 +18,16 @@ import org.json.JSONArray
 import java.io.File
 
 const val MAX_RECENT_CLIPS = 12
+const val MAX_PINNED_CLIPS = 12
 private const val MAX_CLIP_CHARS = 4096
 private val GRAPHEME_CLUSTER = Regex("\\X")
 
 val Context.settingsStore by preferencesDataStore(name = "keyboard")
+
+data class ClipboardEntry(
+    val text: String,
+    val pinned: Boolean,
+)
 
 object PrefKeys {
     val theme = stringPreferencesKey("theme")
@@ -35,6 +41,7 @@ object PrefKeys {
     val calibDy = floatPreferencesKey("calib_dy")
     val calibEpoch = longPreferencesKey("calib_epoch")
     val recentClips = stringPreferencesKey("recent_clips")
+    val pinnedClips = stringPreferencesKey("pinned_clips")
 }
 
 fun mergeRecentClips(
@@ -79,6 +86,48 @@ fun clipboardItemsForDisplay(
     val currentIndex = boundedHistory.indexOf(storedCurrent)
     if (currentIndex < 0) return boundedHistory
     return boundedHistory.toMutableList().also { it[currentIndex] = fullCurrent }
+}
+
+fun togglePinnedClip(
+    text: String,
+    pinned: List<String>,
+    limit: Int = MAX_PINNED_CLIPS,
+): List<String> {
+    val normalized = normalizeRecentClip(text) ?: return mergeRecentClipLists(emptyList(), pinned, limit)
+    val cleaned = mergeRecentClipLists(emptyList(), pinned, limit)
+    return if (normalized in cleaned) {
+        cleaned.filterNot { it == normalized }
+    } else {
+        (listOf(normalized) + cleaned).distinct().take(limit.coerceAtLeast(0))
+    }
+}
+
+fun removeClip(text: String, clips: List<String>): List<String> {
+    val normalized = normalizeRecentClip(text)
+    return clips.filterNot { it == text || (normalized != null && it == normalized) }
+}
+
+fun clipboardDisplayEntries(
+    current: String?,
+    recent: List<String>,
+    pinned: List<String>,
+    limit: Int = MAX_RECENT_CLIPS,
+): List<ClipboardEntry> {
+    if (limit <= 0) return emptyList()
+    val cleanPinned = mergeRecentClipLists(emptyList(), pinned, MAX_PINNED_CLIPS)
+    val recentDisplay = clipboardItemsForDisplay(current, recent, limit)
+    val fullCurrent = current?.takeIf { it.isNotBlank() }
+    val storedCurrent = fullCurrent?.let { truncateRecentClip(it, MAX_CLIP_CHARS) }
+    val pinnedEntries = cleanPinned.map { item ->
+        val displayText = if (fullCurrent != null && item == storedCurrent) fullCurrent else item
+        ClipboardEntry(text = displayText, pinned = true)
+    }
+    val pinnedKeys = cleanPinned.toHashSet()
+    val recentEntries = recentDisplay.mapNotNull { item ->
+        val key = truncateRecentClip(item, MAX_CLIP_CHARS)
+        if (key in pinnedKeys || item in pinnedKeys) null else ClipboardEntry(text = item, pinned = false)
+    }
+    return pinnedEntries + recentEntries
 }
 
 private fun normalizeRecentClip(text: String): String? {

@@ -31,10 +31,12 @@ data class UiState(
     val popup: PopupPreview? = null,
     val tapPreview: TapPreview? = null,
     val backspaceHint: BackspaceHint = BackspaceHint.None,
+    val spaceSliding: Boolean = false,
     val menu: Boolean = false,
     val clip: String? = null,
     val freshClip: String? = null,
     val recentClips: List<String> = emptyList(),
+    val pinnedClips: List<String> = emptyList(),
     val expanded: Boolean = false,
     val overlay: Overlay = Overlay.None,
     val askDraft: String = "",
@@ -56,4 +58,5 @@ data class UiState(
     val polishCandidates: List<PolishCandidate> = emptyList(),
     val polishSelected: Int = 0,
     val canUndoPolish: Boolean = false,
+    val canUndoClear: Boolean = false,
 )
