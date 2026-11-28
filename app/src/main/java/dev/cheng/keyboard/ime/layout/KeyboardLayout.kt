@@ -10,13 +10,23 @@ import dev.cheng.keyboard.model.TouchBias
 import dev.cheng.keyboard.model.TouchSample
 import kotlin.math.abs
 
-private val hints = mapOf(
+private val numberHints = mapOf(
     "q" to "1", "w" to "2", "e" to "3", "r" to "4", "t" to "5",
     "y" to "6", "u" to "7", "i" to "8", "o" to "9", "p" to "0",
+)
+
+private val chineseLetterHints = mapOf(
+    "a" to "\uFF5E", "s" to "\uFF01", "d" to "\uFF20", "f" to "\uFF03", "g" to "\uFF05",
+    "h" to "\u201C", "j" to "\u201D", "k" to "\uFF0A", "l" to "\uFF1F",
+    "z" to "\uFF08", "x" to "\uFF09", "c" to "\uFF0D", "v" to "\uFF3F",
+    "b" to "\uFF1A", "n" to "\uFF1B", "m" to "\u3001",
+)
+
+private val englishLetterHints = mapOf(
     "a" to "~", "s" to "!", "d" to "@", "f" to "#", "g" to "%",
-    "h" to "\u201C", "j" to "\u201D", "k" to "*", "l" to "?",
-    "z" to "(", "x" to ")", "c" to "-", "v" to "_", "b" to ":",
-    "n" to ";", "m" to "\u3001",
+    "h" to "\"", "j" to "\"", "k" to "*", "l" to "?",
+    "z" to "(", "x" to ")", "c" to "-", "v" to "_",
+    "b" to ":", "n" to ";", "m" to ",",
 )
 
 data class KeyRow(val keys: List<KeyModel>, val inset: Boolean = false)
@@ -321,9 +331,18 @@ private fun correctTouchPoint(
 }
 
 private fun letterRows(language: Language): List<KeyRow> {
+    val symbolHints = when (language) {
+        Language.Chinese -> chineseLetterHints
+        Language.English -> englishLetterHints
+    }
     fun letters(text: String) = text.map { ch ->
         val label = ch.toString()
-        KeyModel("l-$label", KeyKind.Letter, label, hint = hints.getValue(label))
+        KeyModel(
+            "l-$label",
+            KeyKind.Letter,
+            label,
+            hint = numberHints[label] ?: symbolHints.getValue(label),
+        )
     }
     return listOf(
         KeyRow(letters("qwertyuiop")),

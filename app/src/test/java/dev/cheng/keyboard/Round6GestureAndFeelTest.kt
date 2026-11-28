@@ -4,7 +4,6 @@ import dev.cheng.keyboard.engine.EngineAct
 import dev.cheng.keyboard.ime.gesture.HapticKind
 import dev.cheng.keyboard.ime.gesture.KeyGesture
 import dev.cheng.keyboard.ime.layout.keyboardRows
-import dev.cheng.keyboard.model.Choice
 import dev.cheng.keyboard.model.KeyKind
 import dev.cheng.keyboard.model.KeyModel
 import dev.cheng.keyboard.model.KeyboardPage
@@ -27,65 +26,100 @@ class Round6GestureAndFeelTest {
         keyboardRows(page, language).flatMap { it.keys }.first { it.id == id }
 
     @Test
-    fun quickPunctuationFlickUpAndCancelWorkOnChineseAndEnglishCommaPeriod() {
-        val zhPeriod = key(KeyboardPage.Letters, Language.Chinese, "period")
-        assertEquals("？", zhPeriod.hint)
-        assertEquals(listOf("！", "？", "…"), zhPeriod.quickChars)
-
+    fun quickPunctuationFlickUpAndPullBackWorkOnEveryLetterPagePunctuationKey() {
         val g = gesture()
-        assertEquals(HapticKind.Down, g.down(zhPeriod, 100f, 100f, 0L).haptic)
-        val flick = g.move(100f, 40f, 60L, zhPeriod)
-        assertEquals(HapticKind.Step, flick.haptic)
-        assertEquals("！", flick.popup?.upper)
-        assertEquals("？", flick.popup?.symbol)
-        assertEquals("…", flick.popup?.lower)
-        assertEquals(Choice.Symbol, flick.popup?.choice)
-        assertEquals(listOf(EngineAct.Direct("？")), g.up().actions)
 
-        // Pulling back cancels flick and commits primary punctuation
-        g.down(zhPeriod, 100f, 100f, 0L)
-        g.move(100f, 40f, 60L, zhPeriod)
-        val pulledBack = g.move(100f, 85f, 90L, zhPeriod)
-        assertNull(pulledBack.popup)
-        assertEquals(HapticKind.Step, pulledBack.haptic)
-        assertEquals(listOf(EngineAct.Direct("。")), g.up().actions)
+        for (case in letterPunctuationCases) {
+            val punctuation = key(KeyboardPage.Letters, case.language, case.id)
+            assertEquals(case.primary, punctuation.insert)
+            assertEquals(case.quickChars, punctuation.quickChars)
 
-        val enComma = key(KeyboardPage.Letters, Language.English, "comma")
-        assertEquals(":", enComma.hint)
-        g.down(enComma, 100f, 100f, 0L)
-        g.move(100f, 40f, 60L, enComma)
-        assertEquals(listOf(EngineAct.Direct(":")), g.up().actions)
+            g.down(punctuation, 100f, 100f, 0L)
+            val flick = g.move(100f, 40f, 60L, punctuation)
+            assertEquals(HapticKind.Step, flick.haptic)
+            assertEquals(case.quickChars[0], flick.popup?.upper)
+            assertEquals(case.quickChars[1], flick.popup?.symbol)
+            assertEquals(case.quickChars[2], flick.popup?.lower)
+            assertEquals(listOf(EngineAct.Direct(case.quickChars[1])), g.up().actions)
+
+            g.down(punctuation, 100f, 100f, 0L)
+            g.move(100f, 40f, 60L, punctuation)
+            val pulledBack = g.move(100f, 85f, 90L, punctuation)
+            assertNull(pulledBack.popup)
+            assertEquals(HapticKind.Step, pulledBack.haptic)
+            assertEquals(listOf(EngineAct.Direct(case.primary)), g.up().actions)
+        }
     }
 
     @Test
-    fun quickPunctuationLongPressSupportsLeftCenterRightSelection() {
-        val zhComma = key(KeyboardPage.Letters, Language.Chinese, "comma")
+    fun quickPunctuationNeverArmsOrSelectsOnLongHoldOrHorizontalMovement() {
         val g = gesture()
 
-        // Left -> ：
-        g.down(zhComma, 100f, 100f, 0L)
-        assertEquals(350L, g.nextAlarm(10L))
-        val armed = g.alarm(350L)
-        assertEquals(HapticKind.Arm, armed.haptic)
-        assertEquals(Choice.Symbol, armed.popup?.choice)
-        val left = g.move(60f, 100f, 380L, zhComma)
-        assertEquals(Choice.Upper, left.popup?.choice)
-        assertEquals(HapticKind.Step, left.haptic)
-        assertEquals(listOf(EngineAct.Direct("：")), g.up().actions)
+        for (case in letterPunctuationCases) {
+            val punctuation = key(KeyboardPage.Letters, case.language, case.id)
 
-        // Right -> ；
-        g.down(zhComma, 100f, 100f, 0L)
-        g.alarm(350L)
-        val right = g.move(140f, 100f, 380L, zhComma)
-        assertEquals(Choice.Lower, right.popup?.choice)
-        assertEquals(listOf(EngineAct.Direct("；")), g.up().actions)
+            g.down(punctuation, 100f, 100f, 0L)
+            assertEquals(listOf(EngineAct.Direct(case.primary)), g.up().actions)
 
-        // Number page comma stays plain without quick popup
-        val numComma = key(KeyboardPage.Number, Language.Chinese, "comma")
-        assertTrue(numComma.quickChars.isEmpty())
-        g.down(numComma, 100f, 100f, 0L)
-        assertNull(g.nextAlarm(10L))
-        assertEquals(listOf(EngineAct.Direct(",")), g.up().actions)
+            g.down(punctuation, 100f, 100f, 0L)
+            assertNull(g.nextAlarm(10L))
+
+            val held = g.alarm(5_000L)
+            assertNull(held.haptic)
+            assertNull(held.popup)
+            assertTrue(held.actions.isEmpty())
+            assertEquals(listOf(EngineAct.Direct(case.primary)), g.up().actions)
+
+            g.down(punctuation, 100f, 100f, 0L)
+            g.alarm(5_000L)
+            val smallHorizontal = g.move(76f, 100f, 5_001L, punctuation)
+            assertNull(smallHorizontal.popup)
+            assertTrue(smallHorizontal.actions.isEmpty())
+            assertEquals(listOf(EngineAct.Direct(case.primary)), g.up().actions)
+
+            g.down(punctuation, 100f, 100f, 0L)
+            g.alarm(5_000L)
+            val formerSelectionDistance = g.move(60f, 100f, 5_001L, punctuation)
+            assertNull(formerSelectionDistance.popup)
+            assertTrue(formerSelectionDistance.actions.isEmpty())
+            assertTrue(g.up().actions.isEmpty())
+        }
+    }
+
+    @Test
+    fun punctuationOnOtherPagesNeverExposesLetterPageQuickChars() {
+        val g = gesture()
+        val pages = listOf(KeyboardPage.Number, KeyboardPage.Symbols, KeyboardPage.More)
+        for (language in Language.entries) {
+            for (page in pages) {
+                for (id in listOf("comma", "period")) {
+                    val punctuation = key(page, language, id)
+                    assertTrue(punctuation.quickChars.isEmpty())
+
+                    g.down(punctuation, 100f, 100f, 0L)
+                    assertEquals(
+                        listOf(EngineAct.Direct(punctuation.insert ?: punctuation.label)),
+                        g.up().actions,
+                    )
+
+                    g.down(punctuation, 100f, 100f, 0L)
+                    assertNull(g.nextAlarm(10L))
+                    val held = g.alarm(5_000L)
+                    assertNull(held.popup)
+                    assertTrue(held.actions.isEmpty())
+                    assertEquals(
+                        listOf(EngineAct.Direct(punctuation.insert ?: punctuation.label)),
+                        g.up().actions,
+                    )
+
+                    g.down(punctuation, 100f, 100f, 0L)
+                    val flickPast = g.move(100f, 40f, 5_001L, punctuation)
+                    assertNull(flickPast.popup)
+                    assertTrue(flickPast.actions.isEmpty())
+                    assertTrue(g.up().actions.isEmpty())
+                }
+            }
+        }
     }
 
     @Test
@@ -139,3 +173,17 @@ class Round6GestureAndFeelTest {
         assertEquals(HapticKind.Delete, g.up().haptic)
     }
 }
+
+private data class PunctuationCase(
+    val language: Language,
+    val id: String,
+    val primary: String,
+    val quickChars: List<String>,
+)
+
+private val letterPunctuationCases = listOf(
+    PunctuationCase(Language.Chinese, "comma", "，", listOf("：", "、", "；")),
+    PunctuationCase(Language.Chinese, "period", "。", listOf("！", "？", "…")),
+    PunctuationCase(Language.English, "comma", ",", listOf(";", ":", "/")),
+    PunctuationCase(Language.English, "period", ".", listOf("!", "?", "'")),
+)

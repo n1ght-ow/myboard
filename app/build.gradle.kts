@@ -17,8 +17,8 @@ android {
         applicationId = "dev.cheng.keyboard"
         minSdk = 26
         targetSdk = 36
-        versionCode = 28
-        versionName = "0.1.25"
+        versionCode = 29
+        versionName = "0.1.26"
     }
 
     buildTypes {

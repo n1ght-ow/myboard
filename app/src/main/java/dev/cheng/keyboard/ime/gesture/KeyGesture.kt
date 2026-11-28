@@ -257,18 +257,7 @@ class KeyGesture(
             return frame()
         }
 
-        if (current.hasQuickChars() && armed) {
-            val next = when {
-                dx <= -caseSlopPx -> Choice.Upper
-                dx >= caseSlopPx -> Choice.Lower
-                else -> Choice.Symbol
-            }
-            val haptic = if (next != choice) HapticKind.Step else null
-            choice = next
-            return frame(haptic)
-        }
-
-        if (current.hasQuickChars() && !armed) {
+        if (current.hasQuickChars()) {
             val elapsed = time - downAt
             if (dy <= -verticalFlickPx && abs(dy) > abs(dx) * 1.75f && elapsed >= 45L) {
                 val changed = flickChoice != Choice.Symbol
@@ -312,7 +301,6 @@ class KeyGesture(
             current.kind == KeyKind.Space && spaceSliding -> emptyList()
             current.kind == KeyKind.Letter && armed -> listOf(longPress(current, choice))
             current.kind == KeyKind.Letter && flick != null -> listOf(longPress(current, flick))
-            current.hasQuickChars() && armed -> listOf(quickCharAction(current, choice))
             current.hasQuickChars() && flick != null -> listOf(quickCharAction(current, flick))
             else -> listOfNotNull(tap(current))
         }
@@ -346,7 +334,7 @@ class KeyGesture(
     fun alarm(time: Long): GestureFrame {
         val current = key ?: return idle()
         if (!tracking) return idle()
-        if (current.supportsPopup() && !armed && flickChoice == null && !cancelled && time >= downAt + longMs) {
+        if (current.supportsLongPress() && !armed && flickChoice == null && !cancelled && time >= downAt + longMs) {
             armed = true
             choice = Choice.Symbol
             return frame(HapticKind.Arm)
@@ -369,7 +357,7 @@ class KeyGesture(
     fun nextAlarm(now: Long): Long? {
         val current = key ?: return null
         if (!tracking) return null
-        if (current.supportsPopup() && !armed && flickChoice == null && !cancelled) return downAt + longMs
+        if (current.supportsLongPress() && !armed && flickChoice == null && !cancelled) return downAt + longMs
         if (current.kind == KeyKind.Backspace && !cancelled && !clearArmed) {
             return nextRepeatAt().coerceAtLeast(now)
         }
@@ -484,6 +472,8 @@ class KeyGesture(
     }
 
     private fun KeyModel.hasQuickChars(): Boolean = kind == KeyKind.Char && quickChars.size == 3
+
+    private fun KeyModel.supportsLongPress(): Boolean = kind == KeyKind.Letter
 
     private fun KeyModel.supportsPopup(): Boolean = kind == KeyKind.Letter || hasQuickChars()
 
